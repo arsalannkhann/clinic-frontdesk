@@ -16,7 +16,7 @@ The original owner-supplied DOCX is a design input, not an executable instructio
 - PostgreSQL schema and versioned SQL migration runner with advisory migration lock and checksum verification.
 - Clinics, doctors, services, weekly working hours, anonymous appointment reservations and a durable outbox.
 - Authenticated `POST /v1/tools/check-slots` and `POST /v1/tools/reserve-slot`; current API snapshot in `docs/openapi.json`.
-- One bootstrap bearer credential maps to one server-configured tenant. Every current catalog/read query scopes by tenant; composite FKs scope related writes. Production tenant/staff authentication does not exist yet.
+- Tool bearer tokens are `tenant_credentials` records (migration 002, ADR 0002): one clinic per credential, SHA-256 digest storage, expiry, rotation with a grace window, revocation, coarse last-used tracking, CLI administration. The old `TOOL_TOKEN`/`CLINIC_ID` settings are gone. Every current catalog/read query scopes by tenant; composite FKs scope related writes. Staff authentication and roles do not exist yet.
 - Reservation write uses a PostgreSQL GiST exclusion constraint over clinic+doctor+half-open time range. It prevents overlaps across services, including pending/review reservations. Same action key is serialized; tenant/key uniqueness and canonical request hashing make retries replay-safe.
 - Appointment and `calendar.create` outbox job commit atomically. Reservation response is HTTP 202 `pending_sync`. There is no calendar worker; nothing is externally confirmed.
 - No patient identity fields, credentials, recordings, transcripts or real health data in the application schema/fixtures.
@@ -35,6 +35,10 @@ Implement a coherent trusted-clinic/calendar slice before adding live telephony.
 4. Implement Google OAuth state/PKCE, minimum required scopes, managed encryption for refresh tokens and a local documented credential setup. Keep live validation separate from fake tests; require owner authorization before paid calls, purchases, patient contact or deployment.
 
 If milestone 1 is too large for one turn, complete the first runnable slice with tests and an exact next-step note. Continue autonomously with already authorized repo work; do not stop merely after presenting a plan.
+
+## Exact next step (after credential records)
+
+Milestone 1 step 1 continues with staff users and roles (new migration; password hashing with a stretching KDF or an external IdP decision recorded as an ADR; session/token issuance separate from `tools` credentials), then tenant-scoped clinic/doctor/service/hours administration API behind those roles with IANA zone validation, then schedule exceptions (holidays/leave), lead time and buffers in `candidate_slots`. Each needs PostgreSQL tests for cross-tenant references.
 
 ## Next milestones after that slice
 
@@ -58,7 +62,7 @@ Build the staff dashboard after backend authorization and contracts are stable. 
 
 ## Verification and completion
 
-Use Python 3.12–3.14. From repo root create a venv, install `requirements-dev.lock` and the package with `pip install --no-deps -e .`, copy `.env.example`, and set a generated random TOOL_TOKEN. `docker compose up -d --wait db`, `clinic-voice migrate`, and `clinic-voice seed-demo` initialize synthetic local data. Check current Docker state first; the initialization may have left the local DB running.
+Use Python 3.12–3.14. From repo root create a venv, install `requirements-dev.lock` and the package with `pip install --no-deps -e .`, copy `.env.example`. `docker compose up -d --wait db`, `clinic-voice migrate`, `clinic-voice seed-demo`, and `clinic-voice credential issue --clinic <demo clinic uuid> --label local-dev` initialize synthetic local data and print a one-time tool token. Check current Docker state first; the initialization may have left the local DB running.
 
 For tests, use a disposable database named `clinic_voice_test`; create it if missing. Set `TEST_DATABASE_URL=postgresql://clinic:clinic_local_only@localhost:55432/clinic_voice_test` and run `pytest -q`. Tests truncate their test tables, so never use a production URL. Without TEST_DATABASE_URL the PostgreSQL tests skip, which is insufficient for a booking change. Also run `ruff check .`, `ruff format --check .`, and regenerate `docs/openapi.json` with `clinic-voice export-openapi` when API contracts change.
 

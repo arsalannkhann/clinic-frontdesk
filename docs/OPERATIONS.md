@@ -4,9 +4,17 @@
 
 Follow README setup. `docker compose stop` preserves data; `docker compose down` also preserves the named volume. `docker compose down -v` deletes local data and must only be used intentionally. Migrations run as a separate CLI step before API start, from the repository root. The application never auto-creates tables. The schema lock serializes migration processes, and checksums reject edits to applied files.
 
-The image runs as UID 10001. Build with `docker build -t clinic-voice:dev .`; pass DATABASE_URL, TOOL_TOKEN, and CLINIC_ID through your environment/secret manager. Inside a Compose network the DB hostname is `db:5432`, not localhost:55432. The Dockerfile does not run migrations on startup. No deployment automation is configured.
+The image runs as UID 10001. Build with `docker build -t clinic-voice:dev .`; pass DATABASE_URL through your environment/secret manager. Issue tool credentials with the CLI after migrating; the plaintext token is printed once and must go straight to the gateway's secret store. Inside a Compose network the DB hostname is `db:5432`, not localhost:55432. The Dockerfile does not run migrations on startup. No deployment automation is configured.
 
 Readiness checks schema availability and reports integrations `not_configured`. It does not certify calendar sync or a working phone line. Keep liveness separate so a provider outage does not trigger a restart loop. Pending outbox entries are expected in this foundation and are not consumed automatically.
+
+## Credential rotation
+
+1. `clinic-voice credential rotate <old-id> --grace-minutes 60` prints the replacement token; the old credential now expires within the grace window (rotation never extends an existing expiry).
+2. Deploy the new token to the caller (future Bolna gateway).
+3. Confirm `last_used_at` on the old credential stops advancing (`credential list --clinic <uuid>`; resolution is about five minutes), then `clinic-voice credential revoke <old-id>`.
+
+For a suspected leak, revoke first; revocation is effective on the next request. Migration 002 drops nothing; `TOOL_TOKEN`/`CLINIC_ID` environment variables are now ignored and should be deleted from deployed environments.
 
 ## Proposed pilot runbook
 

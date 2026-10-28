@@ -14,15 +14,15 @@ source .venv/bin/activate
 pip install -r requirements-dev.lock
 pip install --no-deps -e .
 cp .env.example .env
-python -c 'import secrets; print(secrets.token_urlsafe(32))'
-# Paste the generated value into TOOL_TOKEN in .env.
 docker compose up -d --wait db
 clinic-voice migrate
 clinic-voice seed-demo
+clinic-voice credential issue --clinic 00000000-0000-4000-8000-000000000001 --label local-dev
+# Prints credential_id and token once. Keep the token in your shell or a secret manager only.
 uvicorn clinic_voice.api:app --reload --no-access-log
 ```
 
-Open [API docs](http://127.0.0.1:8000/docs) or [readiness](http://127.0.0.1:8000/health/ready). No frontend is implemented yet. Seed IDs: clinic `...0001`, doctor `...0002`, service `...0003` (full UUIDs in `.env.example` and `cli.py`). The token maps to the configured clinic; a request cannot select its own tenant.
+Open [API docs](http://127.0.0.1:8000/docs) or [readiness](http://127.0.0.1:8000/health/ready). No frontend is implemented yet. Seed IDs: clinic `...0001`, doctor `...0002`, service `...0003` (full UUIDs in `cli.py`). Each credential record belongs to one clinic; a request cannot select its own tenant. Rotate with `clinic-voice credential rotate <id> --grace-minutes 60`, revoke with `clinic-voice credential revoke <id>`, and inspect usage with `clinic-voice credential list --clinic <uuid>`.
 
 ## Verify
 
@@ -40,7 +40,7 @@ Without `TEST_DATABASE_URL`, PostgreSQL tests skip explicitly. Tests reject data
 ## Example
 
 ```sh
-# Set TOOL_TOKEN to the same secret in .env in this shell; do not put secrets into tracked files.
+# Set TOOL_TOKEN in this shell to the issued token; do not put secrets into tracked files.
 curl http://127.0.0.1:8000/v1/tools/check-slots \
   -H "Authorization: Bearer $TOOL_TOKEN" -H 'Content-Type: application/json' \
   -d '{"doctor_id":"00000000-0000-4000-8000-000000000002","service_id":"00000000-0000-4000-8000-000000000003","day":"2030-01-01"}'
@@ -50,7 +50,7 @@ Replace `day` with a date within the next 90 days. Use an offered offset-aware t
 
 ## Repository map
 
-- `src/clinic_voice/`: API, tenant authentication, scheduling domain, transactional reservations, CLI.
+- `src/clinic_voice/`: API, tenant credential records, scheduling domain, transactional reservations, CLI.
 - `migrations/`: versioned PostgreSQL schema, applied atomically with checksums.
 - `agents/`: receptionist/reminder prompts, conversation flow, synthetic evaluation scenarios.
 - `.claude/agents/`: focused reviewer definitions; `AGENTS.md` and `CLAUDE.md` govern agent work.

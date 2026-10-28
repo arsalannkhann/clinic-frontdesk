@@ -2,11 +2,11 @@
 
 ## Current controls
 
-Secret configuration is required at startup and redacted in settings representation. The demo bearer token maps to one server-selected tenant. Reads scope by tenant and schema foreign keys scope doctor/service writes. Validation responses omit submitted values. Application code does not log request bodies or patient data. The local database binds only to loopback. Source documents, credentials, recordings, and transcripts are ignored by Git.
+Secret configuration is required at startup and redacted in settings representation. Tool bearer tokens are per-clinic credential records (`tenant_credentials`): 256-bit random secrets, stored only as SHA-256 digests, shown once at issue, with expiry, overlap-window rotation, immediate revocation and coarse last-used tracking. Credential administration is CLI-only (operator access to the database); there is no HTTP endpoint for it yet. Reads scope by tenant and schema foreign keys scope doctor/service writes. Validation responses omit submitted values. Application code does not log request bodies or patient data. The local database binds only to loopback. Source documents, credentials, recordings, and transcripts are ignored by Git.
 
 ## Release blockers
 
-This public repository is a development scaffold. Before a pilot implement tenant credential rotation/revocation, staff login and roles, TLS and request/rate/concurrency limits, trusted proxy configuration, audit trails, verified call identity and anti-replay controls, encrypted OAuth credentials, retention/deletion policy, backups/restore drills, monitoring, and access reviews. Plain database storage alone is not appropriate for health or credential data. Use a secrets manager and managed encryption; do not persist raw OAuth tokens in clinic rows.
+This public repository is a development scaffold. Before a pilot implement staff login and roles, credential administration audit trail, TLS and request/rate/concurrency limits, trusted proxy configuration, audit trails, verified call identity and anti-replay controls, encrypted OAuth credentials, retention/deletion policy, backups/restore drills, monitoring, and access reviews. Plain database storage alone is not appropriate for health or credential data. Use a secrets manager and managed encryption; do not persist raw OAuth tokens in clinic rows.
 
 Bolna custom headers can authenticate tool/webhook traffic once verified against the provider contract. An IP allowlist is defense in depth, never the sole credential. Do not trust arbitrary X-Forwarded-For. Confirm vendor address ranges at deployment; never copy the DOCX's malformed `13.202.133.534`. Do not send production payloads to public webhook debugging services.
 
