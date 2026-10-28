@@ -56,7 +56,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "005_schedule_exceptions.sql"
+REQUIRED_MIGRATION = "006_calendar_mapping.sql"
 
 
 @app.get("/health/live")

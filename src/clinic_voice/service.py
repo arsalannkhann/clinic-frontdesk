@@ -30,7 +30,8 @@ def busy_intervals(conn, clinic_id, doctor_id, start, end):
     """Local busy time overlapping [start, end) as (start, end) pairs.
 
     Appointments hold the doctor until blocks_until (end plus the buffer snapshotted at
-    booking); schedule exceptions apply to their doctor or, with no doctor, the whole clinic.
+    booking); schedule exceptions apply to their doctor or, with no doctor, the whole clinic; cached
+    external calendar busy time (advisory, see calendar_sync.py) also counts.
     """
     rows = conn.execute(
         """SELECT starts_at, blocks_until AS ends_at FROM appointments
@@ -39,11 +40,18 @@ def busy_intervals(conn, clinic_id, doctor_id, start, end):
         UNION ALL
         SELECT starts_at, ends_at FROM schedule_exceptions
         WHERE clinic_id=%s AND (doctor_id IS NULL OR doctor_id=%s)
-        AND starts_at < %s AND ends_at > %s""",
+        AND starts_at < %s AND ends_at > %s
+        UNION ALL
+        SELECT starts_at, ends_at FROM external_busy
+        WHERE clinic_id=%s AND doctor_id=%s AND starts_at < %s AND ends_at > %s""",
         (
             clinic_id,
             doctor_id,
             list(ACTIVE_STATUSES),
+            end,
+            start,
+            clinic_id,
+            doctor_id,
             end,
             start,
             clinic_id,

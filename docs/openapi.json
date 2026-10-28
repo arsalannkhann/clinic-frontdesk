@@ -1436,6 +1436,24 @@
           "active": {
             "type": "boolean",
             "title": "Active"
+          },
+          "booking_calendar_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Booking Calendar Id"
+          },
+          "busy_calendar_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Busy Calendar Ids"
           }
         },
         "additionalProperties": false,
@@ -1443,7 +1461,9 @@
         "required": [
           "id",
           "name",
-          "active"
+          "active",
+          "booking_calendar_id",
+          "busy_calendar_ids"
         ],
         "title": "DoctorOut"
       },
@@ -1472,6 +1492,36 @@
               }
             ],
             "title": "Active"
+          },
+          "booking_calendar_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 255,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Booking Calendar Id"
+          },
+          "busy_calendar_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string",
+                  "maxLength": 255,
+                  "minLength": 1
+                },
+                "type": "array",
+                "maxItems": 10
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Busy Calendar Ids"
           }
         },
         "additionalProperties": false,

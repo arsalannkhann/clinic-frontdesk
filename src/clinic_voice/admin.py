@@ -48,9 +48,13 @@ def update_clinic(conn, staff, changes):
     return row
 
 
+DOCTOR_COLUMNS = "id,name,active,booking_calendar_id,busy_calendar_ids"
+
+
 def list_doctors(conn, clinic_id):
     return conn.execute(
-        "SELECT id,name,active FROM doctors WHERE clinic_id=%s ORDER BY name,id", (clinic_id,)
+        f"SELECT {DOCTOR_COLUMNS} FROM doctors WHERE clinic_id=%s ORDER BY name,id",  # noqa: S608
+        (clinic_id,),
     ).fetchall()
 
 
@@ -59,7 +63,7 @@ def create_doctor(conn, staff, name):
     lock_doctor_set(conn, staff["clinic_id"], exclusive=False)
     doctor_id = uuid4()
     row = conn.execute(
-        "INSERT INTO doctors (id,clinic_id,name) VALUES (%s,%s,%s) RETURNING id,name,active",
+        f"INSERT INTO doctors (id,clinic_id,name) VALUES (%s,%s,%s) RETURNING {DOCTOR_COLUMNS}",  # noqa: S608
         (doctor_id, staff["clinic_id"], name),
     ).fetchone()
     audit(conn, staff["clinic_id"], staff["id"], "doctor.created", doctor_id)
@@ -67,9 +71,10 @@ def create_doctor(conn, staff, name):
 
 
 def update_doctor(conn, staff, doctor_id, changes):
-    row = _update(conn, "doctors", ("name", "active"), staff["clinic_id"], doctor_id, changes)
+    columns = ("name", "active", "booking_calendar_id", "busy_calendar_ids")
+    row = _update(conn, "doctors", columns, staff["clinic_id"], doctor_id, changes)
     audit(conn, staff["clinic_id"], staff["id"], "doctor.updated", doctor_id)
-    return {"id": row["id"], "name": row["name"], "active": row["active"]}
+    return {k: row[k] for k in DOCTOR_COLUMNS.split(",")}
 
 
 SERVICE_COLUMNS = "id,doctor_id,name,duration_minutes,buffer_after_minutes,active"

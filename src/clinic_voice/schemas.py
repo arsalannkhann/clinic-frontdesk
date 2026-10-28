@@ -142,15 +142,50 @@ class DoctorCreate(StrictModel):
     name: DisplayName
 
 
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _no_control_characters(value):
+    # Checked before trimming so a trailing newline is rejected rather than silently dropped.
+    if isinstance(value, str) and CONTROL_CHARACTERS.search(value):
+        raise ValueError("control characters are not allowed")
+    return value
+
+
+# Opaque provider calendar id (for Google, an email-like string); never patient data.
+CalendarId = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(min_length=1, max_length=255),
+]
+
+
 class DoctorUpdate(PatchModel):
     name: DisplayName | None = None
     active: bool | None = None
+    booking_calendar_id: CalendarId | None = None  # null unsets the mapping
+    busy_calendar_ids: Annotated[list[CalendarId], Field(max_length=10)] | None = None
+
+    @model_validator(mode="after")
+    def _present(self):
+        # Overrides PatchModel: booking_calendar_id may be an explicit null.
+        if not self.model_fields_set:
+            raise ValueError("no fields to update")
+        if any(
+            getattr(self, name) is None
+            for name in self.model_fields_set
+            if name != "booking_calendar_id"
+        ):
+            raise ValueError("null is not allowed")
+        return self
 
 
 class DoctorOut(StrictModel):
     id: UUID
     name: str
     active: bool
+    booking_calendar_id: str | None
+    busy_calendar_ids: list[str]
 
 
 class ServiceCreate(StrictModel):
@@ -204,16 +239,6 @@ class HoursReplace(RootModel[Annotated[list[HoursWindow], Field(max_length=50)]]
 
 # Schedule exceptions (holidays, leave, breaks)
 ExceptionKind = Literal["holiday", "leave", "break"]
-CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
-
-
-def _no_control_characters(value):
-    # Checked before trimming so a trailing newline is rejected rather than silently dropped.
-    if isinstance(value, str) and CONTROL_CHARACTERS.search(value):
-        raise ValueError("control characters are not allowed")
-    return value
-
-
 # Operational note such as "Diwali" or "Lunch"; never patient details.
 ExceptionLabel = Annotated[
     str,
