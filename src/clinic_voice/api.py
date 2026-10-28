@@ -12,6 +12,7 @@ from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tenant
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.schemas import (
+    SLOT_SOURCE,
     LoginRequest,
     PasswordChange,
     ReservationRequest,
@@ -80,7 +81,7 @@ def ready():
 def check_slots(query: SlotQuery, clinic_id=Depends(tenant)):
     with database() as conn:
         available = slots(conn, clinic_id, query.doctor_id, query.service_id, query.day)
-    return {"slots": available[:3], "source": "local_reservations_only"}
+    return {"slots": available[:3], "source": SLOT_SOURCE}
 
 
 @app.post("/v1/tools/reserve-slot", response_model=ReservationResponse, status_code=202)

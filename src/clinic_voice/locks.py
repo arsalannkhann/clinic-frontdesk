@@ -7,6 +7,10 @@ locks in this global order, and never in reverse, so the paths cannot deadlock:
 3. Doctor rows FOR UPDATE in ascending id order.
 
 No provider or network I/O may run while these are held.
+
+Separate namespace: calendar_sync takes "busy:<clinic>:<doctor>" (advisory, per doctor) while
+refreshing the external busy cache. It is taken standalone, never together with the locks
+above, so it imposes no ordering.
 """
 
 

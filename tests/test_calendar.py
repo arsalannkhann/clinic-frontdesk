@@ -282,6 +282,8 @@ def test_admin_doctor_calendar_fields_roundtrip(client, database):
         {"booking_calendar_id": 5},
         {"busy_calendar_ids": ["ok"] * 11},
         {"busy_calendar_ids": [""]},
+        {"busy_calendar_ids": ["   "]},
+        {"booking_calendar_id": "  "},
         {"busy_calendar_ids": ["x" * 256]},
         {"busy_calendar_ids": ["bad\x00id"]},
         {"busy_calendar_ids": [None]},
@@ -342,16 +344,15 @@ def test_refresh_stores_clipped_merged_intervals(database):
     fake = FakeCalendar()
     fake.busy[BUSY] = [(at(11), at(12)), (at(11, 30), at(12, 30)), (at(8), at(9, 30))]
     fake.insert_event(CAL, event("evt00001", at(14), at(15)))
-    assert refresh(database, fake, start=at(9), end=at(16)) == 3
+    assert refresh(database, fake, start=at(9), end=at(16)) is True
     assert cached(database) == [(at(9), at(9, 30)), (at(11), at(12, 30)), (at(14), at(15))]
     with connect(database) as conn:
         sources = conn.execute(
-            "SELECT source_calendar, count(*) AS n FROM external_busy GROUP BY 1"
+            "SELECT source_calendar, count(*) AS n, bool_and(fetched_at IS NOT NULL) AS stamped"
+            " FROM external_busy GROUP BY 1"
         ).fetchall()
     assert {r["source_calendar"]: r["n"] for r in sources} == {BUSY: 2, CAL: 1}
-    with connect(database) as conn:
-        row = conn.execute("SELECT fetched_at FROM external_busy LIMIT 1").fetchone()
-    assert row["fetched_at"] is not None
+    assert all(r["stamped"] for r in sources)
 
 
 def test_refresh_without_calendars_clears_window_and_skips_provider(database):
@@ -365,7 +366,7 @@ def test_refresh_without_calendars_clears_window_and_skips_provider(database):
             " VALUES (%s,%s,%s,%s,%s,'x')",
             (uuid4(), CLINIC, DOCTOR_ID, at(10), at(11)),
         )
-    assert refresh(database, Explodes()) == 0
+    assert refresh(database, Explodes()) is True
     assert cached(database) == []
 
 
@@ -441,7 +442,7 @@ def test_refresh_rolls_back_if_insert_fails(database):
         def free_busy(self, *args):
             return [(at(12), at(13)), ("not", "datetimes")]
 
-    with pytest.raises(Exception):  # noqa: B017
+    with pytest.raises(TypeError):
         refresh(database, Bad())
     assert cached(database) == [(at(10), at(11))]
 
@@ -564,3 +565,145 @@ def test_concurrent_refreshes_leave_no_duplicates(database):
     [t.join() for t in threads]
     assert not errors
     assert cached(database) == [(at(10), at(11)), (at(13), at(14))]
+
+
+def row_dump(database, doctor=DOCTOR_ID):
+    with connect(database) as conn:
+        return conn.execute(
+            "SELECT starts_at, ends_at, source_calendar FROM external_busy"
+            " WHERE doctor_id=%s ORDER BY starts_at, ends_at",
+            (doctor,),
+        ).fetchall()
+
+
+def insert_row(database, start, end, source="old", fetched_at=None):
+    with connect(database) as conn:
+        conn.execute(
+            "INSERT INTO external_busy (id,clinic_id,doctor_id,starts_at,ends_at,source_calendar,"
+            "fetched_at) VALUES (%s,%s,%s,%s,%s,%s,coalesce(%s, now()))",
+            (uuid4(), CLINIC, DOCTOR_ID, start, end, source, fetched_at),
+        )
+
+
+def test_refresh_preserves_out_of_window_part_of_straddling_rows(database):
+    map_doctor(database)
+    insert_row(database, at(8), at(10), "left")  # straddles the start edge
+    insert_row(database, at(15), at(18), "right")  # straddles the end edge
+    insert_row(database, at(7), at(19), "cover")  # covers the whole window
+    insert_row(database, at(11), at(12), "inside")
+    fake = FakeCalendar()
+    fake.busy[BUSY] = [(at(13), at(14))]
+    refresh(database, fake, start=at(9), end=at(16))
+    assert [(r["starts_at"], r["ends_at"], r["source_calendar"]) for r in row_dump(database)] == [
+        (at(7), at(9), "cover"),
+        (at(8), at(9), "left"),
+        (at(13), at(14), BUSY),
+        (at(16), at(18), "right"),
+        (at(16), at(19), "cover"),
+    ]
+
+
+def test_stale_refresh_is_skipped(database):
+    map_doctor(database)
+    insert_row(database, at(10), at(11), "newer", fetched_at=datetime(2099, 1, 1, tzinfo=IST))
+    fake = FakeCalendar()
+    fake.busy[BUSY] = [(at(13), at(14))]
+    assert refresh(database, fake) is False
+    assert cached(database) == [(at(10), at(11))]
+    other_window = refresh(database, fake, start=at(12), end=at(15))  # no newer row there
+    assert other_window is True and (at(13), at(14)) in cached(database)
+
+
+def test_refresh_prunes_rows_that_ended(database):
+    map_doctor(database)
+    past = datetime(2020, 1, 1, tzinfo=IST)
+    insert_row(database, past, past + timedelta(hours=1))
+    insert_row(database, at(10), at(11))
+    refresh(database, FakeCalendar(), start=at(12), end=at(13))
+    assert cached(database) == [(at(10), at(11))]
+
+
+def test_refresh_refuses_autocommit_connection(database):
+    conn = connect(database)
+    try:
+        conn.autocommit = True
+        with pytest.raises(RuntimeError):
+            calendar_sync.refresh_external_busy(
+                conn, FakeCalendar(), CLINIC, DOCTOR_ID, at(0), at(23)
+            )
+    finally:
+        conn.close()
+
+
+def test_fail_next_covers_every_operation_and_calls_are_logged():
+    fake = FakeCalendar()
+    stored = event()
+    calls = {
+        "get_event": lambda: fake.get_event(CAL, "evt00001"),
+        "insert_event": lambda: fake.insert_event(CAL, stored),
+        "cancel_event": lambda: fake.cancel_event(CAL, "evt00001"),
+        "free_busy": lambda: fake.free_busy([CAL], at(0), at(23)),
+    }
+    for op, call in calls.items():
+        fake.fail_next(1, ProviderPermanent, op=op)
+        with pytest.raises(ProviderPermanent):
+            call()
+        call()  # the queue for this op is exhausted; other ops were unaffected
+    assert [c[0] for c in fake.calls] == [name for op in calls for name in (op, op)]
+    with pytest.raises(ValueError):
+        fake.fail_next(1, op="nope")
+
+
+def test_fail_next_is_per_operation():
+    fake = FakeCalendar()
+    fake.fail_next(1, ProviderRetryable, op="get_event")
+    fake.insert_event(CAL, event())  # unaffected
+    with pytest.raises(ProviderRetryable):
+        fake.get_event(CAL, "evt00001")
+
+
+def test_call_log_shows_get_before_insert():
+    fake = FakeCalendar()
+    assert fake.get_event(CAL, "evt00001") is None
+    fake.insert_event(CAL, event())
+    assert [c[0] for c in fake.calls] == ["get_event", "insert_event"]
+    assert fake.calls[1] == ("insert_event", CAL, "evt00001")
+
+
+def test_retryable_carries_retry_after():
+    assert ProviderRetryable().retry_after is None
+    assert ProviderRetryable("rate_limited", retry_after=2.5).retry_after == 2.5
+
+
+def test_calendar_event_validation():
+    start = at(10)
+    with pytest.raises(ValueError):
+        CalendarEvent("evt00001", datetime(2031, 1, 1, 10), datetime(2031, 1, 1, 11), "s")
+    with pytest.raises(ValueError):
+        CalendarEvent("evt00001", start, start, "s")
+    with pytest.raises(ValueError):
+        CalendarEvent("evt00001", start, start + timedelta(hours=1), "s", status="tentative")
+    assert event_id_for(uuid4(), 1)
+    for bad in (0, -1):
+        with pytest.raises(ValueError):
+            event_id_for(uuid4(), bad)
+
+
+def test_busy_calendar_ids_are_trimmed_and_deduplicated(client, database):
+    h = headers(client, database)
+    body = {"busy_calendar_ids": [" b ", "a", "b", "a"]}
+    r = client.patch(f"/v1/admin/doctors/{DOCTOR_ID}", headers=h, json=body)
+    assert r.status_code == 200 and r.json()["busy_calendar_ids"] == ["b", "a"]
+
+
+def test_check_slots_reports_slot_source(client, database):
+    from clinic_voice import credentials
+    from clinic_voice.schemas import SLOT_SOURCE
+
+    with connect(database) as conn:
+        _, token = credentials.issue(conn, CLINIC, "source-test")
+    body = {"doctor_id": str(DOCTOR_ID), "service_id": str(SERVICE_ID), "day": DAY.isoformat()}
+    r = client.post(
+        "/v1/tools/check-slots", headers={"Authorization": f"Bearer {token}"}, json=body
+    )
+    assert r.json()["source"] == SLOT_SOURCE == "ledger_and_cached_calendar"

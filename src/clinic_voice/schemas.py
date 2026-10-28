@@ -41,9 +41,13 @@ class ReservationResponse(StrictModel):
     spoken_confirmation: str
 
 
+# Slots come from the ledger plus the cached (advisory) external calendar busy time.
+SLOT_SOURCE = "ledger_and_cached_calendar"
+
+
 class SlotResponse(StrictModel):
     slots: list[AwareDatetime] = Field(default_factory=list)
-    source: str = "local_reservations_only"
+    source: str = SLOT_SOURCE
 
 
 Email = Annotated[
@@ -152,19 +156,33 @@ def _no_control_characters(value):
     return value
 
 
+def _non_blank(value):
+    # Re-checked after trimming: a whitespace-only id must not reach the database.
+    if not value.strip():
+        raise ValueError("calendar id must not be blank")
+    return value
+
+
 # Opaque provider calendar id (for Google, an email-like string); never patient data.
 CalendarId = Annotated[
     str,
     BeforeValidator(_no_control_characters),
-    StringConstraints(min_length=1, max_length=255),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=255),
+    AfterValidator(_non_blank),
 ]
+
+
+def _unique_in_order(values):
+    return list(dict.fromkeys(values))
 
 
 class DoctorUpdate(PatchModel):
     name: DisplayName | None = None
     active: bool | None = None
     booking_calendar_id: CalendarId | None = None  # null unsets the mapping
-    busy_calendar_ids: Annotated[list[CalendarId], Field(max_length=10)] | None = None
+    busy_calendar_ids: (
+        Annotated[list[CalendarId], Field(max_length=10), AfterValidator(_unique_in_order)] | None
+    ) = None
 
     @model_validator(mode="after")
     def _present(self):

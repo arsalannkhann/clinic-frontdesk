@@ -2058,7 +2058,7 @@
           "source": {
             "type": "string",
             "title": "Source",
-            "default": "local_reservations_only"
+            "default": "ledger_and_cached_calendar"
           }
         },
         "additionalProperties": false,
