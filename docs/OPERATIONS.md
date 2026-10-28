@@ -16,6 +16,10 @@ Readiness checks schema availability and reports integrations `not_configured`. 
 
 For a suspected leak, revoke first; revocation is effective on the next request. Migration 002 drops nothing; `TOOL_TOKEN`/`CLINIC_ID` environment variables are now ignored and should be deleted from deployed environments.
 
+## Staff bootstrap and recovery
+
+Create a clinic's first owner with `clinic-voice staff create-owner --clinic <uuid> --email <address>`; the password is read from a hidden prompt or a single stdin line, never from arguments. The owner then creates other staff via `POST /v1/staff/users`. To recover a locked-out or forgotten account run `clinic-voice staff set-password --email <address>`: it clears the lockout, revokes every session for that user and writes a `staff.password_reset` audit event. Migration 003 only adds tables.
+
 ## Proposed pilot runbook
 
 1. Record the commit/image digest and migration version; back up DB and verify restore procedures.

@@ -19,6 +19,8 @@ clinic-voice migrate
 clinic-voice seed-demo
 clinic-voice credential issue --clinic 00000000-0000-4000-8000-000000000001 --label local-dev
 # Prints credential_id and token once. Keep the token in your shell or a secret manager only.
+clinic-voice staff create-owner --clinic 00000000-0000-4000-8000-000000000001 --email owner@example.test
+# Prompts for a 12+ character password; then POST /v1/staff/login returns a staff session token.
 uvicorn clinic_voice.api:app --reload --no-access-log
 ```
 

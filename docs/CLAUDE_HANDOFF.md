@@ -36,9 +36,9 @@ Implement a coherent trusted-clinic/calendar slice before adding live telephony.
 
 If milestone 1 is too large for one turn, complete the first runnable slice with tests and an exact next-step note. Continue autonomously with already authorized repo work; do not stop merely after presenting a plan.
 
-## Exact next step (after credential records)
+## Exact next step (after staff authentication)
 
-Milestone 1 step 1 continues with staff users and roles (new migration; password hashing with a stretching KDF or an external IdP decision recorded as an ADR; session/token issuance separate from `tools` credentials), then tenant-scoped clinic/doctor/service/hours administration API behind those roles with IANA zone validation, then schedule exceptions (holidays/leave), lead time and buffers in `candidate_slots`. Each needs PostgreSQL tests for cross-tenant references.
+Tool credentials (migration 002, ADR 0002) and staff users/roles/sessions with lockout, audit events and a staff management API (migration 003, ADR 0003) are done. Milestone 1 step 1 continues with tenant-scoped clinic/doctor/service/hours administration API behind the `owner`/`admin` roles (use `require_role` in `api.py`, derive the clinic from the session, write `audit_events`) with IANA zone validation, then schedule exceptions (holidays/leave), lead time and buffers in `candidate_slots`. Each needs PostgreSQL tests for cross-tenant references.
 
 ## Next milestones after that slice
 

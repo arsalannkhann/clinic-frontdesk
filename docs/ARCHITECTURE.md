@@ -29,7 +29,7 @@ Google FreeBusy is not a distributed lock. Before a pilot choose an explicit own
 
 ## Planned tenant boundary
 
-Each tool bearer token is a `tenant_credentials` record owned by exactly one clinic (ADR 0002); tenant identity is never read from tool arguments. All current catalog/appointment reads filter by clinic; composite foreign keys prevent cross-clinic doctor/service references. This is still not complete multi-tenant auth: next add staff users and roles, object-level authorization, and gateway-verified call/session context. Consider PostgreSQL RLS as defense in depth, with isolated role tests, before a pilot.
+Each tool bearer token is a `tenant_credentials` record owned by exactly one clinic (ADR 0002); tenant identity is never read from tool arguments. All current catalog/appointment reads filter by clinic; composite foreign keys prevent cross-clinic doctor/service references. Staff users and sessions (ADR 0003) belong to one clinic, and staff management derives the tenant from the session. This is still not complete multi-tenant auth: next put clinic configuration behind these roles, then add gateway-verified call/session context. Consider PostgreSQL RLS as defense in depth, with isolated role tests, before a pilot.
 
 Caller ID is untrusted. Do not greet with private booking information or allow cancellation using only a phone number. Add a clinic-approved verification mechanism and handle shared phones. Never ask an LLM to decide tenant identity or invent idempotency keys.
 

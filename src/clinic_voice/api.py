@@ -1,15 +1,29 @@
 from contextlib import asynccontextmanager
 from typing import Annotated
+from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from psycopg import Error as DatabaseError
 
+from clinic_voice import staff as staff_service
 from clinic_voice.config import get_settings
 from clinic_voice.credentials import authenticate, parse
 from clinic_voice.db import connect
-from clinic_voice.schemas import ReservationRequest, ReservationResponse, SlotQuery, SlotResponse
+from clinic_voice.schemas import (
+    LoginRequest,
+    PasswordChange,
+    ReservationRequest,
+    ReservationResponse,
+    SessionResponse,
+    SlotQuery,
+    SlotResponse,
+    StaffUser,
+    StaffUserCreate,
+    StaffUserDetail,
+    StaffUserUpdate,
+)
 from clinic_voice.service import reserve, slots
 
 
@@ -40,7 +54,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "002_tenant_credentials.sql"
+REQUIRED_MIGRATION = "003_staff_auth.sql"
 
 
 def unauthorized():
@@ -95,3 +109,82 @@ def reserve_slot(
     return reserve(
         get_settings().database_url.get_secret_value(), clinic_id, request, idempotency_key
     )
+
+
+def database():
+    return connect(get_settings().database_url.get_secret_value())
+
+
+def staff_session(authorization: Annotated[str | None, Header()] = None):
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme != "Bearer" or staff_service.parse_session(token) is None:
+        raise unauthorized()  # Tool credentials never parse as staff sessions.
+    with database() as conn:
+        staff = staff_service.authenticate_session(conn, token)
+    if staff is None:
+        raise unauthorized()
+    return staff
+
+
+def require_role(*roles):
+    def check(staff=Depends(staff_session)):
+        if staff["role"] not in roles:
+            raise HTTPException(403, "Insufficient role")
+        return staff
+
+    return check
+
+
+@app.post("/v1/staff/login", response_model=SessionResponse)
+def staff_login(request: LoginRequest):
+    with database() as conn:
+        session = staff_service.login(conn, request.email, request.password)
+    if session is None:
+        raise HTTPException(401, "Invalid email or password")
+    return session
+
+
+@app.post("/v1/staff/logout", status_code=204)
+def staff_logout(staff=Depends(staff_session)):
+    with database() as conn:
+        staff_service.logout(conn, staff)
+    return Response(status_code=204)
+
+
+@app.get("/v1/staff/me", response_model=StaffUser)
+def staff_me(staff=Depends(staff_session)):
+    return staff_service.public(staff)
+
+
+@app.post("/v1/staff/me/password", status_code=204)
+def staff_change_password(request: PasswordChange, staff=Depends(staff_session)):
+    with database() as conn:
+        staff_service.change_password(conn, staff, request.current_password, request.new_password)
+    return Response(status_code=204)
+
+
+@app.get("/v1/staff/users", response_model=list[StaffUserDetail])
+def staff_list_users(staff=Depends(require_role("owner", "admin"))):
+    with database() as conn:
+        return staff_service.list_users(conn, staff["clinic_id"])
+
+
+@app.post("/v1/staff/users", response_model=StaffUser, status_code=201)
+def staff_create_user(request: StaffUserCreate, staff=Depends(require_role("owner"))):
+    with database() as conn:
+        return staff_service.create_user(
+            conn,
+            staff["clinic_id"],
+            request.email,
+            request.role,
+            request.temporary_password,
+            actor_id=staff["id"],
+        )
+
+
+@app.patch("/v1/staff/users/{user_id}", response_model=StaffUserDetail)
+def staff_update_user(
+    user_id: UUID, request: StaffUserUpdate, staff=Depends(require_role("owner"))
+):
+    with database() as conn:
+        return staff_service.update_user(conn, staff, user_id, request.role, request.disabled)

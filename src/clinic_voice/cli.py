@@ -1,11 +1,14 @@
 import argparse
+import sys
 from datetime import timedelta
+from getpass import getpass
 from pathlib import Path
 from uuid import UUID
 
+from fastapi import HTTPException
 from psycopg.errors import ForeignKeyViolation
 
-from clinic_voice import credentials
+from clinic_voice import credentials, staff
 from clinic_voice.config import get_settings
 from clinic_voice.db import connect, migrate
 
@@ -62,6 +65,38 @@ def credential_command(url, args):
     print(f"token={token}")
 
 
+def read_password():
+    # Never accept passwords as arguments: they leak into shell history and process lists.
+    if sys.stdin.isatty():
+        password = getpass("Password: ")
+        if getpass("Repeat password: ") != password:
+            raise SystemExit("Passwords do not match")
+    else:
+        password = sys.stdin.readline().rstrip("\n")
+    if not 12 <= len(password) <= 256:
+        raise SystemExit("Password must be 12 to 256 characters")
+    return password
+
+
+def staff_command(url, args):
+    password = read_password()
+    with connect(url) as conn:
+        if args.action == "create-owner":
+            try:
+                user = staff.create_user(conn, args.clinic, args.email, "owner", password)
+            except ForeignKeyViolation:
+                raise SystemExit("Clinic not found") from None
+            except HTTPException as error:
+                raise SystemExit(error.detail) from None
+            print(f"created owner {user['id']}")
+        else:
+            try:
+                staff.set_password(conn, args.email, password)
+            except LookupError as error:
+                raise SystemExit(str(error)) from None
+            print("password reset; existing sessions revoked")
+
+
 def main():
     parser = argparse.ArgumentParser(prog="clinic-voice")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -80,6 +115,13 @@ def main():
     revoke.add_argument("credential", type=UUID)
     listing = actions.add_parser("list")
     listing.add_argument("--clinic", type=UUID, required=True)
+    staff_parser = commands.add_parser("staff", help="Bootstrap and recover staff accounts")
+    staff_actions = staff_parser.add_subparsers(dest="action", required=True)
+    owner = staff_actions.add_parser("create-owner", help="Password is read from stdin/prompt")
+    owner.add_argument("--clinic", type=UUID, required=True)
+    owner.add_argument("--email", required=True)
+    reset = staff_actions.add_parser("set-password", help="Password is read from stdin/prompt")
+    reset.add_argument("--email", required=True)
     args = parser.parse_args()
     if getattr(args, "grace_minutes", 0) not in range(0, 10081):
         parser.error("--grace-minutes must be between 0 and 10080")
@@ -95,5 +137,7 @@ def main():
         migrate(url, Path("migrations"))
     elif args.command == "seed-demo":
         seed(url)
+    elif args.command == "staff":
+        staff_command(url, args)
     else:
         credential_command(url, args)

@@ -8,7 +8,7 @@ Local slot computation, anonymous reservations, tenant token mapping, PostgreSQL
 
 Implement credential records and rotation, staff authentication, clinic/doctor/service/hours CRUD with validated IANA zones, holiday/leave exceptions, lead time and buffers. Add encrypted Google OAuth using state/PKCE and minimum required scopes. Add durable job leases, retry backoff, dead-letter review, calendar adapter fake and live contract tests, deterministic event IDs, and timeout reconciliation. Add appointment version and calendar-sync state. Establish calendar ownership and external-conflict handling.
 
-Progress: tenant credential records with hashed secrets, rotation, expiry and revocation are implemented (migration 002, ADR 0002) and replace the bootstrap token. Remaining in this milestone is everything else listed above.
+Progress: tenant credential records with hashed secrets, rotation, expiry and revocation are implemented (migration 002, ADR 0002) and replace the bootstrap token. Staff users, roles (owner/admin/viewer), scrypt passwords, sessions, lockout, staff management API and an audit trail are implemented (migration 003, ADR 0003). Remaining in this milestone: clinic/doctor/service/hours CRUD, schedule exceptions, lead time, buffers, calendar ports, durable worker and OAuth.
 
 Acceptance: tenant A cannot reference tenant B IDs; revoked keys fail; two workers do not duplicate events; crash after provider success recovers; external busy time is respected; no unverified spoken confirmation. Exclusion concurrency tests remain green.
 
