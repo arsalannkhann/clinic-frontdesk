@@ -4,9 +4,9 @@ Jobs are outbox rows. A worker claims due jobs in one short transaction (FOR UPD
 LOCKED), which sets a lease (owner + expiry) and increments attempts, and commits before any
 provider I/O. Every later state change is fenced on (id, clinic_id, lease_owner, attempts,
 status='processing'): if another worker reclaimed the job after this one's lease expired, the
-fence matches nothing and the stale worker must stop. Attempts only ever grow while a job is
-owned (release() on shutdown is the one decrement, for a job that never started), so a fence
-value is never reused by a later claim.
+fence matches nothing and the stale worker must stop. Attempts never decrease (requeue and
+release() on shutdown extend max_attempts instead), so a fence value is never reused by a
+later claim.
 
 The lease is renewed just before a job starts and by handlers between provider calls
 (renew()). Adapter timeouts must therefore stay well under the lease: check_ports() rejects a
@@ -23,7 +23,7 @@ Kinds without a handler are dead-lettered with 'unknown_kind'.
 
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from threading import Event
 from typing import Any
@@ -31,10 +31,12 @@ from uuid import UUID
 
 from psycopg import Error as DatabaseError
 from psycopg.pq import TransactionStatus
+from psycopg.types.json import Jsonb
 
 from clinic_voice.db import connect
 from clinic_voice.providers.calendar import (
     CalendarPort,
+    FakeCalendar,
     ProviderError,
     ProviderPermanent,
     ProviderRetryable,
@@ -87,8 +89,14 @@ def _handlers() -> dict[str, Handler]:
 
 
 def check_ports(ports, lease=DEFAULT_LEASE):
+    """Every adapter except the in-process FakeCalendar must declare `timeout_seconds`, and it
+    must be at most lease / LEASE_TIMEOUT_RATIO."""
+    if isinstance(ports.calendar, FakeCalendar):
+        return
     timeout = getattr(ports.calendar, "timeout_seconds", None)
-    if timeout is not None and timeout * LEASE_TIMEOUT_RATIO > lease.total_seconds():
+    if not isinstance(timeout, int | float) or timeout <= 0:
+        raise ValueError("calendar adapter must declare a positive timeout_seconds")
+    if timeout * LEASE_TIMEOUT_RATIO > lease.total_seconds():
         raise ValueError(
             f"calendar timeout {timeout}s is too long for a {lease.total_seconds():.0f}s lease"
         )
@@ -168,7 +176,8 @@ def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None) -> list[Jo
         f"""WITH due AS (
             SELECT id FROM outbox
             WHERE ((status = 'pending' AND available_at <= now())
-                OR (status = 'processing' AND lease_expires_at < now()))
+                OR (status = 'processing' AND lease_expires_at < now()
+                    AND attempts < max_attempts))
             AND {kind_filter}
             ORDER BY available_at
             LIMIT %(limit)s
@@ -203,6 +212,20 @@ def renew(conn, job) -> bool:
     ).fetchone()
     conn.commit()
     return row is not None
+
+
+def remember(conn, job, **values):
+    """Merge values into the job's payload and renew its lease, fenced, and commit. Returns
+    the updated Job, or None if the lease was lost. Used to record write intent (such as the
+    target calendar) before a provider write, so later attempts act on the same target."""
+    require_idle(conn)
+    row = conn.execute(
+        "UPDATE outbox SET payload = payload || %s, lease_expires_at=now() + %s, updated_at=now()"
+        f" WHERE {FENCE} RETURNING payload",  # noqa: S608
+        (Jsonb(values), job.lease, *_fence(job)),
+    ).fetchone()
+    conn.commit()
+    return None if row is None else replace(job, payload=row["payload"])
 
 
 def mark_done(conn, job) -> bool:
@@ -258,10 +281,11 @@ def retry(conn, job, error_code, delay=None) -> bool:
 
 
 def release(conn, job) -> bool:
-    """Give back a claimed job that never started (worker stopping): pending, due now, and
-    the claim's attempt undone. Fenced, so a job already reclaimed elsewhere is untouched."""
+    """Give back a claimed job that never started (worker stopping): pending and due now.
+    attempts stays (monotonic fences); max_attempts grows by one so the unused claim costs
+    nothing. Fenced, so a job already reclaimed elsewhere is untouched."""
     row = conn.execute(
-        "UPDATE outbox SET status='pending', attempts=attempts - 1, lease_expires_at=NULL,"
+        "UPDATE outbox SET status='pending', max_attempts=max_attempts + 1, lease_expires_at=NULL,"
         f" available_at=now(), updated_at=now() WHERE {FENCE} RETURNING id",  # noqa: S608
         _fence(job),
     ).fetchone()

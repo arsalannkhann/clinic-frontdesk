@@ -10,12 +10,13 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from clinic_voice.calendar_sync import refresh_external_busy
-from clinic_voice.errors import NotFound
+from clinic_voice.errors import LeaseLost, NotFound
 from clinic_voice.outbox import (
     complete,
     fail_dead,
     mark_done,
     provider_failure,
+    remember,
     renew,
     require_idle,
     retry,
@@ -46,6 +47,7 @@ CALENDAR_DEAD_CODES = frozenset(
         "appointment_past",
         "internal",
         "lease_expired",
+        "lease_lost",
     }
 )
 
@@ -68,7 +70,8 @@ def needs_review_on_dead(conn, job):
 def _load_appointment(conn, job):
     row = conn.execute(
         """SELECT a.status, a.version, a.starts_at, a.ends_at, a.blocks_until,
-        a.starts_at <= now() AS past, d.booking_calendar_id, d.busy_calendar_ids, c.timezone
+        a.starts_at <= now() AS past, a.calendar_event_id, a.calendar_id,
+        d.booking_calendar_id, d.busy_calendar_ids, c.timezone
         FROM appointments a
         JOIN doctors d ON d.clinic_id=a.clinic_id AND d.id=a.doctor_id
         JOIN clinics c ON c.id=a.clinic_id
@@ -93,10 +96,14 @@ def _matches(event, appointment) -> bool:
 
 def _withdraw(conn, job, ports, calendar_id, event_id) -> bool:
     """Cancel this job's own event because the appointment was cancelled or rescheduled.
-    Idempotent: cancelling a missing event is a no-op. A provider error retries the job; the
-    next attempt sees the superseded appointment and withdraws again."""
-    if not renew(conn, job):
-        return False
+
+    The cancel runs even if this worker's lease was lost: the id is unique to the superseded
+    version (versions are never reused and a cancelled appointment is never restored at the
+    same version), so cancelling it cannot hurt a newer booking, and a stale worker's late
+    insert must not survive. Only the bookkeeping (complete/retry) is fenced. Idempotent:
+    cancelling a missing event is a no-op. A provider error retries the job; the next attempt
+    sees the superseded appointment and withdraws again."""
+    require_idle(conn)
     try:
         ports.calendar.cancel_event(calendar_id, event_id)
     except ProviderError as error:
@@ -116,9 +123,10 @@ def _confirm(conn, job, ports, calendar_id, event_id) -> bool:
     """
     scope = (job.clinic_id, job.appointment_id, job.appointment_version)
     confirmed = conn.execute(
-        "UPDATE appointments SET status='confirmed', calendar_event_id=%s, updated_at=now()"
+        "UPDATE appointments SET status='confirmed', calendar_event_id=%s, calendar_id=%s,"
+        " updated_at=now()"
         " WHERE clinic_id=%s AND id=%s AND status='pending_sync' AND version=%s RETURNING id",
-        (event_id, *scope),
+        (event_id, calendar_id, *scope),
     ).fetchone()
     if confirmed is None:
         current = conn.execute(
@@ -129,9 +137,9 @@ def _confirm(conn, job, ports, calendar_id, event_id) -> bool:
             conn.rollback()
             return _withdraw(conn, job, ports, calendar_id, event_id)
         conn.execute(
-            "UPDATE appointments SET calendar_event_id=%s, updated_at=now()"
+            "UPDATE appointments SET calendar_event_id=%s, calendar_id=%s, updated_at=now()"
             " WHERE clinic_id=%s AND id=%s AND version=%s AND calendar_event_id IS NULL",
-            (event_id, *scope),
+            (event_id, calendar_id, *scope),
         )
     if not mark_done(conn, job):
         conn.rollback()
@@ -150,12 +158,18 @@ def create(conn, job, ports) -> bool:
     appointment = _load_appointment(conn, job)
     if appointment is None:
         return complete(conn, job)
-    calendar_id = appointment["booking_calendar_id"]
     event_id = event_id_for(job.appointment_id, job.appointment_version)
+    # Write intent: an earlier attempt records its target calendar in the payload before
+    # inserting, so retries recover (or withdraw) in that calendar even if the doctor's
+    # booking calendar was remapped since. Otherwise use the calendar recorded with this
+    # event, else the doctor's current booking calendar.
+    intended = (job.payload or {}).get("calendar_id")
+    recorded = appointment["calendar_id"] if appointment["calendar_event_id"] == event_id else None
+    calendar_id = intended or recorded or appointment["booking_calendar_id"]
     if _superseded(appointment, job):
-        # Only an earlier attempt of this job can have written this event id.
-        if job.attempts > 1 and calendar_id:
-            return _withdraw(conn, job, ports, calendar_id, event_id)
+        # Only an attempt of this job that recorded write intent can have written this id.
+        if intended:
+            return _withdraw(conn, job, ports, intended, event_id)
         return complete(conn, job)
     if appointment["status"] != "pending_sync":
         return complete(conn, job)  # Confirmed or under review at this version.
@@ -189,7 +203,8 @@ def create(conn, job, ports) -> bool:
             appointment["ends_at"].astimezone(zone),
             event_summary(job.appointment_id),
         )
-        if not renew(conn, job):
+        job = remember(conn, job, calendar_id=calendar_id)  # Also renews the lease.
+        if job is None:
             return False
         try:
             stored = ports.calendar.insert_event(calendar_id, event)
@@ -215,27 +230,37 @@ def cancel(conn, job, ports) -> bool:
     Event id: payload['event_id'] if given; else the appointment's recorded calendar_event_id
     only when the appointment is still at the job's version (after a reschedule it names the
     new version's event, which must survive); else event_id_for(appointment, job version).
-    Calendar: payload['calendar_id'], else the doctor's booking calendar. With no calendar and
-    no recorded event nothing was projected and the job completes; with a recorded event but
-    no calendar, staff must review.
+    Calendar: payload['calendar_id']; else the calendar recorded with that event; else the
+    write intent of that version's calendar.create job; else the doctor's current booking
+    calendar. With no calendar and no recorded event nothing was projected and the job
+    completes; with a recorded event but no calendar, staff must review.
     """
     row = conn.execute(
-        """SELECT a.calendar_event_id, a.version, d.booking_calendar_id FROM appointments a
+        """SELECT a.calendar_event_id, a.calendar_id, a.version, d.booking_calendar_id,
+        (SELECT o.payload->>'calendar_id' FROM outbox o
+            WHERE o.clinic_id=a.clinic_id AND o.appointment_id=a.id
+            AND o.kind='calendar.create' AND o.appointment_version=%s) AS intended
+        FROM appointments a
         JOIN doctors d ON d.clinic_id=a.clinic_id AND d.id=a.doctor_id
         WHERE a.clinic_id=%s AND a.id=%s""",
-        (job.clinic_id, job.appointment_id),
+        (job.appointment_version, job.clinic_id, job.appointment_id),
     ).fetchone()
     conn.commit()
     payload = job.payload or {}
     recorded = payload.get("event_id")
     if not recorded and row and row["version"] == job.appointment_version:
         recorded = row["calendar_event_id"]
-    calendar_id = payload.get("calendar_id") or (row["booking_calendar_id"] if row else None)
+    event_id = recorded or event_id_for(job.appointment_id, job.appointment_version)
+    calendar_id = payload.get("calendar_id")
+    if not calendar_id and row:
+        if row["calendar_id"] and row["calendar_event_id"] == event_id:
+            calendar_id = row["calendar_id"]
+        else:
+            calendar_id = row["intended"] or row["booking_calendar_id"]
     if not calendar_id:
         if recorded:
             return fail_dead(conn, job, "calendar_unmapped")
         return complete(conn, job)
-    event_id = recorded or event_id_for(job.appointment_id, job.appointment_version)
     require_idle(conn)
     try:
         ports.calendar.cancel_event(calendar_id, event_id)
@@ -260,7 +285,18 @@ def refresh_busy(conn, job, ports) -> bool:
     except (KeyError, TypeError, ValueError):
         return fail_dead(conn, job, "bad_payload")
     try:
-        written = refresh_external_busy(conn, ports.calendar, job.clinic_id, doctor_id, start, end)
+        written = refresh_external_busy(
+            conn,
+            ports.calendar,
+            job.clinic_id,
+            doctor_id,
+            start,
+            end,
+            heartbeat=lambda: renew(conn, job),
+        )
+    except LeaseLost:
+        conn.rollback()
+        return retry(conn, job, "lease_lost")  # Fenced: normally False, the new owner continues.
     except ProviderError as error:
         conn.rollback()
         return provider_failure(conn, job, error)

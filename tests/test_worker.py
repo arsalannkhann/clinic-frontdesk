@@ -656,16 +656,120 @@ def test_renew_extends_and_is_fenced(mapped):
         assert renew(conn, stale) is False
 
 
-def test_check_ports_rejects_timeouts_near_the_lease():
-    class Slow(FakeCalendar):
-        timeout_seconds = 60
+def test_check_ports_requires_short_declared_timeouts():
+    def adapter(**attrs):
+        return type("Adapter", (), attrs)()
 
+    lease = timedelta(minutes=2)
+    check_ports(Ports(FakeCalendar()), lease)  # The in-process fake is explicitly allowed.
+    check_ports(Ports(adapter(timeout_seconds=10)), lease)
+    for bad in (adapter(), adapter(timeout_seconds=None), adapter(timeout_seconds=0)):
+        with pytest.raises(ValueError, match="must declare"):
+            check_ports(Ports(bad), lease)
+    with pytest.raises(ValueError, match="too long"):
+        check_ports(Ports(adapter(timeout_seconds=60)), lease)
     with pytest.raises(ValueError):
-        check_ports(Ports(Slow()), timedelta(minutes=2))
-    Slow.timeout_seconds = 10
-    check_ports(Ports(Slow()), timedelta(minutes=2))
-    with pytest.raises(ValueError):
-        run_once("postgresql://unused", "w1", Ports(type("C", (), {"timeout_seconds": 90})()))
+        run_once("postgresql://unused", "w1", Ports(adapter(timeout_seconds=90)))
+
+
+def test_stale_worker_late_insert_is_withdrawn(mapped):
+    """w1 loses its lease mid-insert; the appointment is cancelled; w2 reclaims and withdraws
+    (a no-op, nothing written yet); then w1's late insert lands. w1 must still cancel it."""
+    fake = FakeCalendar()
+    appointment_id = book(mapped)
+    event_id = event_id_for(appointment_id, 1)
+    real_insert = fake.insert_event
+    seen = []
+
+    def slow_insert(calendar_id, event):
+        if not seen:
+            seen.append(calendar_id)
+            with connect(mapped) as conn:
+                conn.execute(
+                    "UPDATE appointments SET status='cancelled' WHERE id=%s", (appointment_id,)
+                )
+            expire_leases(mapped)
+            assert run_once(mapped, "w2", Ports(fake)) == 1
+            assert job_for(mapped, appointment_id)["status"] == "done"
+            assert fake.get_event(CAL, event_id) is None  # w2's withdraw was a no-op.
+        return real_insert(calendar_id, event)
+
+    fake.insert_event = slow_insert
+    run_once(mapped, "w1", Ports(fake))
+    assert fake.insert_count(event_id) == 1
+    assert fake.get_event(CAL, event_id).status == "cancelled"
+    assert [c[0] for c in fake.calls if c[0] == "cancel_event"] == ["cancel_event"] * 2
+    job = job_for(mapped, appointment_id)
+    assert (job["status"], job["lease_owner"], job["attempts"]) == ("done", "w2", 2)
+
+
+def test_remap_between_attempts_keeps_original_calendar(mapped):
+    fake = FakeCalendar()
+    fake.timeout_after_write = True
+    appointment_id = book(mapped)
+    event_id = event_id_for(appointment_id, 1)
+    run_once(mapped, "w1", Ports(fake))
+    assert job_for(mapped, appointment_id)["payload"] == {"calendar_id": CAL}
+    map_doctor(mapped, booking="new-booking@example.test")  # Staff remap before the retry.
+    make_due(mapped)
+    run_once(mapped, "w1", Ports(fake))
+    assert_confirmed_once(mapped, fake, appointment_id)
+    assert appointment(mapped, appointment_id)["calendar_id"] == CAL
+    assert all(c[1] != "new-booking@example.test" for c in fake.calls)
+    job_id = insert_job(mapped, "calendar.cancel", appointment_id)
+    run_once(mapped, "w1", Ports(fake))
+    assert job_by_id(mapped, job_id)["status"] == "done"
+    assert fake.get_event(CAL, event_id).status == "cancelled"
+
+
+def test_cancel_uses_create_write_intent_when_unrecorded(mapped):
+    fake = FakeCalendar()
+    fake.timeout_after_write = True
+    appointment_id = book(mapped)
+    run_once(mapped, "w1", Ports(fake))  # Written but never recorded on the appointment.
+    with connect(mapped) as conn:
+        conn.execute("UPDATE appointments SET status='cancelled' WHERE id=%s", (appointment_id,))
+        conn.execute("UPDATE outbox SET status='done' WHERE appointment_id=%s", (appointment_id,))
+    map_doctor(mapped, booking="new-booking@example.test")
+    insert_job(mapped, "calendar.cancel", appointment_id)
+    run_once(mapped, "w1", Ports(fake))
+    assert fake.get_event(CAL, event_id_for(appointment_id, 1)).status == "cancelled"
+
+
+def test_refresh_busy_aborts_when_lease_lost_between_fetches(mapped):
+    fake = FakeCalendar()
+    fake.busy[BUSY] = [(at(10), at(11))]
+    real_free_busy = fake.free_busy
+
+    def steal_after_first(calendar_ids, start, end):
+        result = real_free_busy(calendar_ids, start, end)
+        if len(ops(fake, "free_busy")) == 1:
+            expire_leases(mapped)
+            with connect(mapped) as other:
+                assert len(claim(other, "w2")) == 1
+        return result
+
+    fake.free_busy = steal_after_first
+    payload = {"doctor_id": str(DOCTOR_ID), "start": at(0).isoformat(), "end": at(23).isoformat()}
+    job_id = insert_job(mapped, "calendar.refresh_busy", None, payload)
+    run_once(mapped, "w1", Ports(fake))
+    assert len(ops(fake, "free_busy")) == 1  # Aborted before the booking calendar fetch.
+    row = job_by_id(mapped, job_id)
+    assert (row["status"], row["lease_owner"]) == ("processing", "w2")
+    with connect(mapped) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM external_busy").fetchone()["n"] == 0
+
+
+def test_refresh_heartbeat_false_raises_before_writing(mapped):
+    from clinic_voice import calendar_sync
+    from clinic_voice.errors import LeaseLost
+
+    fake = FakeCalendar()
+    with connect(mapped) as conn, pytest.raises(LeaseLost):
+        calendar_sync.refresh_external_busy(
+            conn, fake, CLINIC, DOCTOR_ID, at(0), at(23), heartbeat=lambda: False
+        )
+    assert len(ops(fake, "free_busy")) == 1
 
 
 # Run loop
@@ -688,10 +792,12 @@ def test_stop_releases_unstarted_jobs(mapped, monkeypatch):
         assert run_batch(conn, "w1", Ports(fake), stop=stop) == 3
     states = [job_for(mapped, i) for i in ids]
     assert [s["status"] for s in states] == ["done", "pending", "pending"]
-    assert [s["attempts"] for s in states] == [1, 0, 0]
+    # attempts never decrease; the unused claim is refunded through max_attempts instead.
+    assert [(s["attempts"], s["max_attempts"]) for s in states] == [(1, 8), (1, 9), (1, 9)]
     assert all(s["lease_expires_at"] is None for s in states[1:])
     with connect(mapped) as conn:
         [job] = claim(conn, "w9", limit=1)
+        assert job.attempts == 2  # The released job's next claim gets a fresh fence value.
         assert release(conn, outbox.Job(**{**job.__dict__, "attempts": 7})) is False
 
 

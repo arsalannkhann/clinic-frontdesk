@@ -4,10 +4,10 @@ from uuid import uuid4
 
 from psycopg.pq import TransactionStatus
 
-from clinic_voice.errors import NotFound
+from clinic_voice.errors import LeaseLost, NotFound
 
 
-def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end):
+def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end, heartbeat=None):
     """Replace the doctor's cached busy time inside [start, end) with fresh FreeBusy data.
 
     Returns True if the cache was written, False if skipped because a refresh that began
@@ -27,6 +27,9 @@ def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end):
     (RuntimeError otherwise, leaving the caller's pending work untouched); only our own
     read-only lookup is committed. The writes then commit together when the caller's
     connection context exits.
+
+    heartbeat, if given, is called between per-calendar fetches (connection idle); if it
+    returns False, LeaseLost is raised and nothing is written.
 
     Concurrent refreshes of one doctor are serialized by an advisory lock on
     'busy:<clinic>:<doctor>' taken in the write transaction, standalone: that namespace
@@ -50,7 +53,13 @@ def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end):
     if doctor["booking_calendar_id"] and doctor["booking_calendar_id"] not in calendars:
         calendars.append(doctor["booking_calendar_id"])
     # With nothing mapped there is nothing to ask the provider; just clear the window.
-    fetched = [(c, port.free_busy([c], start, end)) for c in calendars]
+    fetched = []
+    for index, calendar in enumerate(calendars):
+        # heartbeat() (e.g. a worker lease renewal) runs between fetches; False aborts before
+        # any write.
+        if index and heartbeat is not None and not heartbeat():
+            raise LeaseLost()
+        fetched.append((calendar, port.free_busy([calendar], start, end)))
     conn.execute(
         "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"busy:{clinic_id}:{doctor_id}",)
     )
