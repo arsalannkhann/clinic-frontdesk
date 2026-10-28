@@ -2,8 +2,9 @@
 
 from uuid import uuid4
 
-from fastapi import HTTPException
 from psycopg.pq import TransactionStatus
+
+from clinic_voice.errors import NotFound
 
 
 def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end):
@@ -42,7 +43,7 @@ def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end):
         (clinic_id, doctor_id),
     ).fetchone()
     if not doctor:
-        raise HTTPException(404, "Not found")
+        raise NotFound()
     conn.commit()
     started = doctor["started"]
     calendars = list(doctor["busy_calendar_ids"])

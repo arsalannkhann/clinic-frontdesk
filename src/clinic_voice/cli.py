@@ -102,11 +102,28 @@ def staff_command(url, args):
             print("password reset; existing sessions revoked")
 
 
-def build_ports(calendar):
-    if calendar == "fake":
-        from clinic_voice.providers.calendar import FakeCalendar
-        from clinic_voice.worker import Ports
+FAKE_DATABASE_SUFFIXES = ("_test", "_dev")
 
+
+def fake_calendar_allowed(url, settings):
+    """The fake calendar confirms appointments without any real calendar, so it may only run
+    against a development or test database, or with APP_ENV=development set explicitly."""
+    from psycopg.conninfo import conninfo_to_dict
+
+    name = conninfo_to_dict(url).get("dbname") or ""
+    return name.endswith(FAKE_DATABASE_SUFFIXES) or settings.app_env == "development"
+
+
+def build_ports(calendar, url, settings):
+    if calendar == "fake":
+        from clinic_voice.outbox import Ports
+        from clinic_voice.providers.calendar import FakeCalendar
+
+        if not fake_calendar_allowed(url, settings):
+            raise SystemExit(
+                "Refusing --calendar fake: it would confirm appointments without a real calendar."
+                " Use a database whose name ends in _test or _dev, or set APP_ENV=development."
+            )
         print(
             "WARNING: --calendar fake uses an in-process FakeCalendar. Events are not written to"
             " any real calendar; development only.",
@@ -119,12 +136,13 @@ def build_ports(calendar):
     )
 
 
-def worker_command(url, args):
-    from psycopg import Error as DatabaseError
+def worker_command(url, args, settings):
+    from clinic_voice.outbox import run_loop, run_once
 
-    from clinic_voice.worker import run_once
-
-    ports = build_ports(args.calendar)
+    ports = build_ports(args.calendar, url, settings)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
     worker_id = args.worker_id or f"{socket.gethostname()}:{os.getpid()}"
     if args.once:
         count = run_once(url, worker_id, ports)
@@ -133,20 +151,11 @@ def worker_command(url, args):
     stop = threading.Event()
 
     def request_stop(signum, frame):
-        stop.set()  # The current batch finishes; no new batch starts.
+        stop.set()  # The current job finishes; unstarted jobs of the batch are released.
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    while not stop.is_set():
-        try:
-            count = run_once(url, worker_id, ports)
-        except DatabaseError as error:
-            logging.getLogger("clinic_voice.worker").error(
-                "worker batch failed error=%s", type(error).__name__
-            )
-            count = 0
-        if count == 0:
-            stop.wait(args.interval)
+    run_loop(url, worker_id, ports, stop, interval=args.interval)
 
 
 def main(argv=None):
@@ -197,7 +206,8 @@ def main(argv=None):
 
         print(json.dumps(app.openapi(), indent=2))
         return
-    url = get_settings().database_url.get_secret_value()
+    settings = get_settings()
+    url = settings.database_url.get_secret_value()
     if args.command == "migrate":
         migrate(url, Path("migrations"))
     elif args.command == "seed-demo":
@@ -205,7 +215,6 @@ def main(argv=None):
     elif args.command == "staff":
         staff_command(url, args)
     elif args.command == "worker":
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-        worker_command(url, args)
+        worker_command(url, args, settings)
     else:
         credential_command(url, args)

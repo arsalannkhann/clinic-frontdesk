@@ -187,30 +187,39 @@ def list_outbox(conn, clinic_id, status, limit):
 
 
 def requeue_outbox(conn, staff, job_id):
-    """Return a dead job to pending with a fresh attempt budget.
+    """Return a dead job to pending with a fresh budget of attempts.
 
-    A dead calendar.create moved its appointment to needs_review; requeueing returns that
-    appointment to pending_sync (same version only) so the worker retries the projection. The
-    worker re-reads the event id and re-checks external busy time before inserting, so a
-    requeue never bypasses those checks.
+    attempts is kept (fences rely on it only ever growing); max_attempts becomes attempts +
+    DEFAULT_MAX_ATTEMPTS. A job for an appointment that has already started is refused (409).
+    For calendar.create whose last_error is one of CALENDAR_DEAD_CODES, the appointment is
+    returned from needs_review to pending_sync (same version only), since that review was
+    caused by this job's failure; the worker re-reads the event id and re-checks external busy
+    time before inserting, so a requeue never bypasses those checks.
     """
+    from clinic_voice.handlers.calendar import CALENDAR_DEAD_CODES
+    from clinic_voice.outbox import DEFAULT_MAX_ATTEMPTS
+
     clinic_id = staff["clinic_id"]
     job = conn.execute(
-        "SELECT id, status, kind, appointment_id, appointment_version FROM outbox"
-        " WHERE clinic_id=%s AND id=%s FOR UPDATE",
+        "SELECT o.status, o.kind, o.last_error, o.appointment_id, o.appointment_version,"
+        " a.starts_at <= now() AS past FROM outbox o"
+        " LEFT JOIN appointments a ON a.clinic_id=o.clinic_id AND a.id=o.appointment_id"
+        " WHERE o.clinic_id=%s AND o.id=%s FOR UPDATE OF o",
         (clinic_id, job_id),
     ).fetchone()
     if not job:
         raise HTTPException(404, NOT_FOUND)
     if job["status"] != "dead":
         raise HTTPException(409, "Only dead jobs can be requeued")
+    if job["past"]:
+        raise HTTPException(409, "The appointment has already started")
     row = conn.execute(
-        "UPDATE outbox SET status='pending', attempts=0, available_at=now(), last_error=NULL,"
-        " lease_owner=NULL, lease_expires_at=NULL, updated_at=now()"
+        "UPDATE outbox SET status='pending', max_attempts=attempts + %s, available_at=now(),"
+        " last_error=NULL, lease_expires_at=NULL, updated_at=now()"
         f" WHERE clinic_id=%s AND id=%s RETURNING {OUTBOX_COLUMNS}",  # noqa: S608
-        (clinic_id, job_id),
+        (DEFAULT_MAX_ATTEMPTS, clinic_id, job_id),
     ).fetchone()
-    if job["kind"] == "calendar.create":
+    if job["kind"] == "calendar.create" and job["last_error"] in CALENDAR_DEAD_CODES:
         conn.execute(
             "UPDATE appointments SET status='pending_sync', updated_at=now()"
             " WHERE clinic_id=%s AND id=%s AND status='needs_review' AND version=%s",

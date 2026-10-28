@@ -10,6 +10,7 @@ from psycopg import Error as DatabaseError
 from clinic_voice import staff as staff_service
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tenant
+from clinic_voice.errors import NotFound
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.schemas import (
     SLOT_SOURCE,
@@ -46,6 +47,11 @@ async def database_error(request, exc):
     return JSONResponse(
         status_code=503, content={"detail": "Scheduling unavailable; retry the same action later"}
     )
+
+
+@app.exception_handler(NotFound)
+async def not_found(request, exc):
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
 
 
 @app.exception_handler(RequestValidationError)

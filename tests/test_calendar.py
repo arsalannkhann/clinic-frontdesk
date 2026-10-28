@@ -19,6 +19,7 @@ from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
 from clinic_voice.config import get_settings
 from clinic_voice.db import connect
+from clinic_voice.errors import NotFound
 from clinic_voice.providers.calendar import (
     CalendarEvent,
     EventAlreadyExists,
@@ -410,9 +411,8 @@ def test_refresh_unknown_or_foreign_doctor_is_404_and_writes_nothing(database):
     fake = FakeCalendar()
     fake.busy[BUSY] = [(at(10), at(11))]
     for clinic, doctor in ((CLINIC, other_doctor), (CLINIC, uuid4()), (other_clinic, DOCTOR_ID)):
-        with pytest.raises(HTTPException) as error:
+        with pytest.raises(NotFound):
             refresh(database, fake, doctor=doctor, clinic=clinic)
-        assert error.value.status_code == 404
     assert cached(database, other_doctor, other_clinic) == []
 
 

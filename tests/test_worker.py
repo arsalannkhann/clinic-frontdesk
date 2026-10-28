@@ -14,21 +14,36 @@ import pytest
 from fastapi.testclient import TestClient
 from psycopg.types.json import Jsonb
 
-from clinic_voice import cli, credentials, service, staff, worker
+from clinic_voice import cli, credentials, outbox, service, staff
 from clinic_voice.api import app
 from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
 from clinic_voice.config import get_settings
 from clinic_voice.db import connect
+from clinic_voice.handlers import HANDLERS
+from clinic_voice.outbox import (
+    Handler,
+    Ports,
+    check_ports,
+    claim,
+    complete,
+    fail_dead,
+    release,
+    renew,
+    retry,
+    run_batch,
+    run_loop,
+    run_once,
+)
 from clinic_voice.providers.calendar import (
     CalendarEvent,
+    EventAlreadyExists,
     FakeCalendar,
     ProviderPermanent,
     ProviderRetryable,
     event_id_for,
 )
 from clinic_voice.schemas import ReservationRequest
-from clinic_voice.worker import Ports, claim, complete, fail_dead, retry, run_once
 
 IST = ZoneInfo("Asia/Kolkata")
 NOW = datetime(2031, 3, 3, 8, 30, tzinfo=IST)
@@ -230,9 +245,9 @@ def test_timeout_before_write_retries_with_backoff_then_inserts_once(mapped):
 
 
 def test_backoff_schedule():
-    assert [worker.backoff(n) for n in (1, 2, 3)] == [timedelta(seconds=s) for s in (30, 60, 120)]
-    assert worker.backoff(8) == timedelta(hours=1)
-    assert worker.backoff(50) == timedelta(hours=1)
+    assert [outbox.backoff(n) for n in (1, 2, 3)] == [timedelta(seconds=s) for s in (30, 60, 120)]
+    assert outbox.backoff(8) == timedelta(hours=1)
+    assert outbox.backoff(50) == timedelta(hours=1)
 
 
 class SlowDown(ProviderRetryable):
@@ -335,7 +350,12 @@ def test_dead_letter_after_max_attempts_and_requeue(client, mapped):
     admin = staff_headers(client, mapped, role="admin")
     r = client.post(f"/v1/admin/outbox/{job['id']}/requeue", headers=admin)
     assert r.status_code == 200
-    assert (r.json()["status"], r.json()["attempts"]) == ("pending", 0)
+    # Attempts keep growing (fences rely on it); the budget is extended instead.
+    assert (r.json()["status"], r.json()["attempts"], r.json()["max_attempts"]) == (
+        "pending",
+        2,
+        10,
+    )
     assert appointment(mapped, appointment_id)["status"] == "pending_sync"
     again = client.post(f"/v1/admin/outbox/{job['id']}/requeue", headers=admin)
     assert again.status_code == 409
@@ -420,7 +440,7 @@ def test_unexpected_handler_error_retries_as_internal(mapped, monkeypatch):
     def boom(conn, job, ports):
         raise ValueError("detail that must not be stored")
 
-    monkeypatch.setitem(worker.HANDLERS, "calendar.create", boom)
+    monkeypatch.setitem(HANDLERS, "calendar.create", Handler(boom))
     appointment_id = book(mapped)
     assert run_once(mapped, "w1", Ports(FakeCalendar())) == 1
     job = job_for(mapped, appointment_id)
@@ -470,9 +490,11 @@ def test_cancel_without_recorded_event(database, is_mapped):
     assert fake.calls == expected
 
 
-def test_cancelled_during_projection_records_event_id(mapped, monkeypatch):
+@pytest.mark.parametrize("cancel_fails", [False, True])
+def test_cancelled_during_projection_withdraws_event(mapped, monkeypatch, cancel_fails):
     fake = FakeCalendar()
     appointment_id = book(mapped)
+    event_id = event_id_for(appointment_id, 1)
     real_insert = fake.insert_event
 
     def insert_then_cancel_locally(calendar_id, event):
@@ -484,11 +506,234 @@ def test_cancelled_during_projection_records_event_id(mapped, monkeypatch):
         return stored
 
     monkeypatch.setattr(fake, "insert_event", insert_then_cancel_locally)
+    if cancel_fails:
+        fake.fail_next(1, ProviderRetryable, op="cancel_event")
     run_once(mapped, "w1", Ports(fake))
-    row = appointment(mapped, appointment_id)
-    assert row["status"] == "cancelled"
-    assert row["calendar_event_id"] == event_id_for(appointment_id, 1)
+    if cancel_fails:
+        job = job_for(mapped, appointment_id)
+        assert (job["status"], job["last_error"]) == ("pending", "retryable")
+        assert fake.get_event(CAL, event_id).status == "confirmed"
+        make_due(mapped)
+        run_once(mapped, "w1", Ports(fake))  # Superseded on load: withdraw again.
+    assert fake.get_event(CAL, event_id).status == "cancelled"
+    assert fake.insert_count(event_id) == 1
+    assert appointment(mapped, appointment_id)["status"] == "cancelled"
     assert job_for(mapped, appointment_id)["status"] == "done"
+
+
+def test_reschedule_order_cancel_old_version_keeps_new_event(mapped):
+    fake = FakeCalendar()
+    appointment_id = book(mapped)
+    run_once(mapped, "w1", Ports(fake))
+    v1, v2 = event_id_for(appointment_id, 1), event_id_for(appointment_id, 2)
+    with connect(mapped) as conn:  # A reschedule bumps the version and enqueues both jobs.
+        conn.execute(
+            "UPDATE appointments SET version=2, status='pending_sync' WHERE id=%s",
+            (appointment_id,),
+        )
+        conn.execute(
+            "INSERT INTO outbox (id,clinic_id,appointment_id,kind,appointment_version)"
+            " VALUES (%s,%s,%s,'calendar.create',2),"
+            " (%s,%s,%s,'calendar.cancel',1)",
+            (uuid4(), CLINIC, appointment_id, uuid4(), CLINIC, appointment_id),
+        )
+    run_once(mapped, "w1", Ports(fake), kinds=["calendar.create"])  # create(v2) first.
+    assert appointment(mapped, appointment_id)["calendar_event_id"] == v2
+    run_once(mapped, "w1", Ports(fake), kinds=["calendar.cancel"])
+    assert fake.get_event(CAL, v1).status == "cancelled"
+    assert fake.get_event(CAL, v2).status == "confirmed"
+    row = appointment(mapped, appointment_id)
+    assert (row["status"], row["calendar_event_id"]) == ("confirmed", v2)
+
+
+def test_concurrent_insert_already_exists_is_verified(mapped):
+    """B reads nothing, A's insert lands, B's insert collides: B reads back and confirms."""
+    fake = FakeCalendar()
+    appointment_id = book(mapped)
+    real_insert = fake.insert_event
+
+    def other_worker_wins(calendar_id, event):
+        real_insert(calendar_id, event)  # A's write lands first.
+        raise EventAlreadyExists()
+
+    fake.insert_event = other_worker_wins
+    run_once(mapped, "w1", Ports(fake))
+    assert_confirmed_once(mapped, fake, appointment_id)
+    assert [c[0] for c in fake.calls][-2:] == ["insert_event", "get_event"]
+
+
+def test_past_appointment_dead_letters_and_cannot_be_requeued(client, mapped):
+    fake = FakeCalendar()
+    appointment_id = book(mapped)
+    with connect(mapped) as conn:
+        conn.execute(
+            "UPDATE appointments SET starts_at=starts_at - interval '20 years',"
+            " ends_at=ends_at - interval '20 years', blocks_until=blocks_until - interval '20 years'"
+            " WHERE id=%s",
+            (appointment_id,),
+        )
+    run_once(mapped, "w1", Ports(fake))
+    job = job_for(mapped, appointment_id)
+    assert (job["status"], job["last_error"]) == ("dead", "appointment_past")
+    assert appointment(mapped, appointment_id)["status"] == "needs_review"
+    assert ops(fake, "insert_event") == []
+    r = client.post(f"/v1/admin/outbox/{job['id']}/requeue", headers=staff_headers(client, mapped))
+    assert r.status_code == 409
+
+
+def test_requeue_keeps_review_not_caused_by_job(client, mapped):
+    appointment_id = book(mapped)
+    with connect(mapped) as conn:
+        conn.execute(
+            "UPDATE outbox SET status='dead', last_error='unknown_kind', attempts=1"
+            " WHERE appointment_id=%s",
+            (appointment_id,),
+        )
+        conn.execute("UPDATE appointments SET status='needs_review' WHERE id=%s", (appointment_id,))
+    job = job_for(mapped, appointment_id)
+    r = client.post(f"/v1/admin/outbox/{job['id']}/requeue", headers=staff_headers(client, mapped))
+    assert r.status_code == 200
+    assert appointment(mapped, appointment_id)["status"] == "needs_review"
+
+
+# Leases
+
+
+def test_exhausted_expired_lease_is_dead_lettered_not_reclaimed(mapped):
+    appointment_id = book(mapped)
+    with connect(mapped) as conn:
+        conn.execute("UPDATE outbox SET max_attempts=1 WHERE appointment_id=%s", (appointment_id,))
+        conn.commit()
+        [job] = claim(conn, "w1")
+    expire_leases(mapped)
+    with connect(mapped) as conn:
+        assert claim(conn, "w2") == []
+    row = job_for(mapped, appointment_id)
+    assert (row["status"], row["last_error"], row["attempts"]) == ("dead", "lease_expired", 1)
+    assert appointment(mapped, appointment_id)["status"] == "needs_review"
+    with connect(mapped) as conn:
+        assert complete(conn, job) is False
+
+
+def test_lease_renewed_before_start_and_lost_job_skipped(mapped, monkeypatch):
+    fake = FakeCalendar()
+    first, second = book(mapped, 10), book(mapped, 11)
+    real = HANDLERS["calendar.create"]
+    stolen = []
+
+    def run(conn, job, ports):
+        if not stolen:  # While job 1 runs, job 2's lease expires and w2 reclaims it.
+            with connect(mapped) as other:
+                other.execute(
+                    "UPDATE outbox SET lease_expires_at = now() - interval '1 second'"
+                    " WHERE status='processing' AND id<>%s",
+                    (job.id,),
+                )
+                other.commit()
+                stolen.extend(claim(other, "w2"))
+        return real.run(conn, job, ports)
+
+    monkeypatch.setitem(HANDLERS, "calendar.create", Handler(run, real.on_dead))
+    with connect(mapped) as conn:
+        assert run_batch(conn, "w1", Ports(fake), limit=2) == 2
+    [taken] = stolen
+    assert taken.appointment_id == second
+    assert appointment(mapped, first)["status"] == "confirmed"
+    row = job_for(mapped, second)
+    assert (row["status"], row["lease_owner"]) == ("processing", "w2")
+    assert fake.insert_count(event_id_for(second, 1)) == 0
+
+
+def test_renew_extends_and_is_fenced(mapped):
+    book(mapped)
+    with connect(mapped) as conn:
+        [job] = claim(conn, "w1", lease=timedelta(seconds=5))
+        before = job_for(mapped, job.appointment_id)["lease_expires_at"]
+        longer = outbox.Job(**{**job.__dict__, "lease": timedelta(minutes=10)})
+        assert renew(conn, longer) is True
+        assert job_for(mapped, job.appointment_id)["lease_expires_at"] > before
+        stale = outbox.Job(**{**job.__dict__, "lease_owner": "someone-else"})
+        assert renew(conn, stale) is False
+
+
+def test_check_ports_rejects_timeouts_near_the_lease():
+    class Slow(FakeCalendar):
+        timeout_seconds = 60
+
+    with pytest.raises(ValueError):
+        check_ports(Ports(Slow()), timedelta(minutes=2))
+    Slow.timeout_seconds = 10
+    check_ports(Ports(Slow()), timedelta(minutes=2))
+    with pytest.raises(ValueError):
+        run_once("postgresql://unused", "w1", Ports(type("C", (), {"timeout_seconds": 90})()))
+
+
+# Run loop
+
+
+def test_stop_releases_unstarted_jobs(mapped, monkeypatch):
+    from threading import Event
+
+    fake = FakeCalendar()
+    ids = [book(mapped, 10, 15 * i) for i in range(3)]
+    stop = Event()
+    real = HANDLERS["calendar.create"]
+
+    def run(conn, job, ports):
+        stop.set()  # SIGTERM arrives while the first job runs.
+        return real.run(conn, job, ports)
+
+    monkeypatch.setitem(HANDLERS, "calendar.create", Handler(run, real.on_dead))
+    with connect(mapped) as conn:
+        assert run_batch(conn, "w1", Ports(fake), stop=stop) == 3
+    states = [job_for(mapped, i) for i in ids]
+    assert [s["status"] for s in states] == ["done", "pending", "pending"]
+    assert [s["attempts"] for s in states] == [1, 0, 0]
+    assert all(s["lease_expires_at"] is None for s in states[1:])
+    with connect(mapped) as conn:
+        [job] = claim(conn, "w9", limit=1)
+        assert release(conn, outbox.Job(**{**job.__dict__, "attempts": 7})) is False
+
+
+def test_run_loop_reuses_connection_across_idle_polls(mapped):
+    from threading import Event
+
+    stop, opened, waits = Event(), [], []
+
+    def connect_fn(url):
+        opened.append(url)
+        return connect(url)
+
+    def wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 3:
+            stop.set()
+
+    run_loop(
+        mapped, "w1", Ports(FakeCalendar()), stop, interval=0.5, connect_fn=connect_fn, wait=wait
+    )
+    assert (len(opened), waits) == (1, [0.5, 0.5, 0.5])
+
+
+def test_run_loop_backs_off_on_database_errors():
+    from threading import Event
+
+    from psycopg import OperationalError
+
+    stop, waits = Event(), []
+
+    def connect_fn(url):
+        raise OperationalError("synthetic")
+
+    def wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 7:
+            stop.set()
+
+    run_loop(
+        "postgresql://unused", "w1", Ports(FakeCalendar()), stop, connect_fn=connect_fn, wait=wait
+    )
+    assert waits == [1, 2, 4, 8, 16, 30, 30]
 
 
 def test_refresh_busy_job_updates_cache(mapped):
@@ -676,6 +921,34 @@ def test_cli_worker_refuses_without_provider(database, monkeypatch):
     try:
         with pytest.raises(SystemExit, match="No calendar provider configured"):
             cli.main(["worker", "--once"])
+    finally:
+        get_settings.cache_clear()
+
+
+PRODUCTION_LIKE_URL = "postgresql://clinic:unused@127.0.0.1:1/clinic_voice"
+
+
+def test_cli_fake_calendar_refused_outside_dev_databases(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_LIKE_URL)
+    monkeypatch.delenv("APP_ENV", raising=False)
+    get_settings.cache_clear()
+    try:
+        with pytest.raises(SystemExit, match="Refusing --calendar fake"):
+            cli.main(["worker", "--once", "--calendar", "fake"])
+    finally:
+        get_settings.cache_clear()
+
+
+def test_cli_fake_calendar_allowed_with_app_env_development(monkeypatch):
+    from psycopg import OperationalError
+
+    monkeypatch.setenv("DATABASE_URL", PRODUCTION_LIKE_URL)
+    monkeypatch.setenv("APP_ENV", "development")
+    get_settings.cache_clear()
+    try:
+        # Past the safety check, the worker tries to connect (nothing listens on port 1).
+        with pytest.raises(OperationalError):
+            cli.main(["worker", "--once", "--calendar", "fake"])
     finally:
         get_settings.cache_clear()
 
