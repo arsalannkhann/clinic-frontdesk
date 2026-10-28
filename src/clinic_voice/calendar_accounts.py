@@ -79,7 +79,8 @@ def start(conn, staff, settings, replace=False) -> str:
     """Create a single-use state and return the Google authorization URL.
 
     If the clinic already has an active account, 409 unless replace=True; then the callback
-    revokes the previously active account(s) after storing the new one, so the "clinic's
+    retires the previously active account(s) after storing the new one (token forgotten
+    locally, not revoked at Google; see _supersede), so the "clinic's
     only active account" fallback stays deterministic."""
     keyring = keyring_from(settings)
     clinic_id, user_id = staff["clinic_id"], staff["id"]
@@ -152,6 +153,29 @@ def _revoke_locally(conn, clinic_id, actor_id, account_id):
     audit(conn, clinic_id, actor_id, "calendar.revoked", account_id)
 
 
+def _supersede(conn, clinic_id, actor_id, account_id):
+    """Retire an account replaced by a new connection: forget its token locally and do NOT
+    revoke it at Google. Google's revocation is grant-wide (all tokens of that user for this
+    project), so revoking the old token would also kill the new account when the same
+    Google user reconnected. Caller commits."""
+    conn.execute(
+        "UPDATE calendar_accounts SET status='revoked', revoked_at=now(),"
+        " refresh_token_ciphertext=NULL, key_id=NULL"
+        " WHERE clinic_id=%s AND id=%s AND status <> 'revoked'",
+        (clinic_id, account_id),
+    )
+    audit(conn, clinic_id, actor_id, "calendar.account_replaced", account_id)
+
+
+ALREADY_CONNECTED = "The clinic already has an active calendar account"
+
+
+def _lock_accounts(conn, clinic_id):
+    conn.execute(
+        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"calendar_accounts:{clinic_id}",)
+    )
+
+
 def callback(conn, settings, http, state, code, error) -> dict:
     """Complete an authorization. Raises HTTPException(400) for any invalid request.
     Returns {account_id, active_accounts} (the clinic's active account count afterwards)."""
@@ -164,6 +188,10 @@ def callback(conn, settings, http, state, code, error) -> dict:
     if error or not code or len(code) > 2048:
         raise HTTPException(400, "Calendar authorization was not granted")
     clinic_id, user_id = row["clinic_id"], row["user_id"]
+    if not row["replace_existing"] and active_accounts(conn, clinic_id):
+        conn.commit()
+        raise HTTPException(409, ALREADY_CONNECTED)  # Before any token is obtained.
+    conn.commit()
     try:
         verifier = keyring.decrypt(
             row["key_id"],
@@ -190,24 +218,26 @@ def callback(conn, settings, http, state, code, error) -> dict:
     refresh_token = tokens.get("refresh_token")
     scope = tokens.get("scope")
     granted = set(scope.split()) if isinstance(scope, str) else set()
+    # Rejected grants are discarded, not revoked at Google: revocation is grant-wide and
+    # would also invalidate an account this Google user already connected (here or in
+    # another clinic). The owner can remove a stale grant in the Google account settings.
     if not isinstance(refresh_token, str) or not refresh_token:
-        google.revoke_token(http, tokens["access_token"])
         raise HTTPException(400, "Calendar authorization did not grant offline access")
     if not set(google.SCOPES) <= granted:
-        google.revoke_token(http, refresh_token)
         raise HTTPException(400, "Calendar authorization did not grant the required access")
     account_id = uuid4()
     key_id, blob = keyring.encrypt(refresh_token.encode(), account_aad(clinic_id, account_id))
-    previous = []
-    if row["replace_existing"]:
-        previous = [
-            r["id"]
-            for r in conn.execute(
-                "SELECT id FROM calendar_accounts WHERE clinic_id=%s AND status='active'"
-                " FOR UPDATE",
-                (clinic_id,),
-            ).fetchall()
-        ]
+    _lock_accounts(conn, clinic_id)  # Serializes concurrent callbacks of one clinic.
+    previous = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM calendar_accounts WHERE clinic_id=%s AND status='active' FOR UPDATE",
+            (clinic_id,),
+        ).fetchall()
+    ]
+    if previous and not row["replace_existing"]:
+        conn.rollback()
+        raise HTTPException(409, ALREADY_CONNECTED)  # Lost a race with another callback.
     conn.execute(
         "INSERT INTO calendar_accounts (id,clinic_id,provider,refresh_token_ciphertext,key_id,"
         "scopes,status,connected_by) VALUES (%s,%s,'google',%s,%s,%s,'active',%s)",
@@ -215,7 +245,7 @@ def callback(conn, settings, http, state, code, error) -> dict:
     )
     audit(conn, clinic_id, user_id, "calendar.connected", account_id)
     for old in previous:
-        _revoke_locally(conn, clinic_id, user_id, old)
+        _supersede(conn, clinic_id, user_id, old)
     active = active_accounts(conn, clinic_id)
     conn.commit()
     return {"account_id": account_id, "active_accounts": active}
@@ -257,8 +287,10 @@ class GoogleCalendarResolver:
     """Ports.calendar_for for the Google adapter.
 
     (conn, clinic_id, doctor_id, account_id) -> (port, account_id) | None. With account_id
-    (the account recorded as having written an event) exactly that account is used. Without
-    it, the doctor's calendar_account_id; if the doctor has none, the clinic's only active
+    (the account recorded as having written an event) that account is used; if it was
+    revoked or replaced, the doctor's current mapping is used instead, and if it is in
+    status 'error' (or missing) nothing resolves. Without it, the doctor's
+    calendar_account_id; if the doctor has none, the clinic's only active
     Google account (None if zero or several). Only status 'active' resolves: a revoked or
     errored account is unmapped and never falls back to another account.
 
@@ -289,18 +321,26 @@ class GoogleCalendarResolver:
             self._cache.pop(account_id, None)
 
     def _account(self, conn, clinic_id, doctor_id, account_id):
-        if account_id is None and doctor_id is not None:
-            doctor = conn.execute(
-                "SELECT calendar_account_id FROM doctors WHERE clinic_id=%s AND id=%s",
-                (clinic_id, doctor_id),
-            ).fetchone()
-            if doctor is None:
-                return None
-            account_id = doctor["calendar_account_id"]
         if account_id is not None:
-            return conn.execute(ACCOUNT_SELECT + " AND id=%s", (clinic_id, account_id)).fetchone()
+            row = conn.execute(ACCOUNT_SELECT + " AND id=%s", (clinic_id, account_id)).fetchone()
+            if row is None or row["status"] != "revoked" or doctor_id is None:
+                return row  # Active, or 'error' (stays strict: the caller dead-letters).
+            # The recorded writer was revoked or replaced: fall back to the doctor's current
+            # mapping. Cancels stay safe because a DELETE 404 only counts as success when
+            # the calendar is reachable with the new account.
+            self._evict(account_id)
         if doctor_id is None:
             return None
+        doctor = conn.execute(
+            "SELECT calendar_account_id FROM doctors WHERE clinic_id=%s AND id=%s",
+            (clinic_id, doctor_id),
+        ).fetchone()
+        if doctor is None:
+            return None
+        if doctor["calendar_account_id"] is not None:
+            return conn.execute(
+                ACCOUNT_SELECT + " AND id=%s", (clinic_id, doctor["calendar_account_id"])
+            ).fetchone()
         rows = conn.execute(
             ACCOUNT_SELECT + " AND status='active' LIMIT 2", (clinic_id,)
         ).fetchall()

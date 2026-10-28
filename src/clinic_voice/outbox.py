@@ -456,10 +456,12 @@ def run_loop(
                     last_housekeeping = now
                     try:
                         housekeeping(conn)
-                    except DatabaseError as error:
+                    except Exception as error:
+                        # Housekeeping must never stop job processing; log the type only.
                         log.error("housekeeping failed error=%s", type(error).__name__)
-                        conn.close()
-                        conn = None
+                        if _broken(conn) or isinstance(error, DatabaseError):
+                            conn.close()
+                            conn = None
                 wait(interval)
     finally:
         if conn is not None:

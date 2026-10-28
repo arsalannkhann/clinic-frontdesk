@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from psycopg.types.json import Jsonb
 
 from clinic_voice import calendar_accounts, service, staff
 from clinic_voice.api import StripQuery, app
@@ -54,7 +55,12 @@ SECRET_MARKER = "SYNTHETIC-BODY-MARKER"
 
 
 class FakeGoogle:
-    """Minimal stand-in for Google's token, revoke, events and freeBusy endpoints."""
+    """Minimal stand-in for Google's token, revoke, events and freeBusy endpoints.
+
+    Grant-wide revocation (grant_wide=True, the default, as Google documents it): revoking
+    any token of a fake user invalidates every refresh and access token of that user issued
+    so far. Refresh tokens not seen before (e.g. stored by make_account) belong to `user`.
+    """
 
     def __init__(self):
         self.requests: list[httpx.Request] = []
@@ -71,6 +77,26 @@ class FakeGoogle:
         self.revoke_body = None
         self.owner: dict[str, str] = {}  # access token -> refresh token (or "code")
         self.unreachable: set[str] = set()
+        self.grant_wide = True
+        self.user = "user-1"
+        self.user_of: dict[str, str] = {}  # refresh token -> fake user
+        self.generation: dict[str, int] = {}  # user -> revocation generation
+        self.token_generation: dict[str, int] = {}  # refresh token -> generation at issue
+        self.dead_tokens: set[str] = set()
+
+    def refresh_valid(self, token):
+        if token == "code" or token in self.dead_tokens:
+            return token == "code"
+        user = self.user_of.get(token, self.user)
+        return self.token_generation.get(token, 0) >= self.generation.get(user, 0)
+
+    def _revoke(self, token):
+        refresh = self.owner.get(token, token)
+        if not self.grant_wide:
+            self.dead_tokens.add(refresh)
+            return
+        user = self.user_of.get(refresh, self.user)
+        self.generation[user] = self.generation.get(user, 0) + 1
 
     def transport(self):
         return httpx.MockTransport(self)
@@ -89,6 +115,8 @@ class FakeGoogle:
         if request.url.host == "oauth2.googleapis.com":
             form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
             if request.url.path == "/revoke":
+                if self.revoke_status == 200:
+                    self._revoke(form["token"])
                 if self.revoke_body is not None:
                     return httpx.Response(self.revoke_status, json=self.revoke_body)
                 return httpx.Response(self.revoke_status, text=SECRET_MARKER)
@@ -101,15 +129,21 @@ class FakeGoogle:
             if isinstance(item, Exception):
                 raise item
             return item
+        if form["grant_type"] == "refresh_token" and not self.refresh_valid(form["refresh_token"]):
+            return httpx.Response(400, json={"error": "invalid_grant"})
         self.count += 1
         access = f"synthetic-access-{self.count}"
         self.issued.add(access)
-        self.owner[access] = form.get("refresh_token", "code")
         body = {"access_token": access, "expires_in": 3600, "token_type": "Bearer"}
         if form["grant_type"] == "authorization_code":
             body["scope"] = self.scope
+            self.owner[access] = self.refresh_token or "code"
             if self.refresh_token:
                 body["refresh_token"] = self.refresh_token
+                self.user_of[self.refresh_token] = self.user
+                self.token_generation[self.refresh_token] = self.generation.get(self.user, 0)
+        else:
+            self.owner[access] = form["refresh_token"]
         return httpx.Response(200, json=body)
 
     def _api(self, request):
@@ -119,7 +153,8 @@ class FakeGoogle:
                 raise item
             if item is not None:
                 return item
-        if request.headers.get("authorization", "")[7:] not in self.issued:
+        access = request.headers.get("authorization", "")[7:]
+        if access not in self.issued or not self.refresh_valid(self.owner.get(access, "code")):
             return httpx.Response(401, json={"error": {"code": 401}})
         parts = request.url.path.split("/")  # ['', 'calendar', 'v3', ...]
         if parts[3] == "freeBusy":
@@ -471,7 +506,9 @@ def test_callback_requires_refresh_token(client, database, fake):
     r = callback(client, state=query["state"], code=CODE)
     assert r.status_code == 400
     assert accounts(database) == []
-    [revoke] = fake.by("POST", "/revoke")  # The access token is given back.
+    # Discarded, not revoked: Google revocation is grant-wide and would also kill an
+    # account this Google user already connected.
+    assert fake.by("POST", "/revoke") == []
     assert "synthetic-access" not in r.text
 
 
@@ -481,8 +518,7 @@ def test_callback_requires_scopes(client, database, fake):
     r = callback(client, state=query["state"], code=CODE)
     assert r.status_code == 400
     assert accounts(database) == []
-    [revoke] = fake.by("POST", "/revoke")
-    assert parse_qs(revoke.content.decode())["token"] == [REFRESH]
+    assert fake.by("POST", "/revoke") == []
 
 
 def test_callback_provider_error_param(client, database, fake):
@@ -571,6 +607,8 @@ def test_revoke_account(client, database, fake):
     [account] = accounts(database)
     assert account["refresh_token_ciphertext"] is None and account["key_id"] is None
     assert revoke_jobs(database)[0]["status"] == "done"
+    with pytest.raises(ProviderPermanent, match="^auth_revoked$"):
+        adapter(fake).get_event(CAL, EVENT.event_id)  # The grant is gone at (fake) Google.
 
 
 def test_revoke_grant_retries_until_google_confirms(client, database, fake, caplog):
@@ -1024,21 +1062,78 @@ def test_cancel_uses_account_that_wrote_event(database, fake):
     assert fake.events[(CAL, event_id)]["status"] == "cancelled"
 
 
-def test_cancel_with_revoked_writer_is_dead(database, fake):
+def test_cancel_with_revoked_writer_falls_back_to_current_mapping(database, fake):
     first = make_account(database)
     second = make_account(database, token="synthetic-refresh-b")
     appointment_id, ports = confirmed_under(database, fake, first)
     with connect(database) as conn:
         conn.execute(
-            "UPDATE calendar_accounts SET status='revoked', revoked_at=now() WHERE id=%s",
+            "UPDATE calendar_accounts SET status='revoked', revoked_at=now(),"
+            " refresh_token_ciphertext=NULL, key_id=NULL WHERE id=%s",
             (first,),
         )
+    map_doctor(database, second)
+    add_cancel_job(database, appointment_id)
+    run_once(database, "worker-g", ports)
+    assert job_state(database, appointment_id, "calendar.cancel")["status"] == "done"
+    [delete] = fake.by("DELETE", event_id_for(appointment_id, 1))
+    assert owner_of(fake, delete) == "synthetic-refresh-b"
+
+
+def test_cancel_with_errored_writer_is_dead(database, fake):
+    first = make_account(database)
+    second = make_account(database, token="synthetic-refresh-b")
+    appointment_id, ports = confirmed_under(database, fake, first)
+    with connect(database) as conn:
+        conn.execute("UPDATE calendar_accounts SET status='error' WHERE id=%s", (first,))
     map_doctor(database, second)
     add_cancel_job(database, appointment_id)
     run_once(database, "worker-g", ports)
     job = job_state(database, appointment_id, "calendar.cancel")
     assert job["status"] == "dead" and job["last_error"] == "calendar_unmapped"
     assert fake.by("DELETE", event_id_for(appointment_id, 1)) == []
+
+
+def create_with_recorded_intent(database, account_id):
+    appointment_id = book(database)
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE outbox SET payload=%s WHERE appointment_id=%s AND kind='calendar.create'",
+            (Jsonb({"calendar_id": CAL, "calendar_account_id": str(account_id)}), appointment_id),
+        )
+    return appointment_id
+
+
+def test_create_with_revoked_intent_account_falls_back(database, fake):
+    first = make_account(database)
+    second = make_account(database, token="synthetic-refresh-b")
+    appointment_id = create_with_recorded_intent(database, first)
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE calendar_accounts SET status='revoked', revoked_at=now() WHERE id=%s",
+            (first,),
+        )
+    map_doctor(database, second)
+    run_once(database, "worker-g", google_ports(database, fake))
+    assert appointment(database, appointment_id)["status"] == "confirmed"
+    with connect(database) as conn:
+        recorded = conn.execute(
+            "SELECT calendar_account_id FROM appointments WHERE id=%s", (appointment_id,)
+        ).fetchone()["calendar_account_id"]
+    assert recorded == second
+
+
+def test_create_with_errored_intent_account_is_dead(database, fake):
+    first = make_account(database)
+    second = make_account(database, token="synthetic-refresh-b")
+    appointment_id = create_with_recorded_intent(database, first)
+    with connect(database) as conn:
+        conn.execute("UPDATE calendar_accounts SET status='error' WHERE id=%s", (first,))
+    map_doctor(database, second)
+    run_once(database, "worker-g", google_ports(database, fake))
+    row = appointment(database, appointment_id)
+    assert row["status"] == "needs_review" and row["last_error"] == "calendar_unmapped"
+    assert fake.by("POST", "/events") == []
 
 
 def test_cancel_404_on_unreachable_calendar_is_not_done(database, fake):
@@ -1116,27 +1211,65 @@ def test_resolver_cache_replaces_and_evicts(database, fake):
 
 def test_start_conflicts_with_active_account_unless_replace(client, database, fake):
     auth = headers(client, database)
-    old = make_account(database)
+    old = make_account(database, token="synthetic-refresh-old")
     assert client.post("/v1/admin/calendar/google/start", headers=auth).status_code == 409
     r = client.post("/v1/admin/calendar/google/start?replace=true", headers=auth)
     assert r.status_code == 200
     state = parse_qs(urlsplit(r.json()["authorization_url"]).query)["state"][0]
+    fake.refresh_token = "synthetic-refresh-new"  # The same fake Google user reconsents.
     page = callback(client, state=state, code=CODE)
-    assert page.status_code == 200 and "active calendar accounts" not in page.text
-    statuses = {row["id"]: row["status"] for row in accounts(database)}
-    assert statuses[old] == "revoked"
-    assert list(statuses.values()).count("active") == 1
-    [job] = revoke_jobs(database)
-    assert job["payload"] == {"account_id": str(old)}
+    assert page.status_code == 200
+    rows = {row["id"]: row for row in accounts(database)}
+    assert rows[old]["status"] == "revoked" and rows[old]["refresh_token_ciphertext"] is None
+    assert [row["status"] for row in rows.values()].count("active") == 1
+    # Superseded locally only: no Google revocation (it would be grant-wide).
+    assert revoke_jobs(database) == [] and fake.by("POST", "/revoke") == []
+    actions = [(r["action"], r["target_id"]) for r in audit_rows(database)]
+    assert ("calendar.account_replaced", old) in actions
+    assert ("calendar.revoked", old) not in actions
 
 
-def test_callback_notes_multiple_active_accounts(client, database):
+def test_replace_with_same_google_user_keeps_new_account_working(client, database, fake):
+    auth = headers(client, database)
+    make_account(database, token="synthetic-refresh-old")
+    r = client.post("/v1/admin/calendar/google/start?replace=true", headers=auth)
+    state = parse_qs(urlsplit(r.json()["authorization_url"]).query)["state"][0]
+    fake.refresh_token = "synthetic-refresh-new"
+    assert callback(client, state=state, code=CODE).status_code == 200
+    map_doctor(database)  # No explicit account: the clinic's only active account.
+    appointment_id = book(database)
+    run_once(database, "worker-g", google_ports(database, fake))
+    row = appointment(database, appointment_id)
+    assert row["status"] == "confirmed" and row["job"] == "done"
+    [insert] = fake.by("POST", "/events")
+    assert owner_of(fake, insert) == "synthetic-refresh-new"
+
+
+def test_fake_revocation_is_grant_wide(fake):
+    """Guards the scenario above: revoking the old token would have killed the new one."""
+    fake.refresh_token = "synthetic-refresh-new"
+    google.exchange_code(fake.client(), CLIENT_ID, CLIENT_SECRET, CODE, "v" * 43, REDIRECT)
+    old = google.GoogleCalendar("synthetic-refresh-old", CLIENT_ID, CLIENT_SECRET, fake.client())
+    new = google.GoogleCalendar("synthetic-refresh-new", CLIENT_ID, CLIENT_SECRET, fake.client())
+    assert new.get_event(CAL, EVENT.event_id) is None
+    google.revoke_grant(fake.client(), "synthetic-refresh-old")
+    fresh = google.GoogleCalendar("synthetic-refresh-new", CLIENT_ID, CLIENT_SECRET, fake.client())
+    with pytest.raises(ProviderPermanent, match="^auth_revoked$"):
+        fresh.get_event(CAL, EVENT.event_id)
+    with pytest.raises(ProviderPermanent):
+        old.get_event(CAL, EVENT.event_id)
+
+
+def test_callback_refuses_second_active_account(client, database, fake):
     auth = headers(client, database)
     _, first = start(client, auth)
     _, second = start(client, auth)  # No active account yet, so both starts are allowed.
-    assert "active calendar accounts" not in callback(client, state=first["state"], code=CODE).text
-    page = callback(client, state=second["state"], code=CODE)
-    assert page.status_code == 200 and "2 active calendar accounts" in page.text
+    assert callback(client, state=first["state"], code=CODE).status_code == 200
+    r = callback(client, state=second["state"], code=CODE)
+    assert r.status_code == 409
+    assert len(accounts(database)) == 1
+    assert len(fake.tokens_requested()) == 1  # Refused before the code was exchanged.
+    assert fake.by("POST", "/revoke") == []
 
 
 # Logging and housekeeping
@@ -1190,3 +1323,34 @@ def test_run_loop_runs_housekeeping_when_idle(database):
         wait=lambda seconds: stop.set(),
     )
     assert len(calls) == 1
+
+
+def test_run_loop_survives_housekeeping_failure(database, caplog):
+    from threading import Event
+
+    from clinic_voice.outbox import run_loop
+
+    stop = Event()
+    waits = []
+
+    def housekeeping(conn):
+        raise RuntimeError("synthetic " + SECRET_MARKER)
+
+    def wait(seconds):
+        waits.append(seconds)
+        if len(waits) == 2:
+            stop.set()
+
+    clock = iter([0.0, 1000.0, 2000.0])
+    run_loop(
+        database,
+        "w-house",
+        Ports(calendar=FakeCalendar()),
+        stop,
+        housekeeping=housekeeping,
+        wait=wait,
+        clock=lambda: next(clock),
+    )
+    assert len(waits) == 2  # Kept polling after both failures.
+    assert "housekeeping failed error=RuntimeError" in caplog.text
+    assert SECRET_MARKER not in caplog.text

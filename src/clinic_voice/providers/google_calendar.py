@@ -155,7 +155,11 @@ def exchange_code(http, client_id, client_secret, code, code_verifier, redirect_
 
 
 def revoke_grant(http, token, timeout=10.0) -> None:
-    """Durable-path revocation: returns once Google confirms the token is revoked (200) or
+    """Revoke a token at Google. Google documents revocation as grant-wide: it removes the
+    scopes granted to this project and invalidates every access and refresh token of that
+    grant, not just this token. Callers must only revoke when that is intended (explicit
+    disconnect), never for a superseded or rejected token of a user who may still be
+    connected. Durable-path revocation: returns once Google confirms the token is revoked (200) or
     no longer valid (400 invalid_token, e.g. already revoked or expired). Raises OAuthError
     (retryable for network, 429 and 5xx) otherwise. No bodies are logged or raised."""
     try:
@@ -173,19 +177,6 @@ def revoke_grant(http, token, timeout=10.0) -> None:
     if response.status_code == 400 and error == "invalid_token":
         return
     raise OAuthError(f"revoke_http_{response.status_code}")
-
-
-def revoke_token(http, token, timeout=10.0) -> bool:
-    """Best-effort revocation of a refresh (or access) token. Never raises; logs no bodies."""
-    try:
-        response = http.post(REVOKE_ENDPOINT, data={"token": token}, timeout=timeout)
-    except httpx.HTTPError as error:
-        log.warning("google revoke failed error=%s", type(error).__name__)
-        return False
-    if response.status_code != 200:
-        log.warning("google revoke failed status=%s", response.status_code)
-        return False
-    return True
 
 
 def _parse_time(value) -> datetime:
