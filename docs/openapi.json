@@ -811,6 +811,145 @@
         }
       }
     },
+    "/v1/admin/outbox": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Outbox",
+        "operationId": "list_outbox_v1_admin_outbox_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "dead",
+                "pending",
+                "processing"
+              ],
+              "type": "string",
+              "default": "dead",
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OutboxJobOut"
+                  },
+                  "title": "Response List Outbox V1 Admin Outbox Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/outbox/{job_id}/requeue": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Requeue Outbox",
+        "operationId": "requeue_outbox_v1_admin_outbox__job_id__requeue_post",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Job Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutboxJobOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health/live": {
       "get": {
         "summary": "Live",
@@ -950,6 +1089,62 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ReservationResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/tools/appointment-status": {
+      "post": {
+        "summary": "Get Appointment Status",
+        "operationId": "get_appointment_status_v1_tools_appointment_status_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppointmentStatusRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AppointmentStatusResponse"
                 }
               }
             }
@@ -1312,6 +1507,58 @@
   },
   "components": {
     "schemas": {
+      "AppointmentStatusRequest": {
+        "properties": {
+          "appointment_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Appointment Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "appointment_id"
+        ],
+        "title": "AppointmentStatusRequest"
+      },
+      "AppointmentStatusResponse": {
+        "properties": {
+          "appointment_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Appointment Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "ends_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Ends At"
+          },
+          "spoken_status": {
+            "type": "string",
+            "title": "Spoken Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "appointment_id",
+          "status",
+          "starts_at",
+          "ends_at",
+          "spoken_status"
+        ],
+        "title": "AppointmentStatusResponse"
+      },
       "ClinicConfig": {
         "properties": {
           "id": {
@@ -1772,6 +2019,85 @@
           "password"
         ],
         "title": "LoginRequest"
+      },
+      "OutboxJobOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "kind": {
+            "type": "string",
+            "title": "Kind"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "max_attempts": {
+            "type": "integer",
+            "title": "Max Attempts"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "appointment_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Appointment Id"
+          },
+          "available_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Available At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "attempts",
+          "max_attempts",
+          "last_error",
+          "appointment_id",
+          "available_at",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "OutboxJobOut",
+        "description": "Operational view of a job: no payload contents."
       },
       "PasswordChange": {
         "properties": {

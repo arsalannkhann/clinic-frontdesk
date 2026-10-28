@@ -104,6 +104,43 @@ def response(row):
     }
 
 
+SPOKEN_STATUS = {
+    "confirmed": "Your appointment is confirmed.",
+    "pending_sync": (
+        "Your request is reserved and still awaiting calendar confirmation."
+        " It is not yet confirmed."
+    ),
+    "needs_review": (
+        "Your request needs a check by clinic staff, who will follow up with you."
+        " It is not yet confirmed."
+    ),
+    "cancelled": "This appointment has been cancelled.",
+}
+UNKNOWN_SPOKEN_STATUS = "I cannot see the status of this request right now. It is not confirmed."
+
+
+def spoken_status(status):
+    """The only place status becomes caller-facing wording. Only a persisted 'confirmed'
+    (set by the worker after the calendar event was verified) may be spoken as confirmed."""
+    return SPOKEN_STATUS.get(status, UNKNOWN_SPOKEN_STATUS)
+
+
+def appointment_status(conn, clinic_id, appointment_id):
+    row = conn.execute(
+        "SELECT id, status, starts_at, ends_at FROM appointments WHERE clinic_id=%s AND id=%s",
+        (clinic_id, appointment_id),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "Appointment not found")
+    return {
+        "appointment_id": row["id"],
+        "status": row["status"],
+        "starts_at": row["starts_at"],
+        "ends_at": row["ends_at"],
+        "spoken_status": spoken_status(row["status"]),
+    }
+
+
 def replay(conn, clinic_id, key, fingerprint):
     row = conn.execute(
         "SELECT * FROM appointments WHERE clinic_id=%s AND idempotency_key=%s", (clinic_id, key)

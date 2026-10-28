@@ -76,3 +76,59 @@ def test_005_backfills_blocks_until_and_rebuilds_exclusion(scratch_database, tmp
             " VALUES (%s,%s,%s,%s,%s,%s,'confirmed','old-binary-key','synthetic')",
             (uuid4(), CLINIC, DOCTOR_ID, SERVICE_ID, ends_at, ends_at + timedelta(minutes=15)),
         )
+
+
+def test_007_keeps_existing_outbox_rows_and_versions_uniqueness(scratch_database, tmp_path):
+    for path in sorted(Path("migrations").glob("00[1-6]_*.sql")):
+        shutil.copy(path, tmp_path / path.name)
+    migrate(scratch_database, tmp_path)
+    seed(scratch_database)
+    starts_at = datetime(2031, 1, 6, 4, 30, tzinfo=UTC)
+    appointment, job = uuid4(), uuid4()
+    with connect(scratch_database) as conn:
+        conn.execute(
+            "INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,"
+            "blocks_until,status,idempotency_key,request_hash)"
+            " VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync','pre-007-key','synthetic')",
+            (
+                appointment,
+                CLINIC,
+                DOCTOR_ID,
+                SERVICE_ID,
+                starts_at,
+                starts_at + timedelta(minutes=15),
+                starts_at + timedelta(minutes=15),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO outbox (id,clinic_id,appointment_id,kind) VALUES (%s,%s,%s,'calendar.create')",
+            (job, CLINIC, appointment),
+        )
+
+    migrate(scratch_database, Path("migrations"))
+
+    with connect(scratch_database) as conn:
+        row = conn.execute(
+            "SELECT o.status, o.attempts, o.appointment_version, o.payload, o.max_attempts,"
+            " a.version FROM outbox o JOIN appointments a ON a.id=o.appointment_id WHERE o.id=%s",
+            (job,),
+        ).fetchone()
+        assert row == {
+            "status": "pending",
+            "attempts": 0,
+            "appointment_version": 1,
+            "payload": {},
+            "max_attempts": 8,
+            "version": 1,
+        }
+        # A rescheduled version may enqueue its own create; the same version may not.
+        conn.execute(
+            "INSERT INTO outbox (id,clinic_id,appointment_id,kind,appointment_version)"
+            " VALUES (%s,%s,%s,'calendar.create',2)",
+            (uuid4(), CLINIC, appointment),
+        )
+    with pytest.raises(psycopg.errors.UniqueViolation), connect(scratch_database) as conn:
+        conn.execute(
+            "INSERT INTO outbox (id,clinic_id,appointment_id,kind) VALUES (%s,%s,%s,'calendar.create')",
+            (uuid4(), CLINIC, appointment),
+        )

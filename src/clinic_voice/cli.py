@@ -1,5 +1,10 @@
 import argparse
+import logging
+import os
+import signal
+import socket
 import sys
+import threading
 from datetime import timedelta
 from getpass import getpass
 from pathlib import Path
@@ -97,7 +102,54 @@ def staff_command(url, args):
             print("password reset; existing sessions revoked")
 
 
-def main():
+def build_ports(calendar):
+    if calendar == "fake":
+        from clinic_voice.providers.calendar import FakeCalendar
+        from clinic_voice.worker import Ports
+
+        print(
+            "WARNING: --calendar fake uses an in-process FakeCalendar. Events are not written to"
+            " any real calendar; development only.",
+            file=sys.stderr,
+        )
+        return Ports(calendar=FakeCalendar())
+    raise SystemExit(
+        "No calendar provider configured; the worker will not start. Use --calendar fake for"
+        " local development only (a live provider arrives with the Google adapter)."
+    )
+
+
+def worker_command(url, args):
+    from psycopg import Error as DatabaseError
+
+    from clinic_voice.worker import run_once
+
+    ports = build_ports(args.calendar)
+    worker_id = args.worker_id or f"{socket.gethostname()}:{os.getpid()}"
+    if args.once:
+        count = run_once(url, worker_id, ports)
+        print(f"processed {count} job(s)")
+        return
+    stop = threading.Event()
+
+    def request_stop(signum, frame):
+        stop.set()  # The current batch finishes; no new batch starts.
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    while not stop.is_set():
+        try:
+            count = run_once(url, worker_id, ports)
+        except DatabaseError as error:
+            logging.getLogger("clinic_voice.worker").error(
+                "worker batch failed error=%s", type(error).__name__
+            )
+            count = 0
+        if count == 0:
+            stop.wait(args.interval)
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(prog="clinic-voice")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate")
@@ -122,7 +174,20 @@ def main():
     owner.add_argument("--email", required=True)
     reset = staff_actions.add_parser("set-password", help="Password is read from stdin/prompt")
     reset.add_argument("--email", required=True)
-    args = parser.parse_args()
+    worker = commands.add_parser("worker", help="Process outbox jobs")
+    worker.add_argument("--once", action="store_true", help="Process one batch and exit")
+    worker.add_argument("--calendar", choices=["fake"], help="Calendar provider (fake: dev only)")
+    worker.add_argument("--worker-id", help="Lease owner name (default host:pid)")
+    worker.add_argument("--interval", type=float, default=2.0, help="Idle poll seconds")
+    args = parser.parse_args(argv)
+    if args.command == "worker" and not 0.1 <= args.interval <= 300:
+        parser.error("--interval must be between 0.1 and 300 seconds")
+    if (
+        args.command == "worker"
+        and args.worker_id is not None
+        and not 1 <= len(args.worker_id) <= 128
+    ):
+        parser.error("--worker-id must be 1 to 128 characters")
     if getattr(args, "grace_minutes", 0) not in range(0, 10081):
         parser.error("--grace-minutes must be between 0 and 10080")
     if args.command == "export-openapi":
@@ -139,5 +204,8 @@ def main():
         seed(url)
     elif args.command == "staff":
         staff_command(url, args)
+    elif args.command == "worker":
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+        worker_command(url, args)
     else:
         credential_command(url, args)

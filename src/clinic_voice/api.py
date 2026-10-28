@@ -13,6 +13,8 @@ from clinic_voice.deps import database, require_role, staff_session, tenant
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.schemas import (
     SLOT_SOURCE,
+    AppointmentStatusRequest,
+    AppointmentStatusResponse,
     LoginRequest,
     PasswordChange,
     ReservationRequest,
@@ -25,7 +27,7 @@ from clinic_voice.schemas import (
     StaffUserDetail,
     StaffUserUpdate,
 )
-from clinic_voice.service import reserve, slots
+from clinic_voice.service import appointment_status, reserve, slots
 
 
 @asynccontextmanager
@@ -57,7 +59,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "006_calendar_mapping.sql"
+REQUIRED_MIGRATION = "007_durable_worker.sql"
 
 
 @app.get("/health/live")
@@ -95,6 +97,12 @@ def reserve_slot(
     return reserve(
         get_settings().database_url.get_secret_value(), clinic_id, request, idempotency_key
     )
+
+
+@app.post("/v1/tools/appointment-status", response_model=AppointmentStatusResponse)
+def get_appointment_status(request: AppointmentStatusRequest, clinic_id=Depends(tenant)):
+    with database() as conn:
+        return appointment_status(conn, clinic_id, request.appointment_id)
 
 
 @app.post("/v1/staff/login", response_model=SessionResponse)

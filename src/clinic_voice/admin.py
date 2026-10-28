@@ -169,3 +169,52 @@ def replace_hours(conn, staff, doctor_id, windows):
         )
     audit(conn, clinic_id, staff["id"], "hours.replaced", doctor_id)
     return get_hours(conn, clinic_id, doctor_id)
+
+
+OUTBOX_COLUMNS = (
+    "id,kind,status,attempts,max_attempts,last_error,appointment_id,"
+    "available_at,created_at,updated_at"
+)
+
+
+def list_outbox(conn, clinic_id, status, limit):
+    """The clinic's jobs in one status, most recently changed first. No payloads."""
+    return conn.execute(
+        f"SELECT {OUTBOX_COLUMNS} FROM outbox WHERE clinic_id=%s AND status=%s"  # noqa: S608
+        " ORDER BY updated_at DESC, id LIMIT %s",
+        (clinic_id, status, limit),
+    ).fetchall()
+
+
+def requeue_outbox(conn, staff, job_id):
+    """Return a dead job to pending with a fresh attempt budget.
+
+    A dead calendar.create moved its appointment to needs_review; requeueing returns that
+    appointment to pending_sync (same version only) so the worker retries the projection. The
+    worker re-reads the event id and re-checks external busy time before inserting, so a
+    requeue never bypasses those checks.
+    """
+    clinic_id = staff["clinic_id"]
+    job = conn.execute(
+        "SELECT id, status, kind, appointment_id, appointment_version FROM outbox"
+        " WHERE clinic_id=%s AND id=%s FOR UPDATE",
+        (clinic_id, job_id),
+    ).fetchone()
+    if not job:
+        raise HTTPException(404, NOT_FOUND)
+    if job["status"] != "dead":
+        raise HTTPException(409, "Only dead jobs can be requeued")
+    row = conn.execute(
+        "UPDATE outbox SET status='pending', attempts=0, available_at=now(), last_error=NULL,"
+        " lease_owner=NULL, lease_expires_at=NULL, updated_at=now()"
+        f" WHERE clinic_id=%s AND id=%s RETURNING {OUTBOX_COLUMNS}",  # noqa: S608
+        (clinic_id, job_id),
+    ).fetchone()
+    if job["kind"] == "calendar.create":
+        conn.execute(
+            "UPDATE appointments SET status='pending_sync', updated_at=now()"
+            " WHERE clinic_id=%s AND id=%s AND status='needs_review' AND version=%s",
+            (clinic_id, job["appointment_id"], job["appointment_version"]),
+        )
+    audit(conn, clinic_id, staff["id"], "outbox.requeued", job_id)
+    return row

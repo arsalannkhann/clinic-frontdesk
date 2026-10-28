@@ -41,6 +41,18 @@ class ReservationResponse(StrictModel):
     spoken_confirmation: str
 
 
+class AppointmentStatusRequest(StrictModel):
+    appointment_id: UUID
+
+
+class AppointmentStatusResponse(StrictModel):
+    appointment_id: UUID
+    status: str
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    spoken_status: str
+
+
 # Slots come from the ledger plus the cached (advisory) external calendar busy time.
 SLOT_SOURCE = "ledger_and_cached_calendar"
 
@@ -296,3 +308,21 @@ class ExceptionCreated(ExceptionOut):
     # At most 100 ids; conflict_count is the true total.
     conflicting_appointment_ids: list[UUID]
     conflict_count: int
+
+
+OutboxStatus = Literal["dead", "pending", "processing"]
+
+
+class OutboxJobOut(StrictModel):
+    """Operational view of a job: no payload contents."""
+
+    id: UUID
+    kind: str
+    status: str
+    attempts: int
+    max_attempts: int
+    last_error: str | None
+    appointment_id: UUID | None
+    available_at: AwareDatetime
+    created_at: AwareDatetime
+    updated_at: AwareDatetime

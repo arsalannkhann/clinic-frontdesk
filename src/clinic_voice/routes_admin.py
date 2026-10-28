@@ -17,6 +17,8 @@ from clinic_voice.schemas import (
     ExceptionOut,
     HoursReplace,
     HoursWindow,
+    OutboxJobOut,
+    OutboxStatus,
     ServiceCreate,
     ServiceOut,
     ServiceUpdate,
@@ -126,3 +128,19 @@ def delete_exception(exception_id: UUID, staff=Depends(writer)):
     with database() as conn:
         schedule_exceptions.delete_exception(conn, staff, exception_id)
     return Response(status_code=204)
+
+
+@router.get("/outbox", response_model=list[OutboxJobOut])
+def list_outbox(
+    status: OutboxStatus = "dead",
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    staff=Depends(writer),
+):
+    with database() as conn:
+        return admin.list_outbox(conn, staff["clinic_id"], status, limit)
+
+
+@router.post("/outbox/{job_id}/requeue", response_model=OutboxJobOut)
+def requeue_outbox(job_id: UUID, staff=Depends(writer)):
+    with database() as conn:
+        return admin.requeue_outbox(conn, staff, job_id)
