@@ -176,9 +176,45 @@ def _lock_accounts(conn, clinic_id):
     )
 
 
-def callback(conn, settings, http, state, code, error) -> dict:
-    """Complete an authorization. Raises HTTPException(400) for any invalid request.
-    Returns {account_id, active_accounts} (the clinic's active account count afterwards)."""
+def _cancel_pending_revocations(conn, clinic_id, actor_id):
+    """A new connection may be the same Google user as an account disconnected earlier whose
+    Google revocation has not run yet. That revocation is grant-wide and would kill the new
+    account, so before storing it (caller holds _lock_accounts) forget those tokens locally
+    and cancel pending calendar.revoke_grant jobs (status done, last_error
+    'revoke_superseded'). A job already processing is fenced by the same lock and the
+    newer-account check in GoogleCalendarResolver.revoke_grant. Caller commits."""
+    stale = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT a.id FROM calendar_accounts a WHERE a.clinic_id=%s AND a.status='revoked'"
+            " AND (a.refresh_token_ciphertext IS NOT NULL OR EXISTS ("
+            " SELECT 1 FROM outbox o WHERE o.clinic_id=a.clinic_id"
+            " AND o.kind='calendar.revoke_grant' AND o.status IN ('pending','processing')"
+            " AND o.payload->>'account_id' = a.id::text)) FOR UPDATE",
+            (clinic_id,),
+        ).fetchall()
+    ]
+    if not stale:
+        return
+    conn.execute(
+        "UPDATE calendar_accounts SET refresh_token_ciphertext=NULL, key_id=NULL"
+        " WHERE clinic_id=%s AND id = ANY(%s)",
+        (clinic_id, stale),
+    )
+    conn.execute(
+        "UPDATE outbox SET status='done', last_error='revoke_superseded', updated_at=now()"
+        " WHERE clinic_id=%s AND kind='calendar.revoke_grant' AND status='pending'"
+        " AND payload->>'account_id' = ANY(%s)",
+        (clinic_id, [str(a) for a in stale]),
+    )
+    for account_id in stale:
+        audit(conn, clinic_id, actor_id, "calendar.revoke_superseded", account_id)
+
+
+def callback(conn, settings, http, state, code, error) -> UUID:
+    """Complete an authorization and return the new account id. Raises HTTPException(400)
+    for any invalid request, 409 if the clinic already has an active account and the start
+    did not ask to replace it."""
     keyring = keyring_from(settings)
     if not state or len(state) > 256:
         raise HTTPException(400, INVALID_STATE)
@@ -238,6 +274,7 @@ def callback(conn, settings, http, state, code, error) -> dict:
     if previous and not row["replace_existing"]:
         conn.rollback()
         raise HTTPException(409, ALREADY_CONNECTED)  # Lost a race with another callback.
+    _cancel_pending_revocations(conn, clinic_id, user_id)
     conn.execute(
         "INSERT INTO calendar_accounts (id,clinic_id,provider,refresh_token_ciphertext,key_id,"
         "scopes,status,connected_by) VALUES (%s,%s,'google',%s,%s,%s,'active',%s)",
@@ -246,9 +283,8 @@ def callback(conn, settings, http, state, code, error) -> dict:
     audit(conn, clinic_id, user_id, "calendar.connected", account_id)
     for old in previous:
         _supersede(conn, clinic_id, user_id, old)
-    active = active_accounts(conn, clinic_id)
     conn.commit()
-    return {"account_id": account_id, "active_accounts": active}
+    return account_id
 
 
 def list_accounts(conn, clinic_id):
@@ -286,13 +322,17 @@ ACCOUNT_SELECT = (
 class GoogleCalendarResolver:
     """Ports.calendar_for for the Google adapter.
 
-    (conn, clinic_id, doctor_id, account_id) -> (port, account_id) | None. With account_id
-    (the account recorded as having written an event) that account is used; if it was
-    revoked or replaced, the doctor's current mapping is used instead, and if it is in
-    status 'error' (or missing) nothing resolves. Without it, the doctor's
-    calendar_account_id; if the doctor has none, the clinic's only active
-    Google account (None if zero or several). Only status 'active' resolves: a revoked or
-    errored account is unmapped and never falls back to another account.
+    (conn, clinic_id, doctor_id, account_id) -> (port, account_id) | None.
+
+    With account_id (the account recorded as having written an event) that account is used
+    while active. If it was revoked or replaced, resolution falls back to the doctor's
+    current mapping (below). Only a recorded account in status 'error' (or one that no
+    longer exists) stays strict: nothing resolves and the job dead-letters.
+
+    Without account_id: the doctor's calendar_account_id, else the clinic's only active
+    Google account (None if zero or several). Only status 'active' resolves here; a doctor
+    mapped to a revoked or errored account resolves to None and never falls back to
+    another account.
 
     One adapter is cached per account (access tokens are reused); it is replaced when the
     stored ciphertext changes and evicted when the account stops resolving. Raises
@@ -397,13 +437,42 @@ class GoogleCalendarResolver:
     def revoke_grant(self, conn, clinic_id, account_id) -> bool:
         """Revoke a revoked account's token at Google. True once Google confirmed (or there
         is nothing left to revoke); the caller then clears the ciphertext. Raises
-        ProviderRetryable/ProviderPermanent on failure. Does not commit writes."""
-        account = conn.execute(ACCOUNT_SELECT + " AND id=%s", (clinic_id, account_id)).fetchone()
-        conn.commit()
+        ProviderRetryable/ProviderPermanent on failure.
+
+        Google revocation is grant-wide for the Google user. If an active account of this
+        clinic was connected after this one was revoked, it may be the same user, so the
+        call is skipped and the token only forgotten locally (audit
+        'calendar.revoke_superseded'). The check runs under the clinic's account lock
+        (_lock_accounts, also held by callbacks) and commits before the Google call: no
+        transaction stays open during I/O. A reconnect that completes between that commit
+        and Google's response can still lose its grant; that small window is accepted."""
+        _lock_accounts(conn, clinic_id)
+        account = conn.execute(
+            "SELECT id, status, refresh_token_ciphertext, key_id, revoked_at"
+            " FROM calendar_accounts WHERE clinic_id=%s AND provider='google' AND id=%s",
+            (clinic_id, account_id),
+        ).fetchone()
         if account is None or account["refresh_token_ciphertext"] is None:
+            conn.commit()
             return True
         if account["status"] != "revoked":
+            conn.commit()
             raise ProviderPermanent("account_not_revoked")
+        newer = conn.execute(
+            "SELECT 1 FROM calendar_accounts WHERE clinic_id=%s AND status='active'"
+            " AND created_at > %s LIMIT 1",
+            (clinic_id, account["revoked_at"]),
+        ).fetchone()
+        if newer:
+            conn.execute(
+                "UPDATE calendar_accounts SET refresh_token_ciphertext=NULL, key_id=NULL"
+                " WHERE clinic_id=%s AND id=%s",
+                (clinic_id, account_id),
+            )
+            audit(conn, clinic_id, None, "calendar.revoke_superseded", account_id)
+            conn.commit()
+            return True
+        conn.commit()
         token = self._decrypt(
             clinic_id, account_id, account["key_id"], bytes(account["refresh_token_ciphertext"])
         )

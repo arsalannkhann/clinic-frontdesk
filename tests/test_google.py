@@ -1354,3 +1354,69 @@ def test_run_loop_survives_housekeeping_failure(database, caplog):
     assert len(waits) == 2  # Kept polling after both failures.
     assert "housekeeping failed error=RuntimeError" in caplog.text
     assert SECRET_MARKER not in caplog.text
+
+
+# A disconnect whose Google revocation is still pending must not kill a reconnect
+
+
+def connect_via_callback(client, auth, fake, token):
+    _, query = start(client, auth)
+    fake.refresh_token = token
+    r = callback(client, state=query["state"], code=CODE)
+    assert r.status_code == 200, r.text
+
+
+def new_account_works(database, fake, token):
+    map_doctor(database)
+    appointment_id = book(database)
+    run_once(database, "worker-g", google_ports(database, fake))
+    row = appointment(database, appointment_id)
+    assert row["status"] == "confirmed", row
+    insert = fake.by("POST", "/events")[-1]
+    assert owner_of(fake, insert) == token
+
+
+def test_reconnect_cancels_pending_revocation(client, database, fake):
+    auth = headers(client, database)
+    old = make_account(database, token="synthetic-refresh-old")
+    assert client.delete(f"/v1/admin/calendar/google/{old}", headers=auth).status_code == 204
+    connect_via_callback(client, auth, fake, "synthetic-refresh-new")  # Same fake user.
+    [job] = revoke_jobs(database)
+    assert job["status"] == "done" and job["last_error"] == "revoke_superseded"
+    old_row = next(a for a in accounts(database) if a["id"] == old)
+    assert old_row["status"] == "revoked" and old_row["refresh_token_ciphertext"] is None
+    assert ("calendar.revoke_superseded", old) in [
+        (r["action"], r["target_id"]) for r in audit_rows(database)
+    ]
+    new_account_works(database, fake, "synthetic-refresh-new")
+    assert fake.by("POST", "/revoke") == []
+
+
+def test_reconnect_while_revocation_is_processing(client, database, fake):
+    from clinic_voice.outbox import claim, process
+
+    auth = headers(client, database)
+    old = make_account(database, token="synthetic-refresh-old")
+    assert client.delete(f"/v1/admin/calendar/google/{old}", headers=auth).status_code == 204
+    ports = google_ports(database, fake)
+    with connect(database) as conn:
+        [job] = claim(conn, "worker-slow", kinds=["calendar.revoke_grant"])
+        connect_via_callback(client, auth, fake, "synthetic-refresh-new")
+        assert revoke_jobs(database)[0]["status"] == "processing"  # Fenced; not touched.
+        assert process(conn, job, ports) is not False
+    assert revoke_jobs(database)[0]["status"] == "done"
+    assert fake.by("POST", "/revoke") == []
+    new_account_works(database, fake, "synthetic-refresh-new")
+
+
+def test_revocation_skipped_when_newer_account_exists(client, database, fake):
+    auth = headers(client, database)
+    old = make_account(database, token="synthetic-refresh-old")
+    assert client.delete(f"/v1/admin/calendar/google/{old}", headers=auth).status_code == 204
+    make_account(database, token="synthetic-refresh-new")  # Connected after the revoke.
+    run_once(database, "worker-g", google_ports(database, fake))
+    assert fake.by("POST", "/revoke") == []
+    assert revoke_jobs(database)[0]["status"] == "done"
+    old_row = next(a for a in accounts(database) if a["id"] == old)
+    assert old_row["refresh_token_ciphertext"] is None
+    new_account_works(database, fake, "synthetic-refresh-new")
