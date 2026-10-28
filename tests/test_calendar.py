@@ -345,6 +345,11 @@ def test_refresh_stores_clipped_merged_intervals(database):
     assert refresh(database, fake, start=at(9), end=at(16)) == 3
     assert cached(database) == [(at(9), at(9, 30)), (at(11), at(12, 30)), (at(14), at(15))]
     with connect(database) as conn:
+        sources = conn.execute(
+            "SELECT source_calendar, count(*) AS n FROM external_busy GROUP BY 1"
+        ).fetchall()
+    assert {r["source_calendar"]: r["n"] for r in sources} == {BUSY: 2, CAL: 1}
+    with connect(database) as conn:
         row = conn.execute("SELECT fetched_at FROM external_busy LIMIT 1").fetchone()
     assert row["fetched_at"] is not None
 
@@ -525,3 +530,37 @@ def test_external_busy_requires_composite_doctor_fk(database):
             " VALUES (%s,%s,%s,%s,%s,'x')",
             (uuid4(), CLINIC, other_doctor, at(10), at(11)),
         )
+
+
+def test_refresh_refuses_connection_with_pending_work(database):
+    map_doctor(database)
+    fake = FakeCalendar()
+    with connect(database) as conn:
+        conn.execute(
+            "INSERT INTO external_busy (id,clinic_id,doctor_id,starts_at,ends_at,source_calendar)"
+            " VALUES (%s,%s,%s,%s,%s,'pending')",
+            (uuid4(), CLINIC, DOCTOR_ID, at(10), at(11)),
+        )
+        with pytest.raises(RuntimeError):
+            calendar_sync.refresh_external_busy(conn, fake, CLINIC, DOCTOR_ID, at(0), at(23))
+        conn.rollback()  # the caller's write was never committed by the failed call
+    assert cached(database) == []
+
+
+def test_concurrent_refreshes_leave_no_duplicates(database):
+    map_doctor(database)
+    fake = FakeCalendar()
+    fake.busy[BUSY] = [(at(10), at(11)), (at(13), at(14))]
+    errors = []
+
+    def go():
+        try:
+            refresh(database, fake)
+        except Exception as error:  # noqa: BLE001
+            errors.append(error)
+
+    threads = [Thread(target=go) for _ in range(6)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert not errors
+    assert cached(database) == [(at(10), at(11)), (at(13), at(14))]

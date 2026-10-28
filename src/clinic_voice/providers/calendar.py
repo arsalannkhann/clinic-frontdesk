@@ -121,7 +121,8 @@ class FakeCalendar:
             self._failures.extend([error_type] * n)
 
     def insert_count(self, event_id: str) -> int:
-        """Insert calls that stored (or collided on) this id, across all calendars."""
+        """Number of successful inserts that stored this id, across all calendars (collisions
+        and injected failures that stored nothing are not counted; timeout_after_write counts)."""
         with self._lock:
             return self._inserts.get(event_id, 0)
 
