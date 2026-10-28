@@ -1,0 +1,19 @@
+# Design-only state machine. Not Bolna deployment JSON.
+version: 1
+initial: greeting
+states:
+  greeting: {next: intent, disclose_ai: true}
+  intent: {routes: [booking, verified_lookup, approved_faq, human_handoff]}
+  booking: {steps: [resolve_doctor_service, clarify_date, check_slots, read_back, explicit_confirmation, reserve]}
+  verified_lookup: {requires: [verified_session, booking_reference], routes: [cancel, reschedule]}
+  reserve: {routes: [pending_sync, confirmed, conflict, needs_review]}
+  pending_sync: {say: awaiting_calendar_confirmation, next: close}
+  confirmed: {requires: persisted_confirmed_state, next: close}
+  conflict: {next: check_slots}
+  cancel: {requires: [verified_ownership, explicit_confirmation], next: tool_result}
+  reschedule: {requires: [verified_ownership, explicit_confirmation], next: tool_result}
+  tool_result: {say: actual_result_only, next: close}
+  needs_review: {next: human_handoff}
+  human_handoff: {requires: configured_route, fallback: approved_callback_policy}
+  approved_faq: {source: trusted_clinic_content, next: close}
+  close: {recap: actual_result_only}
