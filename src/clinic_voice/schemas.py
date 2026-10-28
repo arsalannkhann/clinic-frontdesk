@@ -1,6 +1,7 @@
 from datetime import date
 from typing import Annotated, Literal
 from uuid import UUID
+from zoneinfo import available_timezones
 
 from pydantic import (
     AfterValidator,
@@ -89,13 +90,13 @@ class StaffUserUpdate(StrictModel):
 
 
 # Clinic configuration (staff admin)
-def _iana_zone(value: str) -> str:
-    from zoneinfo import ZoneInfo, available_timezones
+ZONES = frozenset(available_timezones())
 
+
+def _iana_zone(value: str) -> str:
     # Names such as "local" or "" are not canonical IANA keys; require a known key.
-    if value not in available_timezones():
+    if value not in ZONES:
         raise ValueError("unknown IANA timezone")
-    ZoneInfo(value)
     return value
 
 

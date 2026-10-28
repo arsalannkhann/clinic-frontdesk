@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 from fastapi import HTTPException
 from psycopg.errors import UniqueViolation
 
+from clinic_voice.audit import audit
 from clinic_voice.credentials import digest
 
 ROLES = ("owner", "admin", "viewer")
@@ -69,13 +70,6 @@ def parse_session(token: str):
     if not match:
         return None
     return UUID(match.group(1)), match.group(2)
-
-
-def audit(conn, clinic_id, actor_id, action, target_id=None):
-    conn.execute(
-        "INSERT INTO audit_events (id,clinic_id,actor_id,action,target_id) VALUES (%s,%s,%s,%s,%s)",
-        (uuid4(), clinic_id, actor_id, action, target_id),
-    )
 
 
 def public(user):

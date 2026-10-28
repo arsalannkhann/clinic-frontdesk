@@ -2,14 +2,15 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
-from clinic_voice.staff import audit
+from clinic_voice.audit import audit
 
 NOT_FOUND = "Not found"
 
 
 def _update(conn, table, columns, clinic_id, row_id, changes):
     """Update allow-listed columns of one clinic-scoped row; 404 if it is not in the clinic."""
-    assert set(changes) <= set(columns)
+    if not changes or not set(changes) <= set(columns):
+        raise ValueError("invalid update columns")
     sets = ", ".join(f"{name}=%s" for name in changes)
     row = conn.execute(
         f"UPDATE {table} SET {sets} WHERE clinic_id=%s AND id=%s RETURNING *",  # noqa: S608
@@ -28,7 +29,15 @@ def get_clinic(conn, clinic_id):
 
 
 def update_clinic(conn, staff, changes):
+    """Update clinic settings.
+
+    Timezone and horizon changes are not serialized with in-flight reservations; a booking
+    validated against the old value may commit just after the change (low risk).
+    """
     clinic_id = staff["clinic_id"]
+    columns = ("name", "timezone", "lead_time_minutes", "horizon_days")
+    if not changes or not set(changes) <= set(columns):
+        raise ValueError("invalid update columns")
     row = conn.execute(
         f"UPDATE clinics SET {', '.join(f'{k}=%s' for k in changes)} WHERE id=%s"  # noqa: S608
         " RETURNING id,name,timezone,lead_time_minutes,horizon_days",
@@ -87,6 +96,13 @@ def create_service(conn, staff, doctor_id, name, duration, buffer):
 
 
 def update_service(conn, staff, service_id, changes):
+    # Lock the owning doctor first, the same order reserve() uses, so edits and bookings serialize.
+    if not conn.execute(
+        "SELECT d.id FROM services s JOIN doctors d ON d.clinic_id=s.clinic_id AND d.id=s.doctor_id"
+        " WHERE s.clinic_id=%s AND s.id=%s FOR UPDATE OF d",
+        (staff["clinic_id"], service_id),
+    ).fetchone():
+        raise HTTPException(404, NOT_FOUND)
     row = _update(
         conn,
         "services",

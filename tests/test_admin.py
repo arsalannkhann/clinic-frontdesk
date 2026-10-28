@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from threading import Thread
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -272,6 +273,40 @@ def test_cross_tenant_ids_are_404(client, database):
     assert str(other_service) not in ids
 
 
+def test_lists_do_not_leak_across_clinics(client, database):
+    other, other_doctor, other_service = foreign(database)
+    b = headers(client, database, "viewer", clinic=other)
+    doctors = {d["id"] for d in client.get("/v1/admin/doctors", headers=b).json()}
+    services = {s["id"] for s in client.get("/v1/admin/services", headers=b).json()}
+    assert doctors == {str(other_doctor)} and services == {str(other_service)}
+    assert client.get("/v1/admin/clinic", headers=b).json()["id"] == str(other)
+    assert client.get(f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=b).status_code == 404
+
+
+def test_audit_rows_carry_clinic_actor_target(client, database):
+    with connect(database) as conn:
+        owner = staff.create_user(conn, CLINIC, "audit-owner@example.test", "owner", PASSWORD)
+    token = client.post(
+        "/v1/staff/login", json={"email": "audit-owner@example.test", "password": PASSWORD}
+    ).json()["token"]
+    h = {"Authorization": "Bearer " + token}
+    doctor = client.post("/v1/admin/doctors", headers=h, json={"name": "Audit"}).json()["id"]
+    client.put(f"/v1/admin/doctors/{doctor}/hours", headers=h, json=[])
+    client.patch("/v1/admin/clinic", headers=h, json={"name": "Audited"})
+    with connect(database) as conn:
+        rows = conn.execute(
+            "SELECT action,clinic_id,actor_id,target_id FROM audit_events"
+            " WHERE action IN ('doctor.created','hours.replaced','clinic.updated')"
+        ).fetchall()
+    by_action = {r["action"]: r for r in rows}
+    assert set(by_action) == {"doctor.created", "hours.replaced", "clinic.updated"}
+    for r in rows:
+        assert r["clinic_id"] == CLINIC and r["actor_id"] == owner["id"]
+    assert str(by_action["doctor.created"]["target_id"]) == doctor
+    assert str(by_action["hours.replaced"]["target_id"]) == doctor
+    assert by_action["clinic.updated"]["target_id"] == CLINIC
+
+
 # Hours
 
 
@@ -289,7 +324,7 @@ def test_hours_replace_and_read(client, database):
     # Adjacent windows are allowed; empty list makes the doctor unbookable.
     r = client.put(f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=h, json=[])
     assert r.status_code == 200 and r.json() == []
-    day = datetime.now(IST).date() + timedelta(days=1)
+    day = datetime.now(IST).date() + timedelta(days=3)
     assert check_slots(client, database, day).json()["slots"] == []
 
 
@@ -321,7 +356,6 @@ def test_hours_replacement_rolls_back_on_failure(client, database, monkeypatch):
 
     h = headers(client, database)
     before = client.get(f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=h).json()
-    real = admin.audit
 
     def boom(*args, **kwargs):
         raise RuntimeError("synthetic failure after delete and insert")
@@ -332,7 +366,7 @@ def test_hours_replacement_rolls_back_on_failure(client, database, monkeypatch):
             f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=h, json=[window(1, "10:00", "11:00")]
         )
     assert r.status_code == 500
-    monkeypatch.setattr(admin, "audit", real)
+    monkeypatch.undo()
     assert client.get(f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=h).json() == before
 
 
@@ -380,3 +414,56 @@ def test_inactive_is_unbookable(client, database, target):
     assert reserve(client, database, slot).status_code == 404
     assert client.patch(path, headers=h, json={"active": True}).status_code == 200
     assert check_slots(client, database, day).status_code == 200
+
+
+def test_hours_change_alters_slots(client, database):
+    h = headers(client, database)
+    day = datetime.now(IST).date() + timedelta(days=3)
+    before = check_slots(client, database, day).json()["slots"]
+    assert before
+    body = [window(day.weekday(), "10:00", "10:30")]
+    assert (
+        client.put(f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=h, json=body).status_code == 200
+    )
+    after = check_slots(client, database, day).json()["slots"]
+    assert after != before and after
+    assert all(datetime.fromisoformat(t).astimezone(IST).hour == 10 for t in after)
+
+
+# Lock discipline: admin edits must queue behind a held doctor row lock, like reservations.
+
+
+def blocked_until_released(database, call):
+    result = {}
+    with connect(database) as holder:
+        holder.execute("SELECT id FROM doctors WHERE id=%s FOR UPDATE", (DOCTOR_ID,))
+        thread = Thread(target=lambda: result.setdefault("r", call()))
+        thread.start()
+        thread.join(timeout=0.5)
+        assert thread.is_alive(), "mutation did not wait for the doctor row lock"
+        holder.rollback()  # Release the lock.
+    thread.join(timeout=10)
+    assert not thread.is_alive()
+    return result["r"]
+
+
+def test_put_hours_waits_for_doctor_lock(client, database):
+    h = headers(client, database)
+    r = blocked_until_released(
+        database,
+        lambda: client.put(
+            f"/v1/admin/doctors/{DOCTOR_ID}/hours", headers=h, json=[window(1, "10:00", "11:00")]
+        ),
+    )
+    assert r.status_code == 200
+
+
+def test_patch_service_waits_for_doctor_lock(client, database):
+    h = headers(client, database)
+    r = blocked_until_released(
+        database,
+        lambda: client.patch(
+            f"/v1/admin/services/{SERVICE_ID}", headers=h, json={"duration_minutes": 20}
+        ),
+    )
+    assert r.status_code == 200 and r.json()["duration_minutes"] == 20

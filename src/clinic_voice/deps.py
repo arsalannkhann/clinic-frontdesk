@@ -4,6 +4,7 @@ from fastapi import Depends, Header, HTTPException
 
 from clinic_voice import staff as staff_service
 from clinic_voice.config import get_settings
+from clinic_voice.credentials import authenticate, parse
 from clinic_voice.db import connect
 
 
@@ -34,3 +35,15 @@ def require_role(*roles):
         return staff
 
     return check
+
+
+def tenant(authorization: Annotated[str | None, Header()] = None):
+    scheme, _, token = (authorization or "").partition(" ")
+    if scheme != "Bearer" or parse(token) is None:
+        raise unauthorized()  # Reject malformed tokens before touching the database.
+    # The credential record alone selects the tenant. Never accept clinic_id from the LLM.
+    with database() as conn:
+        clinic_id = authenticate(conn, token)
+    if clinic_id is None:
+        raise unauthorized()
+    return clinic_id

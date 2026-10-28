@@ -9,9 +9,7 @@ from psycopg import Error as DatabaseError
 
 from clinic_voice import staff as staff_service
 from clinic_voice.config import get_settings
-from clinic_voice.credentials import authenticate, parse
-from clinic_voice.db import connect
-from clinic_voice.deps import database, require_role, staff_session, unauthorized
+from clinic_voice.deps import database, require_role, staff_session, tenant
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.schemas import (
     LoginRequest,
@@ -61,18 +59,6 @@ async def validation_error(request, exc):
 REQUIRED_MIGRATION = "004_clinic_configuration.sql"
 
 
-def tenant(authorization: Annotated[str | None, Header()] = None):
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme != "Bearer" or parse(token) is None:
-        raise unauthorized()  # Reject malformed tokens before touching the database.
-    # The credential record alone selects the tenant. Never accept clinic_id from the LLM.
-    with connect(get_settings().database_url.get_secret_value()) as conn:
-        clinic_id = authenticate(conn, token)
-    if clinic_id is None:
-        raise unauthorized()
-    return clinic_id
-
-
 @app.get("/health/live")
 def live():
     return {"status": "ok"}
@@ -81,7 +67,7 @@ def live():
 @app.get("/health/ready")
 def ready():
     try:
-        with connect(get_settings().database_url.get_secret_value()) as conn:
+        with database() as conn:
             applied = conn.execute("SELECT name FROM schema_migrations ORDER BY name").fetchall()
             if not any(row["name"] == REQUIRED_MIGRATION for row in applied):
                 raise HTTPException(503, "Schema not ready")
@@ -92,7 +78,7 @@ def ready():
 
 @app.post("/v1/tools/check-slots", response_model=SlotResponse)
 def check_slots(query: SlotQuery, clinic_id=Depends(tenant)):
-    with connect(get_settings().database_url.get_secret_value()) as conn:
+    with database() as conn:
         available = slots(conn, clinic_id, query.doctor_id, query.service_id, query.day)
     return {"slots": available[:3], "source": "local_reservations_only"}
 

@@ -17,7 +17,7 @@ from clinic_voice.schemas import (
     ServiceUpdate,
 )
 
-router = APIRouter(prefix="/v1/admin")
+router = APIRouter(prefix="/v1/admin", tags=["admin"])
 reader = require_role("owner", "admin", "viewer")
 writer = require_role("owner", "admin")
 
