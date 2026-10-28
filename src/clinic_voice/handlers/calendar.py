@@ -3,9 +3,13 @@
 Each handler reads in a short committed transaction, calls the provider with the connection
 idle (renewing the lease between calls), then records the outcome in a fenced transaction.
 
-Handlers are provider-agnostic: the port comes from Ports.calendar_port(conn, clinic, doctor),
-which is a fixed adapter (FakeCalendar) or a per-account resolver (Google). No port (no
-usable account, e.g. revoked) is treated like an unmapped calendar.
+Handlers are provider-agnostic: the port comes from Ports.calendar_port(conn, clinic, doctor,
+account), which is a fixed adapter (FakeCalendar) or a per-account resolver (Google). The
+account that wrote an event is recorded (create payload write intent, then
+appointments.calendar_account_id) and later cancels and withdrawals use that account, never
+the doctor's current mapping. No port (no usable account, e.g. revoked) is treated like an
+unmapped calendar. A provider that rejects an account's credentials ('auth_revoked') marks
+the account 'error' through Ports.account_failed.
 """
 
 import logging
@@ -29,6 +33,7 @@ from clinic_voice.providers.calendar import (
     CalendarEvent,
     EventAlreadyExists,
     ProviderError,
+    ProviderPermanent,
     event_id_for,
     event_summary,
 )
@@ -75,6 +80,7 @@ def _load_appointment(conn, job):
     row = conn.execute(
         """SELECT a.status, a.version, a.starts_at, a.ends_at, a.blocks_until,
         a.starts_at <= now() AS past, a.calendar_event_id, a.calendar_id, a.doctor_id,
+        a.calendar_account_id,
         d.booking_calendar_id, d.busy_calendar_ids, c.timezone
         FROM appointments a
         JOIN doctors d ON d.clinic_id=a.clinic_id AND d.id=a.doctor_id
@@ -98,18 +104,34 @@ def _matches(event, appointment) -> bool:
     )
 
 
-def _port(conn, job, ports, doctor_id):
-    """(port, None) or (None, outcome) when resolution failed and the job was settled."""
+def _uuid(value):
     try:
-        port = ports.calendar_port(conn, job.clinic_id, doctor_id)
+        return None if value is None else UUID(str(value))
+    except ValueError:
+        return None
+
+
+def _port(conn, job, ports, doctor_id, account_id=None):
+    """((port, account_id), None), or (None, outcome) when resolution failed and the job was
+    settled. With account_id, only that account may be used (dead 'calendar_unmapped' if it
+    is no longer active)."""
+    try:
+        target = ports.calendar_port(conn, job.clinic_id, doctor_id, account_id)
     except ProviderError as error:
         return None, provider_failure(conn, job, error)
-    if port is None:
+    if target is None:
         return None, fail_dead(conn, job, "calendar_unmapped")
-    return port, None
+    return target, None
 
 
-def _withdraw(conn, job, port, calendar_id, event_id) -> bool:
+def _failed(conn, job, ports, target, error) -> bool:
+    """provider_failure, after flagging an account whose credentials the provider rejected."""
+    if isinstance(error, ProviderPermanent) and error.code == "auth_revoked":
+        ports.account_failed(conn, job.clinic_id, target[1])
+    return provider_failure(conn, job, error)
+
+
+def _withdraw(conn, job, ports, target, calendar_id, event_id) -> bool:
     """Cancel this job's own event because the appointment was cancelled or rescheduled.
 
     The cancel runs even if this worker's lease was lost: the id is unique to the superseded
@@ -120,14 +142,14 @@ def _withdraw(conn, job, port, calendar_id, event_id) -> bool:
     sees the superseded appointment and withdraws again."""
     require_idle(conn)
     try:
-        port.cancel_event(calendar_id, event_id)
+        target[0].cancel_event(calendar_id, event_id)
     except ProviderError as error:
-        return provider_failure(conn, job, error)
+        return _failed(conn, job, ports, target, error)
     log.info("withdrew superseded event job=%s", job.id)
     return complete(conn, job)
 
 
-def _confirm(conn, job, port, calendar_id, event_id) -> bool:
+def _confirm(conn, job, ports, target, calendar_id, event_id) -> bool:
     """Confirm the appointment and complete the job in one transaction (both roll back if the
     lease was lost; the new owner reaches the same idempotent outcome).
 
@@ -137,11 +159,12 @@ def _confirm(conn, job, port, calendar_id, event_id) -> bool:
     its own event.
     """
     scope = (job.clinic_id, job.appointment_id, job.appointment_version)
+    account_id = target[1]
     confirmed = conn.execute(
         "UPDATE appointments SET status='confirmed', calendar_event_id=%s, calendar_id=%s,"
-        " updated_at=now()"
+        " calendar_account_id=%s, updated_at=now()"
         " WHERE clinic_id=%s AND id=%s AND status='pending_sync' AND version=%s RETURNING id",
-        (event_id, calendar_id, *scope),
+        (event_id, calendar_id, account_id, *scope),
     ).fetchone()
     if confirmed is None:
         current = conn.execute(
@@ -150,11 +173,12 @@ def _confirm(conn, job, port, calendar_id, event_id) -> bool:
         ).fetchone()
         if current is None or _superseded(current, job):
             conn.rollback()
-            return _withdraw(conn, job, port, calendar_id, event_id)
+            return _withdraw(conn, job, ports, target, calendar_id, event_id)
         conn.execute(
-            "UPDATE appointments SET calendar_event_id=%s, calendar_id=%s, updated_at=now()"
+            "UPDATE appointments SET calendar_event_id=%s, calendar_id=%s,"
+            " calendar_account_id=%s, updated_at=now()"
             " WHERE clinic_id=%s AND id=%s AND version=%s AND calendar_event_id IS NULL",
-            (event_id, calendar_id, *scope),
+            (event_id, calendar_id, account_id, *scope),
         )
     if not mark_done(conn, job):
         conn.rollback()
@@ -163,9 +187,9 @@ def _confirm(conn, job, port, calendar_id, event_id) -> bool:
     return True
 
 
-def _verify(conn, job, port, event, appointment, calendar_id, event_id) -> bool:
+def _verify(conn, job, ports, target, event, appointment, calendar_id, event_id) -> bool:
     if _matches(event, appointment):
-        return _confirm(conn, job, port, calendar_id, event_id)
+        return _confirm(conn, job, ports, target, calendar_id, event_id)
     return fail_dead(conn, job, "event_mismatch")
 
 
@@ -178,29 +202,37 @@ def create(conn, job, ports) -> bool:
     # inserting, so retries recover (or withdraw) in that calendar even if the doctor's
     # booking calendar was remapped since. Otherwise use the calendar recorded with this
     # event, else the doctor's current booking calendar.
-    intended = (job.payload or {}).get("calendar_id")
-    recorded = appointment["calendar_id"] if appointment["calendar_event_id"] == event_id else None
+    # The account is recorded the same way: the write intent's account, else the account
+    # recorded with this event, else (nothing written yet) the doctor's current mapping.
+    payload = job.payload or {}
+    intended = payload.get("calendar_id")
+    own_event = appointment["calendar_event_id"] == event_id
+    recorded = appointment["calendar_id"] if own_event else None
     calendar_id = intended or recorded or appointment["booking_calendar_id"]
+    owner = _uuid(payload.get("calendar_account_id")) or (
+        appointment["calendar_account_id"] if own_event else None
+    )
     if _superseded(appointment, job):
         # Only an attempt of this job that recorded write intent can have written this id.
         if intended:
-            port, outcome = _port(conn, job, ports, appointment["doctor_id"])
-            if port is None:
+            target, outcome = _port(conn, job, ports, appointment["doctor_id"], owner)
+            if target is None:
                 return outcome
-            return _withdraw(conn, job, port, intended, event_id)
+            return _withdraw(conn, job, ports, target, intended, event_id)
         return complete(conn, job)
     if appointment["status"] != "pending_sync":
         return complete(conn, job)  # Confirmed or under review at this version.
     if not calendar_id:
         return fail_dead(conn, job, "calendar_unmapped")
-    port, outcome = _port(conn, job, ports, appointment["doctor_id"])
-    if port is None:
+    target, outcome = _port(conn, job, ports, appointment["doctor_id"], owner)
+    if target is None:
         return outcome
+    port = target[0]
     require_idle(conn)
     try:
         existing = port.get_event(calendar_id, event_id)
         if existing is not None:
-            return _verify(conn, job, port, existing, appointment, calendar_id, event_id)
+            return _verify(conn, job, ports, target, existing, appointment, calendar_id, event_id)
         if appointment["past"]:
             return fail_dead(conn, job, "appointment_past")
         # Re-check external busy just before writing (ADR 0004), over the same hold slot
@@ -224,7 +256,10 @@ def create(conn, job, ports) -> bool:
             appointment["ends_at"].astimezone(zone),
             event_summary(job.appointment_id),
         )
-        job = remember(conn, job, calendar_id=calendar_id)  # Also renews the lease.
+        intent = {"calendar_id": calendar_id}
+        if target[1] is not None:
+            intent["calendar_account_id"] = str(target[1])
+        job = remember(conn, job, **intent)  # Also renews the lease.
         if job is None:
             return False
         try:
@@ -236,10 +271,10 @@ def create(conn, job, ports) -> bool:
             stored = port.get_event(calendar_id, event_id)
             if stored is None:
                 return retry(conn, job, "event_missing")
-            return _verify(conn, job, port, stored, appointment, calendar_id, event_id)
-        return _verify(conn, job, port, stored, appointment, calendar_id, event_id)
+            return _verify(conn, job, ports, target, stored, appointment, calendar_id, event_id)
+        return _verify(conn, job, ports, target, stored, appointment, calendar_id, event_id)
     except ProviderError as error:
-        return provider_failure(conn, job, error)
+        return _failed(conn, job, ports, target, error)
 
 
 # calendar.cancel
@@ -255,15 +290,19 @@ def cancel(conn, job, ports) -> bool:
     write intent of that version's calendar.create job; else the doctor's current booking
     calendar. With no calendar and no recorded event nothing was projected and the job
     completes; with a recorded event but no calendar, staff must review.
+    Account: payload['calendar_account_id']; else the account recorded with that event; else
+    the create job's write-intent account; only if nothing was recorded, the doctor's
+    current mapping. A recorded account that is no longer active dead-letters the job
+    ('calendar_unmapped') for staff: the event may still exist.
     """
     row = conn.execute(
         """SELECT a.calendar_event_id, a.calendar_id, a.version, a.doctor_id,
-        d.booking_calendar_id,
-        (SELECT o.payload->>'calendar_id' FROM outbox o
-            WHERE o.clinic_id=a.clinic_id AND o.appointment_id=a.id
-            AND o.kind='calendar.create' AND o.appointment_version=%s) AS intended
+        a.calendar_account_id, d.booking_calendar_id, o.payload->>'calendar_id' AS intended,
+        o.payload->>'calendar_account_id' AS intended_account
         FROM appointments a
         JOIN doctors d ON d.clinic_id=a.clinic_id AND d.id=a.doctor_id
+        LEFT JOIN outbox o ON o.clinic_id=a.clinic_id AND o.appointment_id=a.id
+            AND o.kind='calendar.create' AND o.appointment_version=%s
         WHERE a.clinic_id=%s AND a.id=%s""",
         (job.appointment_version, job.clinic_id, job.appointment_id),
     ).fetchone()
@@ -283,14 +322,20 @@ def cancel(conn, job, ports) -> bool:
         if recorded:
             return fail_dead(conn, job, "calendar_unmapped")
         return complete(conn, job)
-    port, outcome = _port(conn, job, ports, row["doctor_id"] if row else None)
-    if port is None:
+    account_id = _uuid(payload.get("calendar_account_id"))
+    if account_id is None and row:
+        if row["calendar_account_id"] and row["calendar_event_id"] == event_id:
+            account_id = row["calendar_account_id"]
+        else:
+            account_id = _uuid(row["intended_account"])
+    target, outcome = _port(conn, job, ports, row["doctor_id"] if row else None, account_id)
+    if target is None:
         return outcome
     require_idle(conn)
     try:
-        port.cancel_event(calendar_id, event_id)
+        target[0].cancel_event(calendar_id, event_id)
     except ProviderError as error:
-        return provider_failure(conn, job, error)
+        return _failed(conn, job, ports, target, error)
     return complete(conn, job)
 
 
@@ -309,13 +354,13 @@ def refresh_busy(conn, job, ports) -> bool:
             raise ValueError
     except (KeyError, TypeError, ValueError):
         return fail_dead(conn, job, "bad_payload")
-    port, outcome = _port(conn, job, ports, doctor_id)
-    if port is None:
+    target, outcome = _port(conn, job, ports, doctor_id)
+    if target is None:
         return outcome
     try:
         written = refresh_external_busy(
             conn,
-            port,
+            target[0],
             job.clinic_id,
             doctor_id,
             start,
@@ -327,13 +372,45 @@ def refresh_busy(conn, job, ports) -> bool:
         return retry(conn, job, "lease_lost")  # Fenced: normally False, the new owner continues.
     except ProviderError as error:
         conn.rollback()
-        return provider_failure(conn, job, error)
+        return _failed(conn, job, ports, target, error)
     except NotFound:
         conn.rollback()
         return fail_dead(conn, job, "not_found")
     if not written:
         return complete(conn, job)  # A newer refresh already covered the window.
     # The cache writes and the completion commit together; a lost lease discards both.
+    if not mark_done(conn, job):
+        conn.rollback()
+        return False
+    conn.commit()
+    return True
+
+
+# calendar.revoke_grant
+
+
+def revoke_grant(conn, job, ports) -> bool:
+    """Payload {account_id}. Revoke a revoked account's refresh token at the provider, then
+    clear the stored ciphertext in the same transaction that completes the job. Provider
+    failures retry; after max_attempts the job is dead and the ciphertext stays, so staff
+    can requeue (or remove the grant in the Google account and requeue: an already invalid
+    token counts as revoked)."""
+    account_id = _uuid((job.payload or {}).get("account_id"))
+    if account_id is None:
+        return fail_dead(conn, job, "bad_payload")
+    revoker = ports.grant_revoker()
+    if revoker is None:
+        return fail_dead(conn, job, "no_revoker")
+    require_idle(conn)
+    try:
+        revoker(conn, job.clinic_id, account_id)
+    except ProviderError as error:
+        return provider_failure(conn, job, error)
+    conn.execute(
+        "UPDATE calendar_accounts SET refresh_token_ciphertext=NULL, key_id=NULL"
+        " WHERE clinic_id=%s AND id=%s AND status='revoked'",
+        (job.clinic_id, account_id),
+    )
     if not mark_done(conn, job):
         conn.rollback()
         return False

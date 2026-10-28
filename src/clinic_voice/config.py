@@ -26,22 +26,17 @@ class Settings(BaseSettings):
     app_env: str = "production"
     # "kid1:<base64 32 bytes>,kid2:..." - the first key encrypts; all keys decrypt.
     token_encryption_keys: SecretStr | None = None
-    # base64 32 bytes; HMAC key for phone number lookups (later tasks).
+    # base64 32 bytes; HMAC key for crypto.phone_hash. Not used yet: reserved for caller
+    # lookup in T6/T7.
     phone_hash_key: SecretStr | None = None
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
     google_redirect_uri: str | None = None
-    public_base_url: str | None = None
 
     @field_validator("google_redirect_uri")
     @classmethod
     def _redirect(cls, value):
         return _https_or_loopback(value, "google_redirect_uri")
-
-    @field_validator("public_base_url")
-    @classmethod
-    def _base(cls, value):
-        return _https_or_loopback(value, "public_base_url")
 
     def google_configured(self) -> bool:
         return bool(

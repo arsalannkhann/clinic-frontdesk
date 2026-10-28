@@ -22,6 +22,7 @@ Kinds without a handler are dead-lettered with 'unknown_kind'.
 """
 
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import timedelta
@@ -73,25 +74,42 @@ class Job:
 @dataclass(frozen=True)
 class Ports:
     """Provider ports for handlers. Either one calendar adapter for every job (`calendar`,
-    e.g. the FakeCalendar) or a resolver `calendar_for(conn, clinic_id, doctor_id)` that
-    returns the port for that doctor's calendar account, or None when the doctor has no
-    usable account (handlers treat that as unmapped). A resolver may read the database; it
-    must leave the connection idle (committed), since provider I/O follows. It must declare
-    `timeout_seconds` for its adapters, checked by check_ports like a single adapter."""
+    e.g. the FakeCalendar) or a resolver `calendar_for`.
+
+    A resolver is called as calendar_for(conn, clinic_id, doctor_id, account_id) and returns
+    (port, account_id) or None. With account_id set it must use exactly that account (the
+    one recorded as having written an event) and return None unless it is active; without
+    it, the doctor's account mapping decides. None means no usable account; handlers treat
+    that as unmapped. A resolver may read the database but must leave the connection idle
+    (committed), since provider I/O follows. It must declare `timeout_seconds` for its
+    adapters (checked by check_ports). Optional resolver methods: mark_error(conn,
+    clinic_id, account_id) when the provider rejected the account's credentials, and
+    revoke_grant(conn, clinic_id, account_id) for calendar.revoke_grant jobs."""
 
     calendar: CalendarPort | None = None
-    calendar_for: Callable[[Any, UUID, UUID], CalendarPort | None] | None = None
+    calendar_for: Callable[..., tuple[CalendarPort, UUID | None] | None] | None = None
 
     def __post_init__(self):
         if (self.calendar is None) == (self.calendar_for is None):
             raise ValueError("Ports needs exactly one of calendar or calendar_for")
 
-    def calendar_port(self, conn, clinic_id, doctor_id) -> CalendarPort | None:
+    def calendar_port(
+        self, conn, clinic_id, doctor_id, account_id=None
+    ) -> tuple[CalendarPort, UUID | None] | None:
         if self.calendar_for is None:
-            return self.calendar
-        port = self.calendar_for(conn, clinic_id, doctor_id)
+            return self.calendar, None
+        resolved = self.calendar_for(conn, clinic_id, doctor_id, account_id)
         require_idle(conn)
-        return port
+        return resolved
+
+    def account_failed(self, conn, clinic_id, account_id) -> None:
+        mark = getattr(self.calendar_for, "mark_error", None)
+        if mark is not None and account_id is not None:
+            mark(conn, clinic_id, account_id)
+            require_idle(conn)
+
+    def grant_revoker(self):
+        return getattr(self.calendar_for, "revoke_grant", None)
 
 
 @dataclass(frozen=True)
@@ -383,6 +401,15 @@ def run_once(url, worker_id, ports, limit=10, lease=DEFAULT_LEASE, kinds=None) -
         return run_batch(conn, worker_id, ports, limit, lease, kinds)
 
 
+HOUSEKEEPING_INTERVAL = 600.0
+
+
+def _default_housekeeping(conn):
+    from clinic_voice.calendar_accounts import prune_oauth_states
+
+    prune_oauth_states(conn)
+
+
 def run_loop(
     url,
     worker_id,
@@ -393,15 +420,19 @@ def run_loop(
     lease=DEFAULT_LEASE,
     connect_fn=connect,
     wait=None,
+    housekeeping=None,
+    clock=time.monotonic,
 ):
     """Process batches until `stop` is set, finishing (or releasing) the current batch.
 
     One connection is reused across idle polls. Database errors close it and back off
-    exponentially (1 s doubling to 30 s) before reconnecting.
+    exponentially (1 s doubling to 30 s) before reconnecting. When idle, `housekeeping(conn)`
+    (default: prune expired OAuth states) runs at most every HOUSEKEEPING_INTERVAL seconds.
     """
     check_ports(ports, lease)
     wait = wait or stop.wait
-    conn, failures = None, 0
+    housekeeping = housekeeping or _default_housekeeping
+    conn, failures, last_housekeeping = None, 0, None
     try:
         while not stop.is_set():
             try:
@@ -420,6 +451,15 @@ def run_loop(
                 wait(error_delay(failures))
                 continue
             if count == 0:
+                now = clock()
+                if last_housekeeping is None or now - last_housekeeping >= HOUSEKEEPING_INTERVAL:
+                    last_housekeeping = now
+                    try:
+                        housekeeping(conn)
+                    except DatabaseError as error:
+                        log.error("housekeeping failed error=%s", type(error).__name__)
+                        conn.close()
+                        conn = None
                 wait(interval)
     finally:
         if conn is not None:

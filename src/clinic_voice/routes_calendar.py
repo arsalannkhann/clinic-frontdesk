@@ -25,9 +25,13 @@ reader = require_role("owner", "admin", "viewer")
 writer = require_role("owner", "admin")
 
 PRIVATE_HEADERS = {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
-CONNECTED_PAGE = (
+PAGE = (
     "<!doctype html><html><head><meta charset='utf-8'><title>Calendar connected</title></head>"
-    "<body><p>Calendar connected; you can close this window.</p></body></html>"
+    "<body><p>Calendar connected; you can close this window.</p>{note}</body></html>"
+)
+MULTIPLE_NOTE = (
+    "<p>Note: this clinic now has {count} active calendar accounts. Map each doctor to one"
+    " account, or revoke the extra accounts.</p>"
 )
 
 
@@ -38,12 +42,14 @@ def google_http():
 
 
 @admin_router.post("/google/start", response_model=AuthorizationStart)
-def google_start(response: Response, staff=Depends(writer)):
+def google_start(response: Response, replace: bool = False, staff=Depends(writer)):
+    """409 if the clinic already has an active account, unless replace=true: the previous
+    active account(s) are then revoked once the new one is connected."""
     settings = get_settings()
     calendar_accounts.keyring_from(settings)  # 503 before touching the database.
     response.headers.update(PRIVATE_HEADERS)
     with database() as conn:
-        return {"authorization_url": calendar_accounts.start(conn, staff, settings)}
+        return {"authorization_url": calendar_accounts.start(conn, staff, settings, replace)}
 
 
 @admin_router.get("/accounts", response_model=list[CalendarAccountOut])
@@ -53,9 +59,9 @@ def list_accounts(staff=Depends(reader)):
 
 
 @admin_router.delete("/google/{account_id}", status_code=204)
-def revoke_account(account_id: UUID, staff=Depends(writer), http=Depends(google_http)):
+def revoke_account(account_id: UUID, staff=Depends(writer)):
     with database() as conn:
-        calendar_accounts.revoke(conn, staff, get_settings(), http, account_id)
+        calendar_accounts.revoke(conn, staff, account_id)
     return Response(status_code=204)
 
 
@@ -68,5 +74,7 @@ def google_callback(
 ):
     settings = get_settings()
     with database() as conn:
-        calendar_accounts.callback(conn, settings, http, state, code, error)
-    return HTMLResponse(CONNECTED_PAGE, headers=PRIVATE_HEADERS)
+        result = calendar_accounts.callback(conn, settings, http, state, code, error)
+    count = result["active_accounts"]
+    note = MULTIPLE_NOTE.format(count=count) if count > 1 else ""
+    return HTMLResponse(PAGE.format(note=note), headers=PRIVATE_HEADERS)

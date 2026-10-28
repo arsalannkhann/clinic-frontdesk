@@ -68,6 +68,9 @@ class FakeGoogle:
         self.scope = " ".join(google.SCOPES)
         self.refresh_token: str | None = REFRESH
         self.revoke_status = 200
+        self.revoke_body = None
+        self.owner: dict[str, str] = {}  # access token -> refresh token (or "code")
+        self.unreachable: set[str] = set()
 
     def transport(self):
         return httpx.MockTransport(self)
@@ -86,6 +89,8 @@ class FakeGoogle:
         if request.url.host == "oauth2.googleapis.com":
             form = {k: v[0] for k, v in parse_qs(request.content.decode()).items()}
             if request.url.path == "/revoke":
+                if self.revoke_body is not None:
+                    return httpx.Response(self.revoke_status, json=self.revoke_body)
                 return httpx.Response(self.revoke_status, text=SECRET_MARKER)
             return self._token(form)
         return self._api(request)
@@ -99,6 +104,7 @@ class FakeGoogle:
         self.count += 1
         access = f"synthetic-access-{self.count}"
         self.issued.add(access)
+        self.owner[access] = form.get("refresh_token", "code")
         body = {"access_token": access, "expires_in": 3600, "token_type": "Bearer"}
         if form["grant_type"] == "authorization_code":
             body["scope"] = self.scope
@@ -119,6 +125,10 @@ class FakeGoogle:
         if parts[3] == "freeBusy":
             return self._free_busy(json.loads(request.content))
         calendar_id = unquote(parts[4])
+        if calendar_id in self.unreachable:
+            return httpx.Response(404)
+        if request.method == "GET" and len(parts) == 6:  # events.list reachability check
+            return httpx.Response(200, json={"items": []})
         if request.method == "POST":
             body = json.loads(request.content)
             key = (calendar_id, body["id"])
@@ -525,6 +535,13 @@ def test_access_log_query_is_stripped():
 # Revocation and doctor mapping
 
 
+def revoke_jobs(database):
+    with connect(database) as conn:
+        return conn.execute(
+            "SELECT status, last_error, payload FROM outbox WHERE kind='calendar.revoke_grant'"
+        ).fetchall()
+
+
 def test_revoke_account(client, database, fake):
     account_id = make_account(database)
     assert (
@@ -538,24 +555,64 @@ def test_revoke_account(client, database, fake):
     assert r.status_code == 204
     [account] = accounts(database)
     assert account["status"] == "revoked" and account["revoked_at"] is not None
-    assert account["refresh_token_ciphertext"] is None
+    # The ciphertext stays until Google confirms; the route makes no provider call.
+    assert account["refresh_token_ciphertext"] is not None
+    assert fake.requests == []
+    [job] = revoke_jobs(database)
+    assert job["status"] == "pending" and job["payload"] == {"account_id": str(account_id)}
+    assert [r["action"] for r in audit_rows(database)].count("calendar.revoked") == 1
+    # Idempotent; no second job or audit row.
+    assert client.delete(f"/v1/admin/calendar/google/{account_id}", headers=auth).status_code == 204
+    assert len(revoke_jobs(database)) == 1
+    assert client.delete(f"/v1/admin/calendar/google/{uuid4()}", headers=auth).status_code == 404
+    run_once(database, "worker-g", google_ports(database, fake))
     [revoke] = fake.by("POST", "/revoke")
     assert parse_qs(revoke.content.decode())["token"] == [REFRESH]
-    assert [r["action"] for r in audit_rows(database)].count("calendar.revoked") == 1
-    # Idempotent; no second Google call or audit row.
-    assert client.delete(f"/v1/admin/calendar/google/{account_id}", headers=auth).status_code == 204
-    assert len(fake.by("POST", "/revoke")) == 1
-    assert client.delete(f"/v1/admin/calendar/google/{uuid4()}", headers=auth).status_code == 404
+    [account] = accounts(database)
+    assert account["refresh_token_ciphertext"] is None and account["key_id"] is None
+    assert revoke_jobs(database)[0]["status"] == "done"
 
 
-def test_revoke_ignores_google_failure(client, database, fake, caplog):
+def test_revoke_grant_retries_until_google_confirms(client, database, fake, caplog):
     caplog.set_level(logging.DEBUG)
     fake.revoke_status = 500
     account_id = make_account(database)
     r = client.delete(f"/v1/admin/calendar/google/{account_id}", headers=headers(client, database))
     assert r.status_code == 204
-    assert accounts(database)[0]["status"] == "revoked"
+    run_once(database, "worker-g", google_ports(database, fake))
+    [job] = revoke_jobs(database)
+    assert job["status"] == "pending" and job["last_error"] == "retryable"
+    assert accounts(database)[0]["refresh_token_ciphertext"] is not None
     assert SECRET_MARKER not in app_logs(caplog) and REFRESH not in app_logs(caplog)
+    # Exhausted attempts dead-letter with the ciphertext kept (staff requeue later).
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE outbox SET available_at=now() - interval '1 second', max_attempts=2"
+            " WHERE kind='calendar.revoke_grant'"
+        )
+    run_once(database, "worker-g", google_ports(database, fake))
+    assert revoke_jobs(database)[0]["status"] == "dead"
+    assert accounts(database)[0]["refresh_token_ciphertext"] is not None
+    # The owner removed the grant in Google; Google now reports invalid_token: success.
+    fake.revoke_status = 400
+    fake.revoke_body = {"error": "invalid_token"}
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE outbox SET status='pending', max_attempts=attempts + 1,"
+            " available_at=now() WHERE kind='calendar.revoke_grant'"
+        )
+    run_once(database, "worker-g", google_ports(database, fake))
+    assert revoke_jobs(database)[0]["status"] == "done"
+    assert accounts(database)[0]["refresh_token_ciphertext"] is None
+
+
+def test_revoke_grant_needs_google_worker(client, database):
+    account_id = make_account(database)
+    client.delete(f"/v1/admin/calendar/google/{account_id}", headers=headers(client, database))
+    run_once(database, "worker-f", Ports(calendar=FakeCalendar()))
+    [job] = revoke_jobs(database)
+    assert job["status"] == "dead" and job["last_error"] == "no_revoker"
+    assert accounts(database)[0]["refresh_token_ciphertext"] is not None
 
 
 def test_doctor_calendar_account_mapping(client, database):
@@ -882,7 +939,7 @@ def test_worker_revoked_via_route(client, database, fake):
     fake.requests.clear()
     run_once(database, "worker-g", google_ports(database, fake))
     assert appointment(database, appointment_id)["last_error"] == "calendar_unmapped"
-    assert fake.requests == []
+    assert fake.by("POST", "/events") == [] and fake.by("POST", "/freeBusy") == []
 
 
 def test_worker_undecryptable_token_is_permanent(database, fake):
@@ -910,3 +967,226 @@ def test_worker_cli_google_requires_configuration(database, monkeypatch):
         cli.build_ports("google", database, Settings(database_url=database))
     ports = cli.build_ports("google", database, settings_for(database))
     check_ports(ports)
+
+
+# The account that wrote an event owns its cancel
+
+
+def add_cancel_job(database, appointment_id, version=1):
+    with connect(database) as conn:
+        conn.execute(
+            "INSERT INTO outbox (id,clinic_id,appointment_id,kind,appointment_version)"
+            " VALUES (%s,%s,%s,'calendar.cancel',%s)",
+            (uuid4(), CLINIC, appointment_id, version),
+        )
+
+
+def job_state(database, appointment_id, kind):
+    with connect(database) as conn:
+        return conn.execute(
+            "SELECT status, last_error, payload FROM outbox WHERE appointment_id=%s AND kind=%s",
+            (appointment_id, kind),
+        ).fetchone()
+
+
+def confirmed_under(database, fake, account_id):
+    map_doctor(database, account_id)
+    appointment_id = book(database)
+    ports = google_ports(database, fake)
+    run_once(database, "worker-g", ports)
+    with connect(database) as conn:
+        row = conn.execute(
+            "SELECT status, calendar_account_id FROM appointments WHERE id=%s", (appointment_id,)
+        ).fetchone()
+    assert row == {"status": "confirmed", "calendar_account_id": account_id}
+    return appointment_id, ports
+
+
+def owner_of(fake, request):
+    return fake.owner[request.headers["authorization"].removeprefix("Bearer ")]
+
+
+def test_cancel_uses_account_that_wrote_event(database, fake):
+    first = make_account(database, token="synthetic-refresh-a")
+    second = make_account(database, token="synthetic-refresh-b")
+    appointment_id, ports = confirmed_under(database, fake, first)
+    [insert] = fake.by("POST", "/events")
+    assert owner_of(fake, insert) == "synthetic-refresh-a"
+    create = job_state(database, appointment_id, "calendar.create")
+    assert create["payload"]["calendar_account_id"] == str(first)
+    map_doctor(database, second)  # Remapped after the event was written.
+    add_cancel_job(database, appointment_id)
+    run_once(database, "worker-g", ports)
+    event_id = event_id_for(appointment_id, 1)
+    [delete] = fake.by("DELETE", event_id)
+    assert owner_of(fake, delete) == "synthetic-refresh-a"
+    assert job_state(database, appointment_id, "calendar.cancel")["status"] == "done"
+    assert fake.events[(CAL, event_id)]["status"] == "cancelled"
+
+
+def test_cancel_with_revoked_writer_is_dead(database, fake):
+    first = make_account(database)
+    second = make_account(database, token="synthetic-refresh-b")
+    appointment_id, ports = confirmed_under(database, fake, first)
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE calendar_accounts SET status='revoked', revoked_at=now() WHERE id=%s",
+            (first,),
+        )
+    map_doctor(database, second)
+    add_cancel_job(database, appointment_id)
+    run_once(database, "worker-g", ports)
+    job = job_state(database, appointment_id, "calendar.cancel")
+    assert job["status"] == "dead" and job["last_error"] == "calendar_unmapped"
+    assert fake.by("DELETE", event_id_for(appointment_id, 1)) == []
+
+
+def test_cancel_404_on_unreachable_calendar_is_not_done(database, fake):
+    account_id = make_account(database)
+    appointment_id, ports = confirmed_under(database, fake, account_id)
+    fake.unreachable.add(CAL)
+    add_cancel_job(database, appointment_id)
+    run_once(database, "worker-g", ports)
+    job = job_state(database, appointment_id, "calendar.cancel")
+    assert job["status"] == "dead" and job["last_error"] == "provider_permanent"
+
+
+def test_delete_404_requires_reachable_calendar(fake):
+    port = adapter(fake)
+    fake.unreachable.add(CAL)
+    with pytest.raises(ProviderPermanent, match="^calendar_not_found$"):
+        port.cancel_event(CAL, EVENT.event_id)
+    fake.unreachable.clear()
+    port.cancel_event(CAL, EVENT.event_id)  # 404 on a reachable calendar: really gone.
+    checks = [r for r in fake.requests if r.method == "GET" and r.url.path.endswith("/events")]
+    assert len(checks) == 2 and checks[-1].url.params["maxResults"] == "1"
+
+
+@pytest.mark.parametrize("value", ["\xb2", "99999999999", "soon", " 12x", "-5"])
+def test_retry_after_rejects_garbage(value):
+    response = httpx.Response(429, headers={"Retry-After": value.encode("latin-1")})
+    assert response.headers["retry-after"] == value  # Decoded back, e.g. a superscript two.
+    assert google.retry_after(response) is None
+
+
+# Rejected credentials, adapter cache, replacement
+
+
+def test_rejected_credentials_mark_account_error(client, database, fake):
+    account_id = make_account(database)
+    map_doctor(database, account_id)
+    appointment_id = book(database)
+    fake.token_queue.append(httpx.Response(400, json={"error": "invalid_grant"}))
+    run_once(database, "worker-g", google_ports(database, fake))
+    row = appointment(database, appointment_id)
+    assert row["job"] == "dead" and row["last_error"] == "provider_permanent"
+    assert row["status"] == "needs_review"
+    assert accounts(database)[0]["status"] == "error"
+    listing = client.get("/v1/admin/calendar/accounts", headers=headers(client, database, "viewer"))
+    assert [a["status"] for a in listing.json()] == ["error"]
+    assert "calendar.credentials_rejected" in [r["action"] for r in audit_rows(database)]
+    resolver = calendar_accounts.GoogleCalendarResolver(settings_for(database), fake.client())
+    with connect(database) as conn:
+        assert resolver(conn, CLINIC, DOCTOR_ID) is None
+
+
+def test_resolver_cache_replaces_and_evicts(database, fake):
+    account_id = make_account(database)
+    map_doctor(database, account_id)
+    resolver = calendar_accounts.GoogleCalendarResolver(settings_for(database), fake.client())
+    with connect(database) as conn:
+        port, resolved = resolver(conn, CLINIC, DOCTOR_ID)
+        assert resolved == account_id
+        assert resolver(conn, CLINIC, DOCTOR_ID)[0] is port
+        key_id, blob = Keyring.from_setting(KEYS).encrypt(
+            b"synthetic-refresh-new", calendar_accounts.account_aad(CLINIC, account_id)
+        )
+        conn.execute(
+            "UPDATE calendar_accounts SET refresh_token_ciphertext=%s, key_id=%s WHERE id=%s",
+            (blob, key_id, account_id),
+        )
+        conn.commit()
+        replaced, _ = resolver(conn, CLINIC, DOCTOR_ID)
+        assert replaced is not port and resolver.cached_accounts() == {account_id}
+        conn.execute("UPDATE calendar_accounts SET status='error' WHERE id=%s", (account_id,))
+        conn.commit()
+        assert resolver(conn, CLINIC, DOCTOR_ID) is None
+        assert resolver.cached_accounts() == set()
+
+
+def test_start_conflicts_with_active_account_unless_replace(client, database, fake):
+    auth = headers(client, database)
+    old = make_account(database)
+    assert client.post("/v1/admin/calendar/google/start", headers=auth).status_code == 409
+    r = client.post("/v1/admin/calendar/google/start?replace=true", headers=auth)
+    assert r.status_code == 200
+    state = parse_qs(urlsplit(r.json()["authorization_url"]).query)["state"][0]
+    page = callback(client, state=state, code=CODE)
+    assert page.status_code == 200 and "active calendar accounts" not in page.text
+    statuses = {row["id"]: row["status"] for row in accounts(database)}
+    assert statuses[old] == "revoked"
+    assert list(statuses.values()).count("active") == 1
+    [job] = revoke_jobs(database)
+    assert job["payload"] == {"account_id": str(old)}
+
+
+def test_callback_notes_multiple_active_accounts(client, database):
+    auth = headers(client, database)
+    _, first = start(client, auth)
+    _, second = start(client, auth)  # No active account yet, so both starts are allowed.
+    assert "active calendar accounts" not in callback(client, state=first["state"], code=CODE).text
+    page = callback(client, state=second["state"], code=CODE)
+    assert page.status_code == 200 and "2 active calendar accounts" in page.text
+
+
+# Logging and housekeeping
+
+
+def test_access_log_filter_installed_at_import():
+    import subprocess
+    import sys
+
+    code = (
+        "import logging, clinic_voice.api as a\n"
+        "count = lambda: sum(isinstance(f, a.StripQuery)"
+        " for f in logging.getLogger('uvicorn.access').filters)\n"
+        "assert count() == 1\n"
+        "a.quiet_logs()\n"
+        "assert count() == 1\n"
+    )
+    env = {**os.environ, "DATABASE_URL": "postgresql://unused@localhost/unused_test"}
+    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+
+
+def test_prune_oauth_states(database):
+    other = other_clinic(database)
+    for clinic, offset in ((CLINIC, "-1 minute"), (other, "-1 minute"), (CLINIC, "5 minutes")):
+        user_id, _ = new_user(database, "owner", clinic)
+        with connect(database) as conn:
+            conn.execute(
+                "INSERT INTO oauth_states (state_digest,clinic_id,user_id,"
+                "code_verifier_ciphertext,key_id,expires_at)"
+                " VALUES (%s,%s,%s,%s,'k1',now() + %s::interval)",
+                (os.urandom(32), clinic, user_id, b"x" * 40, offset),
+            )
+    with connect(database) as conn:
+        assert calendar_accounts.prune_oauth_states(conn) == 2
+        assert conn.execute("SELECT count(*) AS n FROM oauth_states").fetchone()["n"] == 1
+
+
+def test_run_loop_runs_housekeeping_when_idle(database):
+    from threading import Event
+
+    from clinic_voice.outbox import run_loop
+
+    calls = []
+    stop = Event()
+    run_loop(
+        database,
+        "w-house",
+        Ports(calendar=FakeCalendar()),
+        stop,
+        housekeeping=lambda conn: calls.append(conn),
+        wait=lambda seconds: stop.set(),
+    )
+    assert len(calls) == 1

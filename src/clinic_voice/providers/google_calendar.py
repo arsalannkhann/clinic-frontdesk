@@ -16,7 +16,9 @@ Error mapping (see the CalendarPort obligations in providers/calendar.py):
   status 'cancelled'; Google only guarantees its id, so missing times are filled with a fixed
   placeholder (1970-01-01T00:00Z plus one minute) that callers must not interpret.
   'tentative' (only possible after a human edit) maps to 'confirmed': it still blocks time.
-- delete: 404 and 410 are success (idempotent cancel).
+- delete: 410 is success; 404 is success only after an events list (maxResults=1) on the
+  same calendar returns 200, i.e. the calendar is reachable and the event is really gone.
+  An unreachable calendar is ProviderPermanent('calendar_not_found').
 - freeBusy: a per-calendar `errors` entry is ProviderPermanent for reason notFound and
   ProviderRetryable otherwise; a requested calendar missing from the response is retryable.
 - Timeouts: for writes (insert, delete) a timeout after the request may have been sent is
@@ -26,6 +28,7 @@ Error mapping (see the CalendarPort obligations in providers/calendar.py):
 """
 
 import logging
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
@@ -78,12 +81,13 @@ def retry_after(response: httpx.Response) -> float | None:
     if not value:
         return None
     value = value.strip()
-    if value.isdigit():
+    # str.isdigit() accepts characters such as superscripts that float() rejects; ASCII only.
+    if re.fullmatch(r"[0-9]{1,10}", value):
         seconds = float(value)
     else:
         try:
             when = parsedate_to_datetime(value)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, IndexError, OverflowError):
             return None
         if when.tzinfo is None:
             when = when.replace(tzinfo=UTC)
@@ -148,6 +152,27 @@ def exchange_code(http, client_id, client_secret, code, code_verifier, redirect_
         },
         timeout,
     )
+
+
+def revoke_grant(http, token, timeout=10.0) -> None:
+    """Durable-path revocation: returns once Google confirms the token is revoked (200) or
+    no longer valid (400 invalid_token, e.g. already revoked or expired). Raises OAuthError
+    (retryable for network, 429 and 5xx) otherwise. No bodies are logged or raised."""
+    try:
+        response = http.post(REVOKE_ENDPOINT, data={"token": token}, timeout=timeout)
+    except httpx.HTTPError:
+        raise OAuthError("revoke_network", retryable=True) from None
+    if response.status_code == 200:
+        return
+    if response.status_code == 429 or response.status_code >= 500:
+        raise OAuthError(f"revoke_http_{response.status_code}", retryable=True)
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError):
+        error = None
+    if response.status_code == 400 and error == "invalid_token":
+        return
+    raise OAuthError(f"revoke_http_{response.status_code}")
 
 
 def revoke_token(http, token, timeout=10.0) -> bool:
@@ -355,8 +380,19 @@ class GoogleCalendar:
             write=True,
             params={"sendUpdates": "none"},
         )
-        if response.status_code in (200, 204, 404, 410):
+        if response.status_code in (200, 204, 410):
             return
+        if response.status_code == 404:
+            # 404 means "no such event" only if the calendar itself is reachable; otherwise
+            # the event may still exist in a calendar these credentials can no longer see.
+            check = self._send(
+                "GET", self._events_url(calendar_id), write=False, params={"maxResults": 1}
+            )
+            if check.status_code == 200:
+                return
+            if check.status_code == 404:
+                raise ProviderPermanent("calendar_not_found")
+            raise _error_for(check)
         raise _error_for(response)
 
     def free_busy(self, calendar_ids, start, end):

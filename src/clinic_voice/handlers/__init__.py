@@ -12,4 +12,5 @@ HANDLERS: dict[str, Handler] = {
     "calendar.create": Handler(calendar.create, on_dead=calendar.needs_review_on_dead),
     "calendar.cancel": Handler(calendar.cancel),
     "calendar.refresh_busy": Handler(calendar.refresh_busy),
+    "calendar.revoke_grant": Handler(calendar.revoke_grant),
 }

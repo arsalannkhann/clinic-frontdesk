@@ -956,8 +956,19 @@
           "calendar"
         ],
         "summary": "Google Start",
+        "description": "409 if the clinic already has an active account, unless replace=true: the previous\nactive account(s) are then revoked once the new one is connected.",
         "operationId": "google_start_v1_admin_calendar_google_start_post",
         "parameters": [
+          {
+            "name": "replace",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Replace"
+            }
+          },
           {
             "name": "authorization",
             "in": "header",

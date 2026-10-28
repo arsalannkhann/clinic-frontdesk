@@ -53,10 +53,13 @@ def quiet_logs():
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
+quiet_logs()  # At import, so the filter applies however the app is served.
+
+
 @asynccontextmanager
 async def lifespan(app):
     get_settings()  # Fail startup on missing configuration.
-    quiet_logs()
+    quiet_logs()  # Idempotent; repeated in case logging was reconfigured after import.
     yield
 
 
@@ -90,7 +93,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "009_google_calendar.sql"
+REQUIRED_MIGRATION = "010_appointment_calendar_account.sql"
 
 
 @app.get("/health/live")
