@@ -48,7 +48,7 @@ def update_clinic(conn, staff, changes):
     return row
 
 
-DOCTOR_COLUMNS = "id,name,active,booking_calendar_id,busy_calendar_ids"
+DOCTOR_COLUMNS = "id,name,active,booking_calendar_id,busy_calendar_ids,calendar_account_id"
 
 
 def list_doctors(conn, clinic_id):
@@ -71,7 +71,17 @@ def create_doctor(conn, staff, name):
 
 
 def update_doctor(conn, staff, doctor_id, changes):
-    columns = ("name", "active", "booking_calendar_id", "busy_calendar_ids")
+    columns = ("name", "active", "booking_calendar_id", "busy_calendar_ids", "calendar_account_id")
+    account_id = changes.get("calendar_account_id")
+    if account_id is not None:
+        account = conn.execute(
+            "SELECT status FROM calendar_accounts WHERE clinic_id=%s AND id=%s FOR SHARE",
+            (staff["clinic_id"], account_id),
+        ).fetchone()
+        if not account:
+            raise HTTPException(404, NOT_FOUND)
+        if account["status"] != "active":
+            raise HTTPException(409, "Calendar account is not active")
     row = _update(conn, "doctors", columns, staff["clinic_id"], doctor_id, changes)
     audit(conn, staff["clinic_id"], staff["id"], "doctor.updated", doctor_id)
     return {k: row[k] for k in DOCTOR_COLUMNS.split(",")}

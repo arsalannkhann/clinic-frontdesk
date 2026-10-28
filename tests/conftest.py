@@ -18,7 +18,7 @@ def database():
     migrate(url, Path("migrations"))
     with connect(url) as conn:
         conn.execute(
-            "TRUNCATE external_busy, schedule_exceptions, audit_events, staff_sessions, staff_users, tenant_credentials, outbox, appointments, working_hours, services, doctors,"
+            "TRUNCATE oauth_states, calendar_accounts, external_busy, schedule_exceptions, audit_events, staff_sessions, staff_users, tenant_credentials, outbox, appointments, working_hours, services, doctors,"
             " clinics CASCADE"
         )
     seed(url)

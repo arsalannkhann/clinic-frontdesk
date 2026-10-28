@@ -192,6 +192,8 @@ class DoctorUpdate(PatchModel):
     name: DisplayName | None = None
     active: bool | None = None
     booking_calendar_id: CalendarId | None = None  # null unsets the mapping
+    # A calendar account of this clinic (null: use the clinic's only active account).
+    calendar_account_id: UUID | None = None
     busy_calendar_ids: (
         Annotated[list[CalendarId], Field(max_length=10), AfterValidator(_unique_in_order)] | None
     ) = None
@@ -204,7 +206,7 @@ class DoctorUpdate(PatchModel):
         if any(
             getattr(self, name) is None
             for name in self.model_fields_set
-            if name != "booking_calendar_id"
+            if name not in ("booking_calendar_id", "calendar_account_id")
         ):
             raise ValueError("null is not allowed")
         return self
@@ -216,6 +218,7 @@ class DoctorOut(StrictModel):
     active: bool
     booking_calendar_id: str | None
     busy_calendar_ids: list[str]
+    calendar_account_id: UUID | None
 
 
 class ServiceCreate(StrictModel):
@@ -326,3 +329,20 @@ class OutboxJobOut(StrictModel):
     available_at: AwareDatetime
     created_at: AwareDatetime
     updated_at: AwareDatetime
+
+
+# Calendar accounts (Google OAuth)
+class AuthorizationStart(StrictModel):
+    authorization_url: str
+
+
+class CalendarAccountOut(StrictModel):
+    """No token material, ever."""
+
+    id: UUID
+    provider: str
+    status: str
+    scopes: list[str]
+    connected_by: UUID
+    created_at: AwareDatetime
+    revoked_at: AwareDatetime | None

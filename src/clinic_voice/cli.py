@@ -130,9 +130,26 @@ def build_ports(calendar, url, settings):
             file=sys.stderr,
         )
         return Ports(calendar=FakeCalendar())
+    if calendar == "google":
+        import httpx
+        from fastapi import HTTPException as ConfigError
+
+        from clinic_voice.calendar_accounts import GoogleCalendarResolver
+        from clinic_voice.outbox import Ports
+        from clinic_voice.providers.google_calendar import DEFAULT_TIMEOUT
+
+        http = httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=False)
+        try:
+            resolver = GoogleCalendarResolver(settings, http)
+        except ConfigError:
+            raise SystemExit(
+                "Google Calendar is not configured: set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,"
+                " GOOGLE_REDIRECT_URI and a valid TOKEN_ENCRYPTION_KEYS."
+            ) from None
+        return Ports(calendar_for=resolver)
     raise SystemExit(
-        "No calendar provider configured; the worker will not start. Use --calendar fake for"
-        " local development only (a live provider arrives with the Google adapter)."
+        "No calendar provider configured; the worker will not start. Use --calendar google, or"
+        " --calendar fake for local development only."
     )
 
 
@@ -164,6 +181,9 @@ def main(argv=None):
     commands.add_parser("migrate")
     commands.add_parser("seed-demo")
     commands.add_parser("export-openapi")
+    commands.add_parser(
+        "generate-key", help="Print a new random base64 32-byte key (nothing is stored)"
+    )
     credential = commands.add_parser("credential", help="Manage tenant tool credentials")
     actions = credential.add_subparsers(dest="action", required=True)
     issue = actions.add_parser("issue")
@@ -185,7 +205,9 @@ def main(argv=None):
     reset.add_argument("--email", required=True)
     worker = commands.add_parser("worker", help="Process outbox jobs")
     worker.add_argument("--once", action="store_true", help="Process one batch and exit")
-    worker.add_argument("--calendar", choices=["fake"], help="Calendar provider (fake: dev only)")
+    worker.add_argument(
+        "--calendar", choices=["fake", "google"], help="Calendar provider (fake: dev only)"
+    )
     worker.add_argument("--worker-id", help="Lease owner name (default host:pid)")
     worker.add_argument("--interval", type=float, default=2.0, help="Idle poll seconds")
     args = parser.parse_args(argv)
@@ -205,6 +227,11 @@ def main(argv=None):
         from clinic_voice.api import app
 
         print(json.dumps(app.openapi(), indent=2))
+        return
+    if args.command == "generate-key":
+        from clinic_voice.crypto import generate_key
+
+        print(generate_key())
         return
     settings = get_settings()
     url = settings.database_url.get_secret_value()

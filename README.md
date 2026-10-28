@@ -2,7 +2,7 @@
 
 A multilingual AI receptionist for Indian clinics, built around Bolna Hosted API, Sarvam speech, and a FastAPI scheduling backend. Intended languages: Hindi, Hinglish, and Indian English.
 
-**Status: tested initialization foundation, not a live receptionist.** The backend can list local slots and atomically reserve them with a durable calendar job. It does not yet connect to Bolna, Google Calendar, telephony, WhatsApp, or SMS. Reservations return `202 pending_sync`; they are never presented as confirmed appointments.
+**Status: tested initialization foundation, not a live receptionist.** The backend can list local slots and atomically reserve them with a durable calendar job. It does not yet connect to Bolna, telephony, WhatsApp, or SMS. Google OAuth and a Google Calendar adapter exist but have only been exercised against mocked HTTP fixtures, never a live Google account (see docs/OPERATIONS.md for the owner-run setup). Reservations return `202 pending_sync`; they are never presented as confirmed appointments.
 
 ## Run locally
 

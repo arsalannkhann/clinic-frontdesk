@@ -1,3 +1,4 @@
+import logging
 from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
@@ -12,6 +13,8 @@ from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tenant
 from clinic_voice.errors import NotFound
 from clinic_voice.routes_admin import router as admin_router
+from clinic_voice.routes_calendar import admin_router as calendar_admin_router
+from clinic_voice.routes_calendar import oauth_router
 from clinic_voice.schemas import (
     SLOT_SOURCE,
     AppointmentStatusRequest,
@@ -31,15 +34,37 @@ from clinic_voice.schemas import (
 from clinic_voice.service import appointment_status, reserve, slots
 
 
+class StripQuery(logging.Filter):
+    """Drop query strings from uvicorn access log lines: the OAuth callback's query holds an
+    authorization code, and no query string here needs to be logged."""
+
+    def filter(self, record):
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            record.args = (*args[:2], args[2].split("?", 1)[0], *args[3:])
+        return True
+
+
+def quiet_logs():
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, StripQuery) for f in access.filters):
+        access.addFilter(StripQuery())
+    for noisy in ("httpx", "httpcore"):  # Request lines carry calendar ids.
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+
 @asynccontextmanager
 async def lifespan(app):
     get_settings()  # Fail startup on missing configuration.
+    quiet_logs()
     yield
 
 
 app = FastAPI(title="Clinic Voice AI", version="0.1.0", lifespan=lifespan)
 
 app.include_router(admin_router)
+app.include_router(calendar_admin_router)
+app.include_router(oauth_router)
 
 
 @app.exception_handler(DatabaseError)
@@ -65,7 +90,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "008_calendar_event_calendar.sql"
+REQUIRED_MIGRATION = "009_google_calendar.sql"
 
 
 @app.get("/health/live")

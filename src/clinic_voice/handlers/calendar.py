@@ -2,6 +2,10 @@
 
 Each handler reads in a short committed transaction, calls the provider with the connection
 idle (renewing the lease between calls), then records the outcome in a fenced transaction.
+
+Handlers are provider-agnostic: the port comes from Ports.calendar_port(conn, clinic, doctor),
+which is a fixed adapter (FakeCalendar) or a per-account resolver (Google). No port (no
+usable account, e.g. revoked) is treated like an unmapped calendar.
 """
 
 import logging
@@ -70,7 +74,7 @@ def needs_review_on_dead(conn, job):
 def _load_appointment(conn, job):
     row = conn.execute(
         """SELECT a.status, a.version, a.starts_at, a.ends_at, a.blocks_until,
-        a.starts_at <= now() AS past, a.calendar_event_id, a.calendar_id,
+        a.starts_at <= now() AS past, a.calendar_event_id, a.calendar_id, a.doctor_id,
         d.booking_calendar_id, d.busy_calendar_ids, c.timezone
         FROM appointments a
         JOIN doctors d ON d.clinic_id=a.clinic_id AND d.id=a.doctor_id
@@ -94,7 +98,18 @@ def _matches(event, appointment) -> bool:
     )
 
 
-def _withdraw(conn, job, ports, calendar_id, event_id) -> bool:
+def _port(conn, job, ports, doctor_id):
+    """(port, None) or (None, outcome) when resolution failed and the job was settled."""
+    try:
+        port = ports.calendar_port(conn, job.clinic_id, doctor_id)
+    except ProviderError as error:
+        return None, provider_failure(conn, job, error)
+    if port is None:
+        return None, fail_dead(conn, job, "calendar_unmapped")
+    return port, None
+
+
+def _withdraw(conn, job, port, calendar_id, event_id) -> bool:
     """Cancel this job's own event because the appointment was cancelled or rescheduled.
 
     The cancel runs even if this worker's lease was lost: the id is unique to the superseded
@@ -105,14 +120,14 @@ def _withdraw(conn, job, ports, calendar_id, event_id) -> bool:
     sees the superseded appointment and withdraws again."""
     require_idle(conn)
     try:
-        ports.calendar.cancel_event(calendar_id, event_id)
+        port.cancel_event(calendar_id, event_id)
     except ProviderError as error:
         return provider_failure(conn, job, error)
     log.info("withdrew superseded event job=%s", job.id)
     return complete(conn, job)
 
 
-def _confirm(conn, job, ports, calendar_id, event_id) -> bool:
+def _confirm(conn, job, port, calendar_id, event_id) -> bool:
     """Confirm the appointment and complete the job in one transaction (both roll back if the
     lease was lost; the new owner reaches the same idempotent outcome).
 
@@ -135,7 +150,7 @@ def _confirm(conn, job, ports, calendar_id, event_id) -> bool:
         ).fetchone()
         if current is None or _superseded(current, job):
             conn.rollback()
-            return _withdraw(conn, job, ports, calendar_id, event_id)
+            return _withdraw(conn, job, port, calendar_id, event_id)
         conn.execute(
             "UPDATE appointments SET calendar_event_id=%s, calendar_id=%s, updated_at=now()"
             " WHERE clinic_id=%s AND id=%s AND version=%s AND calendar_event_id IS NULL",
@@ -148,9 +163,9 @@ def _confirm(conn, job, ports, calendar_id, event_id) -> bool:
     return True
 
 
-def _verify(conn, job, ports, event, appointment, calendar_id, event_id) -> bool:
+def _verify(conn, job, port, event, appointment, calendar_id, event_id) -> bool:
     if _matches(event, appointment):
-        return _confirm(conn, job, ports, calendar_id, event_id)
+        return _confirm(conn, job, port, calendar_id, event_id)
     return fail_dead(conn, job, "event_mismatch")
 
 
@@ -169,17 +184,23 @@ def create(conn, job, ports) -> bool:
     if _superseded(appointment, job):
         # Only an attempt of this job that recorded write intent can have written this id.
         if intended:
-            return _withdraw(conn, job, ports, intended, event_id)
+            port, outcome = _port(conn, job, ports, appointment["doctor_id"])
+            if port is None:
+                return outcome
+            return _withdraw(conn, job, port, intended, event_id)
         return complete(conn, job)
     if appointment["status"] != "pending_sync":
         return complete(conn, job)  # Confirmed or under review at this version.
     if not calendar_id:
         return fail_dead(conn, job, "calendar_unmapped")
+    port, outcome = _port(conn, job, ports, appointment["doctor_id"])
+    if port is None:
+        return outcome
     require_idle(conn)
     try:
-        existing = ports.calendar.get_event(calendar_id, event_id)
+        existing = port.get_event(calendar_id, event_id)
         if existing is not None:
-            return _verify(conn, job, ports, existing, appointment, calendar_id, event_id)
+            return _verify(conn, job, port, existing, appointment, calendar_id, event_id)
         if appointment["past"]:
             return fail_dead(conn, job, "appointment_past")
         # Re-check external busy just before writing (ADR 0004), over the same hold slot
@@ -189,7 +210,7 @@ def create(conn, job, ports) -> bool:
         if busy_calendars:
             if not renew(conn, job):
                 return False
-            busy = ports.calendar.free_busy(
+            busy = port.free_busy(
                 busy_calendars, appointment["starts_at"], appointment["blocks_until"]
             )
             if any(
@@ -207,16 +228,16 @@ def create(conn, job, ports) -> bool:
         if job is None:
             return False
         try:
-            stored = ports.calendar.insert_event(calendar_id, event)
+            stored = port.insert_event(calendar_id, event)
         except EventAlreadyExists:
             # Another attempt's write landed between our read and insert: read and verify.
             if not renew(conn, job):
                 return False
-            stored = ports.calendar.get_event(calendar_id, event_id)
+            stored = port.get_event(calendar_id, event_id)
             if stored is None:
                 return retry(conn, job, "event_missing")
-            return _verify(conn, job, ports, stored, appointment, calendar_id, event_id)
-        return _verify(conn, job, ports, stored, appointment, calendar_id, event_id)
+            return _verify(conn, job, port, stored, appointment, calendar_id, event_id)
+        return _verify(conn, job, port, stored, appointment, calendar_id, event_id)
     except ProviderError as error:
         return provider_failure(conn, job, error)
 
@@ -236,7 +257,8 @@ def cancel(conn, job, ports) -> bool:
     completes; with a recorded event but no calendar, staff must review.
     """
     row = conn.execute(
-        """SELECT a.calendar_event_id, a.calendar_id, a.version, d.booking_calendar_id,
+        """SELECT a.calendar_event_id, a.calendar_id, a.version, a.doctor_id,
+        d.booking_calendar_id,
         (SELECT o.payload->>'calendar_id' FROM outbox o
             WHERE o.clinic_id=a.clinic_id AND o.appointment_id=a.id
             AND o.kind='calendar.create' AND o.appointment_version=%s) AS intended
@@ -261,9 +283,12 @@ def cancel(conn, job, ports) -> bool:
         if recorded:
             return fail_dead(conn, job, "calendar_unmapped")
         return complete(conn, job)
+    port, outcome = _port(conn, job, ports, row["doctor_id"] if row else None)
+    if port is None:
+        return outcome
     require_idle(conn)
     try:
-        ports.calendar.cancel_event(calendar_id, event_id)
+        port.cancel_event(calendar_id, event_id)
     except ProviderError as error:
         return provider_failure(conn, job, error)
     return complete(conn, job)
@@ -284,10 +309,13 @@ def refresh_busy(conn, job, ports) -> bool:
             raise ValueError
     except (KeyError, TypeError, ValueError):
         return fail_dead(conn, job, "bad_payload")
+    port, outcome = _port(conn, job, ports, doctor_id)
+    if port is None:
+        return outcome
     try:
         written = refresh_external_busy(
             conn,
-            ports.calendar,
+            port,
             job.clinic_id,
             doctor_id,
             start,

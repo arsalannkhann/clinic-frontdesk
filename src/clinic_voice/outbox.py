@@ -72,7 +72,26 @@ class Job:
 
 @dataclass(frozen=True)
 class Ports:
-    calendar: CalendarPort
+    """Provider ports for handlers. Either one calendar adapter for every job (`calendar`,
+    e.g. the FakeCalendar) or a resolver `calendar_for(conn, clinic_id, doctor_id)` that
+    returns the port for that doctor's calendar account, or None when the doctor has no
+    usable account (handlers treat that as unmapped). A resolver may read the database; it
+    must leave the connection idle (committed), since provider I/O follows. It must declare
+    `timeout_seconds` for its adapters, checked by check_ports like a single adapter."""
+
+    calendar: CalendarPort | None = None
+    calendar_for: Callable[[Any, UUID, UUID], CalendarPort | None] | None = None
+
+    def __post_init__(self):
+        if (self.calendar is None) == (self.calendar_for is None):
+            raise ValueError("Ports needs exactly one of calendar or calendar_for")
+
+    def calendar_port(self, conn, clinic_id, doctor_id) -> CalendarPort | None:
+        if self.calendar_for is None:
+            return self.calendar
+        port = self.calendar_for(conn, clinic_id, doctor_id)
+        require_idle(conn)
+        return port
 
 
 @dataclass(frozen=True)
@@ -89,12 +108,13 @@ def _handlers() -> dict[str, Handler]:
 
 
 def check_ports(ports, lease=DEFAULT_LEASE):
-    """Every adapter except the in-process FakeCalendar must declare `timeout_seconds`, and it
-    must be at most lease / LEASE_TIMEOUT_RATIO."""
-    if isinstance(ports.calendar, FakeCalendar):
+    """Every adapter (or resolver) except the in-process FakeCalendar must declare a numeric
+    `timeout_seconds` (not a bool), and it must be at most lease / LEASE_TIMEOUT_RATIO."""
+    adapter = ports.calendar if ports.calendar is not None else ports.calendar_for
+    if isinstance(adapter, FakeCalendar):
         return
-    timeout = getattr(ports.calendar, "timeout_seconds", None)
-    if not isinstance(timeout, int | float) or timeout <= 0:
+    timeout = getattr(adapter, "timeout_seconds", None)
+    if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
         raise ValueError("calendar adapter must declare a positive timeout_seconds")
     if timeout * LEASE_TIMEOUT_RATIO > lease.total_seconds():
         raise ValueError(
