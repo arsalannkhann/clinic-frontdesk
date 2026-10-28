@@ -13,9 +13,10 @@ from clinic_voice.domain import candidate_slots, utc_now
 
 def get_context(conn, clinic_id, doctor_id, service_id):
     context = conn.execute(
-        """SELECT s.duration_minutes, c.timezone FROM services s
+        """SELECT s.duration_minutes, c.timezone, c.horizon_days FROM services s
         JOIN clinics c ON c.id=s.clinic_id
-        WHERE s.clinic_id=%s AND s.doctor_id=%s AND s.id=%s""",
+        JOIN doctors d ON d.clinic_id=s.clinic_id AND d.id=s.doctor_id
+        WHERE s.clinic_id=%s AND s.doctor_id=%s AND s.id=%s AND s.active AND d.active""",
         (clinic_id, doctor_id, service_id),
     ).fetchone()
     if not context:
@@ -27,8 +28,9 @@ def slots(conn, clinic_id, doctor_id, service_id, day):
     context = get_context(conn, clinic_id, doctor_id, service_id)
     zone = ZoneInfo(context["timezone"])
     now = utc_now()
-    if not 0 <= (day - now.astimezone(zone).date()).days <= 90:
-        raise HTTPException(422, "Date must be today through 90 days ahead")
+    horizon = context["horizon_days"]
+    if not 0 <= (day - now.astimezone(zone).date()).days <= horizon:
+        raise HTTPException(422, f"Date must be today through {horizon} days ahead")
     hours = conn.execute(
         "SELECT opens, closes FROM working_hours WHERE clinic_id=%s AND doctor_id=%s AND weekday=%s",
         (clinic_id, doctor_id, day.weekday()),

@@ -2,7 +2,16 @@ from datetime import date
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    RootModel,
+    StringConstraints,
+    model_validator,
+)
 
 
 class StrictModel(BaseModel):
@@ -77,3 +86,114 @@ class StaffUserCreate(StrictModel):
 class StaffUserUpdate(StrictModel):
     role: Role | None = None
     disabled: bool | None = None
+
+
+# Clinic configuration (staff admin)
+def _iana_zone(value: str) -> str:
+    from zoneinfo import ZoneInfo, available_timezones
+
+    # Names such as "local" or "" are not canonical IANA keys; require a known key.
+    if value not in available_timezones():
+        raise ValueError("unknown IANA timezone")
+    ZoneInfo(value)
+    return value
+
+
+Timezone = Annotated[str, Field(min_length=1, max_length=64), AfterValidator(_iana_zone)]
+DisplayName = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=120)]
+LeadTime = Annotated[int, Field(ge=0, le=10080)]
+HorizonDays = Annotated[int, Field(ge=1, le=365)]
+Duration = Annotated[int, Field(ge=5, le=240)]
+Buffer = Annotated[int, Field(ge=0, le=120)]
+ClockTime = Annotated[str, Field(pattern=r"^([01]\d|2[0-3]):[0-5]\d$")]
+
+
+class PatchModel(StrictModel):
+    """Partial update: at least one field, and no explicit nulls."""
+
+    @model_validator(mode="after")
+    def _present(self):
+        if not self.model_fields_set:
+            raise ValueError("no fields to update")
+        if any(getattr(self, name) is None for name in self.model_fields_set):
+            raise ValueError("null is not allowed")
+        return self
+
+
+class ClinicConfig(StrictModel):
+    id: UUID
+    name: str
+    timezone: str
+    lead_time_minutes: int
+    horizon_days: int
+
+
+class ClinicUpdate(PatchModel):
+    name: DisplayName | None = None
+    timezone: Timezone | None = None
+    lead_time_minutes: LeadTime | None = None
+    horizon_days: HorizonDays | None = None
+
+
+class DoctorCreate(StrictModel):
+    name: DisplayName
+
+
+class DoctorUpdate(PatchModel):
+    name: DisplayName | None = None
+    active: bool | None = None
+
+
+class DoctorOut(StrictModel):
+    id: UUID
+    name: str
+    active: bool
+
+
+class ServiceCreate(StrictModel):
+    doctor_id: UUID
+    name: DisplayName
+    duration_minutes: Duration
+    buffer_after_minutes: Buffer = 0
+
+
+class ServiceUpdate(PatchModel):
+    name: DisplayName | None = None
+    duration_minutes: Duration | None = None
+    buffer_after_minutes: Buffer | None = None
+    active: bool | None = None
+
+
+class ServiceOut(StrictModel):
+    id: UUID
+    doctor_id: UUID
+    name: str
+    duration_minutes: int
+    buffer_after_minutes: int
+    active: bool
+
+
+class HoursWindow(StrictModel):
+    weekday: int = Field(ge=0, le=6)
+    opens: ClockTime
+    closes: ClockTime
+
+    @model_validator(mode="after")
+    def _ordered(self):
+        if self.opens >= self.closes:  # Zero-padded HH:MM compares chronologically.
+            raise ValueError("opens must be before closes")
+        return self
+
+
+class HoursReplace(RootModel[Annotated[list[HoursWindow], Field(max_length=50)]]):
+    @model_validator(mode="after")
+    def _no_overlap(self):
+        by_day = {}
+        for window in self.root:
+            by_day.setdefault(window.weekday, []).append((window.opens, window.closes))
+        for windows in by_day.values():
+            windows.sort()
+            for (_, end), (start, _) in zip(windows, windows[1:], strict=False):
+                if start < end:
+                    raise ValueError("overlapping windows")
+        return self

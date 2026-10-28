@@ -11,6 +11,8 @@ from clinic_voice import staff as staff_service
 from clinic_voice.config import get_settings
 from clinic_voice.credentials import authenticate, parse
 from clinic_voice.db import connect
+from clinic_voice.deps import database, require_role, staff_session, unauthorized
+from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.schemas import (
     LoginRequest,
     PasswordChange,
@@ -35,6 +37,8 @@ async def lifespan(app):
 
 app = FastAPI(title="Clinic Voice AI", version="0.1.0", lifespan=lifespan)
 
+app.include_router(admin_router)
+
 
 @app.exception_handler(DatabaseError)
 async def database_error(request, exc):
@@ -54,12 +58,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "003_staff_auth.sql"
-
-
-def unauthorized():
-    # One response for malformed, unknown, revoked and expired credentials.
-    return HTTPException(401, "Invalid credentials", headers={"WWW-Authenticate": "Bearer"})
+REQUIRED_MIGRATION = "004_clinic_configuration.sql"
 
 
 def tenant(authorization: Annotated[str | None, Header()] = None):
@@ -109,30 +108,6 @@ def reserve_slot(
     return reserve(
         get_settings().database_url.get_secret_value(), clinic_id, request, idempotency_key
     )
-
-
-def database():
-    return connect(get_settings().database_url.get_secret_value())
-
-
-def staff_session(authorization: Annotated[str | None, Header()] = None):
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme != "Bearer" or staff_service.parse_session(token) is None:
-        raise unauthorized()  # Tool credentials never parse as staff sessions.
-    with database() as conn:
-        staff = staff_service.authenticate_session(conn, token)
-    if staff is None:
-        raise unauthorized()
-    return staff
-
-
-def require_role(*roles):
-    def check(staff=Depends(staff_session)):
-        if staff["role"] not in roles:
-            raise HTTPException(403, "Insufficient role")
-        return staff
-
-    return check
 
 
 @app.post("/v1/staff/login", response_model=SessionResponse)
