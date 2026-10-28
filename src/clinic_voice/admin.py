@@ -161,3 +161,58 @@ def replace_hours(conn, staff, doctor_id, windows):
         )
     audit(conn, clinic_id, staff["id"], "hours.replaced", doctor_id)
     return get_hours(conn, clinic_id, doctor_id)
+
+
+EXCEPTION_COLUMNS = "id,doctor_id,kind,starts_at,ends_at,label"
+
+
+def list_exceptions(conn, clinic_id, starts=None, ends=None):
+    """Exceptions overlapping the optional half-open range [starts, ends)."""
+    return conn.execute(
+        f"SELECT {EXCEPTION_COLUMNS} FROM schedule_exceptions WHERE clinic_id=%s"  # noqa: S608
+        " AND (%s::timestamptz IS NULL OR ends_at > %s)"
+        " AND (%s::timestamptz IS NULL OR starts_at < %s)"
+        " ORDER BY starts_at,id",
+        (clinic_id, starts, starts, ends, ends),
+    ).fetchall()
+
+
+def create_exception(conn, staff, doctor_id, kind, starts_at, ends_at, label):
+    """Insert an exception and report, but never cancel, overlapping active appointments.
+
+    Takes the same doctor row lock(s) reserve() takes, so once this commits no reservation
+    validated without it can land inside the window; anything that committed first is
+    reported as conflicting.
+    """
+    clinic_id = staff["clinic_id"]
+    if doctor_id is None:
+        conn.execute(
+            "SELECT id FROM doctors WHERE clinic_id=%s ORDER BY id FOR UPDATE", (clinic_id,)
+        ).fetchall()
+    else:
+        _require_doctor(conn, clinic_id, doctor_id, lock=True)
+    exception_id = uuid4()
+    row = conn.execute(
+        "INSERT INTO schedule_exceptions"
+        " (id,clinic_id,doctor_id,kind,starts_at,ends_at,label,created_by)"
+        f" VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING {EXCEPTION_COLUMNS}",  # noqa: S608
+        (exception_id, clinic_id, doctor_id, kind, starts_at, ends_at, label, staff["id"]),
+    ).fetchone()
+    conflicts = conn.execute(
+        "SELECT id FROM appointments WHERE clinic_id=%s"
+        " AND (%s::uuid IS NULL OR doctor_id=%s)"
+        " AND status IN ('pending_sync', 'confirmed', 'needs_review')"
+        " AND starts_at < %s AND blocks_until > %s ORDER BY starts_at,id",
+        (clinic_id, doctor_id, doctor_id, ends_at, starts_at),
+    ).fetchall()
+    audit(conn, clinic_id, staff["id"], "exception.created", exception_id)
+    return {**row, "conflicting_appointment_ids": [r["id"] for r in conflicts]}
+
+
+def delete_exception(conn, staff, exception_id):
+    if not conn.execute(
+        "DELETE FROM schedule_exceptions WHERE clinic_id=%s AND id=%s RETURNING id",
+        (staff["clinic_id"], exception_id),
+    ).fetchone():
+        raise HTTPException(404, NOT_FOUND)
+    audit(conn, staff["clinic_id"], staff["id"], "exception.deleted", exception_id)

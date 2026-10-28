@@ -134,14 +134,16 @@ def test_database_constraint_blocks_overlap_across_services(database, request_bo
         )
     with pytest.raises(ExclusionViolation), connect(database) as conn:
         conn.execute(
-            """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,status,idempotency_key,request_hash)
-            VALUES (%s,%s,%s,%s,%s,%s,'pending_sync','raw-overlap-01','synthetic')""",
+            """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,
+            blocks_until,status,idempotency_key,request_hash)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync','raw-overlap-01','synthetic')""",
             (
                 uuid4(),
                 CLINIC,
                 DOCTOR_ID,
                 other_service,
                 request_body.starts_at + timedelta(minutes=5),
+                request_body.starts_at + timedelta(minutes=35),
                 request_body.starts_at + timedelta(minutes=35),
             ),
         )

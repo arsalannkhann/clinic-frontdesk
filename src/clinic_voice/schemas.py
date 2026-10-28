@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 from zoneinfo import available_timezones
@@ -198,3 +198,40 @@ class HoursReplace(RootModel[Annotated[list[HoursWindow], Field(max_length=50)]]
                 if start < end:
                     raise ValueError("overlapping windows")
         return self
+
+
+# Schedule exceptions (holidays, leave, breaks)
+ExceptionKind = Literal["holiday", "leave", "break"]
+# Operational note such as "Diwali" or "Lunch"; never patient details.
+ExceptionLabel = Annotated[str, StringConstraints(strip_whitespace=True, max_length=80)]
+MAX_EXCEPTION = timedelta(days=366)
+
+
+class ExceptionCreate(StrictModel):
+    doctor_id: UUID | None = None  # None applies to every doctor in the clinic.
+    kind: ExceptionKind
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    label: ExceptionLabel = ""
+
+    @model_validator(mode="after")
+    def _range(self):
+        if self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        if self.ends_at - self.starts_at > MAX_EXCEPTION:
+            raise ValueError("exception longer than 366 days")
+        return self
+
+
+class ExceptionOut(StrictModel):
+    id: UUID
+    doctor_id: UUID | None
+    kind: ExceptionKind
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    label: str
+
+
+class ExceptionCreated(ExceptionOut):
+    # Active appointments overlapping the exception; they are not cancelled automatically.
+    conflicting_appointment_ids: list[UUID]

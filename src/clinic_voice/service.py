@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import timedelta
+from datetime import datetime, time, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -13,7 +13,8 @@ from clinic_voice.domain import candidate_slots, utc_now
 
 def get_context(conn, clinic_id, doctor_id, service_id):
     context = conn.execute(
-        """SELECT s.duration_minutes, c.timezone, c.horizon_days FROM services s
+        """SELECT s.duration_minutes, s.buffer_after_minutes, c.timezone, c.horizon_days,
+        c.lead_time_minutes FROM services s
         JOIN clinics c ON c.id=s.clinic_id
         JOIN doctors d ON d.clinic_id=s.clinic_id AND d.id=s.doctor_id
         WHERE s.clinic_id=%s AND s.doctor_id=%s AND s.id=%s AND s.active AND d.active""",
@@ -35,12 +36,19 @@ def slots(conn, clinic_id, doctor_id, service_id, day):
         "SELECT opens, closes FROM working_hours WHERE clinic_id=%s AND doctor_id=%s AND weekday=%s",
         (clinic_id, doctor_id, day.weekday()),
     ).fetchall()
+    day_start = datetime.combine(day, time(0), zone)
+    day_end = datetime.combine(day + timedelta(days=1), time(0), zone)
+    # Appointments hold the doctor until blocks_until (end plus the buffer snapshotted at booking).
     busy = conn.execute(
-        """SELECT starts_at, ends_at FROM appointments WHERE clinic_id=%s AND doctor_id=%s
+        """SELECT starts_at, blocks_until AS ends_at FROM appointments
+        WHERE clinic_id=%s AND doctor_id=%s
         AND status IN ('pending_sync', 'confirmed', 'needs_review')
-        AND (starts_at AT TIME ZONE %s)::date <= %s
-        AND (ends_at AT TIME ZONE %s)::date >= %s""",
-        (clinic_id, doctor_id, context["timezone"], day, context["timezone"], day),
+        AND starts_at < %s AND blocks_until > %s
+        UNION ALL
+        SELECT starts_at, ends_at FROM schedule_exceptions
+        WHERE clinic_id=%s AND (doctor_id IS NULL OR doctor_id=%s)
+        AND starts_at < %s AND ends_at > %s""",
+        (clinic_id, doctor_id, day_end, day_start, clinic_id, doctor_id, day_end, day_start),
     ).fetchall()
     return candidate_slots(
         day,
@@ -49,6 +57,8 @@ def slots(conn, clinic_id, doctor_id, service_id, day):
         zone,
         [(r["starts_at"], r["ends_at"]) for r in busy],
         now,
+        buffer=context["buffer_after_minutes"],
+        earliest=now + timedelta(minutes=context["lead_time_minutes"]),
     )
 
 
@@ -101,16 +111,19 @@ def reserve(url, clinic_id, request, key):
             ):
                 raise HTTPException(409, "Slot unavailable or outside working hours")
             appointment_id = uuid4()
+            ends_at = request.starts_at + timedelta(minutes=context["duration_minutes"])
             row = conn.execute(
-                """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,status,idempotency_key,request_hash)
-                VALUES (%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s) RETURNING *""",
+                """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,
+                blocks_until,status,idempotency_key,request_hash)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s) RETURNING *""",
                 (
                     appointment_id,
                     clinic_id,
                     request.doctor_id,
                     request.service_id,
                     request.starts_at,
-                    request.starts_at + timedelta(minutes=context["duration_minutes"]),
+                    ends_at,
+                    ends_at + timedelta(minutes=context["buffer_after_minutes"]),
                     key,
                     fingerprint,
                 ),
