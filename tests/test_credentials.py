@@ -96,7 +96,13 @@ def test_revoked_credential_fails(database, client):
 
 
 def test_expired_credential_fails(database, client):
-    _, token = issue(database, expires_at=datetime.now(ZoneInfo("UTC")) - timedelta(seconds=1))
+    credential_id, token = issue(database)
+    with connect(database) as conn:
+        # Use the database clock; host and container clocks can differ.
+        conn.execute(
+            "UPDATE tenant_credentials SET expires_at=now() - interval '1 second' WHERE id=%s",
+            (credential_id,),
+        )
     assert check(client, token).status_code == 401
 
 
