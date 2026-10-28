@@ -3,8 +3,10 @@
 "Now" is pinned to a fixed instant far from the host clock so every date is deterministic.
 """
 
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
+from functools import partial
 from threading import Barrier, Thread
+from time import monotonic, sleep
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -13,20 +15,22 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from psycopg.errors import CheckViolation, ExclusionViolation
 
-from clinic_voice import admin, credentials, service, staff
+from clinic_voice import admin, credentials, schedule_exceptions, service, staff
 from clinic_voice.api import app
 from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
 from clinic_voice.config import get_settings
 from clinic_voice.db import connect
-from clinic_voice.schemas import ReservationRequest
+from clinic_voice.domain import ACTIVE_STATUSES
+from clinic_voice.locks import lock_doctor_set
+from clinic_voice.schemas import HoursWindow, ReservationRequest
 
 IST = ZoneInfo("Asia/Kolkata")
 NOW = datetime(2031, 3, 3, 8, 30, tzinfo=IST)  # Seeded hours are 09:00-17:00 every day.
 TODAY = NOW.date()
 DAY = TODAY + timedelta(days=2)
 PASSWORD = "synthetic-password-01"
-ACTIVE = "('pending_sync', 'confirmed', 'needs_review')"
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 @pytest.fixture(autouse=True)
@@ -295,9 +299,10 @@ def test_conflicting_appointments_reported_not_cancelled(client, database):
     r = post_exception(client, h, at(10, 20), at(11))
     assert r.status_code == 201 and r.json()["conflicting_appointment_ids"] == [str(mine)]
     r = post_exception(client, h, at(10, 30), at(11))  # Starts at blocks_until: no conflict.
-    assert r.json()["conflicting_appointment_ids"] == []
+    assert r.json()["conflicting_appointment_ids"] == [] and r.json()["conflict_count"] == 0
     r = post_exception(client, h, at(9), at(12), doctor=None, kind="holiday")
     assert set(r.json()["conflicting_appointment_ids"]) == {str(mine), str(theirs)}
+    assert r.json()["conflict_count"] == 2
     with connect(database) as conn:
         statuses = conn.execute("SELECT status FROM appointments").fetchall()
     assert {s["status"] for s in statuses} == {"pending_sync"}
@@ -388,6 +393,11 @@ def test_exception_list_range_and_audit(client, database):
         exception_body(at(0), at(0) + timedelta(days=366, seconds=1)),
         exception_body(at(13), at(14), kind="vacation"),
         exception_body(at(13), at(14), label="x" * 81),
+        exception_body(at(13), at(14), label="Lunch\n"),
+        exception_body(at(13), at(14), label="Lu\x00nch"),
+        exception_body(at(13), at(14), label="Lu\x1bnch"),
+        exception_body(at(13), at(14), label="Lunch\x7f"),
+        exception_body(at(13), at(14), label="\tLunch"),
         exception_body(at(13), at(14), clinic_id=str(CLINIC)),
         {"kind": "leave", "starts_at": "2031-03-05T13:00:00", "ends_at": "2031-03-05T14:00:00"},
         {"kind": "leave", "starts_at": at(13).isoformat()},
@@ -412,6 +422,8 @@ def test_exception_accepts_366_days_and_strips_label(client, database):
         {"from": "2031-03-05T10:00:00"},
         {"to": "not-a-date"},
         {"from": "2031-03-05T10:00:00+05:30", "to": "2031-03-05T10:00:00+05:30"},
+        {"limit": "0"},
+        {"limit": "1001"},
     ],
 )
 def test_exception_list_rejects_bad_range(client, database, params):
@@ -419,40 +431,210 @@ def test_exception_list_rejects_bad_range(client, database, params):
     assert client.get("/v1/admin/exceptions", headers=h, params=params).status_code == 422
 
 
+def test_exception_list_limit(client, database):
+    h = headers(client, database, "viewer")
+    owner = headers(client, database)
+    for hour in (9, 10, 11):
+        assert post_exception(client, owner, at(hour), at(hour, 30)).status_code == 201
+    assert len(client.get("/v1/admin/exceptions", headers=h).json()) == 3
+    r = client.get("/v1/admin/exceptions", headers=h, params={"limit": 2})
+    assert [e["starts_at"] for e in r.json()] == [
+        e["starts_at"] for e in client.get("/v1/admin/exceptions", headers=h).json()[:2]
+    ]
+
+
+def test_conflict_ids_capped_with_true_count(client, database):
+    with connect(database) as conn:
+        for index in range(105):
+            start = at(9, day=DAY) + timedelta(days=index // 30, minutes=15 * (index % 30))
+            conn.execute(
+                "INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,"
+                "blocks_until,status,idempotency_key,request_hash)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,'confirmed',%s,'synthetic')",
+                (
+                    uuid4(),
+                    CLINIC,
+                    DOCTOR_ID,
+                    SERVICE_ID,
+                    start,
+                    start + timedelta(minutes=15),
+                    start + timedelta(minutes=15),
+                    uuid4().hex,
+                ),
+            )
+    h = headers(client, database)
+    r = post_exception(client, h, at(0), at(0, day=DAY + timedelta(days=5)))
+    assert r.status_code == 201
+    assert len(r.json()["conflicting_appointment_ids"]) == 100
+    assert r.json()["conflict_count"] == 105
+
+
+def test_delete_exception_restores_slots(client, database):
+    h = headers(client, database)
+    before = free(database)
+    created = post_exception(client, h, at(9), at(17), doctor=None, kind="holiday").json()
+    assert free(database) == []
+    assert client.delete(f"/v1/admin/exceptions/{created['id']}", headers=h).status_code == 204
+    assert free(database) == before
+    assert book(database, at(10))["status"] == "pending_sync"
+
+
+def test_cancelled_appointments_do_not_block(client, database):
+    set_buffer(database, 15)
+    booked = book(database, at(10))["appointment_id"]
+    with connect(database) as conn:
+        conn.execute("UPDATE appointments SET status='cancelled' WHERE id=%s", (booked,))
+    available = free(database)
+    assert at(9, 45) in available and at(10) in available and at(10, 15) in available
+    h = headers(client, database)
+    r = post_exception(client, h, at(10), at(11))
+    assert r.json()["conflicting_appointment_ids"] == [] and r.json()["conflict_count"] == 0
+    with connect(database) as conn:
+        conn.execute("DELETE FROM schedule_exceptions")
+    assert book(database, at(10))["status"] == "pending_sync"
+
+
+def test_cross_midnight_buffer_hits_next_day_exception(client, database):
+    set_buffer(database, 30)
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE working_hours SET opens='23:00', closes='23:59'"
+            " WHERE doctor_id=%s AND weekday=%s",
+            (DOCTOR_ID, DAY.weekday()),
+        )
+    assert free(database) == [at(23), at(23, 15), at(23, 30)]
+    h = headers(client, database)
+    next_day = DAY + timedelta(days=1)
+    assert post_exception(client, h, at(0, day=next_day), at(1, day=next_day)).status_code == 201
+    # 23:30 holds until 00:15 the next day; 23:15 holds until exactly 00:00 (adjacent).
+    assert free(database) == [at(23), at(23, 15)]
+    assert rejected(database, at(23, 30)) == 409
+
+
+# Non-IST clinics and DST
+
+
+def new_york_clinic(monkeypatch, database, now, duration=15):
+    monkeypatch.setattr(service, "utc_now", lambda: now)
+    with connect(database) as conn:
+        conn.execute("UPDATE clinics SET timezone='America/New_York' WHERE id=%s", (CLINIC,))
+        conn.execute("UPDATE services SET duration_minutes=%s WHERE id=%s", (duration, SERVICE_ID))
+
+
+def test_non_ist_clinic_uses_its_own_zone(monkeypatch, client, database):
+    new_york_clinic(monkeypatch, database, datetime(2030, 6, 3, 12, tzinfo=NEW_YORK))
+    day = datetime(2030, 6, 5).date()
+    available = free(database, day=day)
+    assert len(available) == 32
+    assert available[0].astimezone(UTC) == datetime(2030, 6, 5, 13, tzinfo=UTC)  # 09:00 EDT
+    # Today in New York (lead time from 12:00 local) and the horizon are judged in that zone.
+    assert free(database, day=datetime(2030, 6, 3).date())[0] == datetime(
+        2030, 6, 3, 13, tzinfo=NEW_YORK
+    )
+    h = headers(client, database)
+    start = datetime(2030, 6, 5, 9, tzinfo=NEW_YORK)
+    r = post_exception(client, h, start, start + timedelta(hours=1), doctor=None, kind="break")
+    assert r.status_code == 201
+    assert free(database, day=day)[0] == datetime(2030, 6, 5, 10, tzinfo=NEW_YORK)
+    assert book(database, datetime(2030, 6, 5, 14, tzinfo=UTC))["status"] == "pending_sync"
+
+
+def test_reserve_rejects_nonexistent_local_time(monkeypatch, database):
+    new_york_clinic(monkeypatch, database, datetime(2030, 3, 8, 12, tzinfo=NEW_YORK), 45)
+    day = datetime(2030, 3, 10).date()  # Spring forward: 02:00-03:00 does not exist.
+    with connect(database) as conn:
+        conn.execute(
+            "UPDATE working_hours SET opens='01:00', closes='04:00'"
+            " WHERE doctor_id=%s AND weekday=%s",
+            (DOCTOR_ID, day.weekday()),
+        )
+    available = free(database, day=day)
+    assert [v.astimezone(UTC).strftime("%H:%M") for v in available] == ["06:00", "06:45"]
+    # 02:30 local never happens; wall-clock stepping would have offered it (and 03:15).
+    assert rejected(database, datetime(2030, 3, 10, 2, 30, tzinfo=NEW_YORK)) == 409
+    assert rejected(database, datetime(2030, 3, 10, 3, 15, tzinfo=NEW_YORK)) == 409
+    booked = book(database, datetime(2030, 3, 10, 6, 45, tzinfo=UTC))
+    assert booked["ends_at"] == datetime(2030, 3, 10, 7, 30, tzinfo=UTC)
+
+
 # Serialization with reservations
 
 
-def held_doctor_lock(database, call):
-    """Run call() in a thread while another connection holds the doctor row lock."""
-    result = {}
+class Worker(Thread):
+    """Runs call() and re-raises its exception in the test thread."""
+
+    def __init__(self, call):
+        super().__init__(daemon=True)
+        self.call, self.value, self.error = call, None, None
+
+    def run(self):
+        try:
+            self.value = self.call()
+        except BaseException as error:  # noqa: BLE001 - re-raised by result()
+            self.error = error
+
+    def result(self, timeout=10):
+        self.join(timeout)
+        assert not self.is_alive(), "worker did not finish"
+        if self.error is not None:
+            raise self.error
+        return self.value
+
+
+def wait_for_lock_waiter(database, timeout=5.0):
+    """Poll until some other backend of the test database is waiting on a lock."""
+    deadline = monotonic() + timeout
+    with connect(database) as conn:
+        conn.autocommit = True  # Fresh pg_stat_activity snapshot on every query.
+        while monotonic() < deadline:
+            waiting = conn.execute(
+                "SELECT count(*) AS n FROM pg_stat_activity WHERE datname=current_database()"
+                " AND wait_event_type='Lock' AND pid <> pg_backend_pid()"
+            ).fetchone()["n"]
+            if waiting:
+                return
+            sleep(0.01)
+    raise AssertionError("no backend waited for the lock")
+
+
+def start_blocked(database, holder, call):
+    """Start call() in a worker and confirm it is waiting on a lock the holder owns."""
+    worker = Worker(call)
+    worker.start()
+    try:
+        wait_for_lock_waiter(database)
+    except AssertionError:
+        holder.rollback()
+        worker.join(10)
+        raise
+    return worker
+
+
+def holding_doctor_lock(database):
     holder = connect(database)
     holder.execute("SELECT id FROM doctors WHERE id=%s FOR UPDATE", (DOCTOR_ID,))
-    thread = Thread(target=lambda: result.setdefault("r", call()))
-    thread.start()
-    thread.join(timeout=0.5)
-    assert thread.is_alive(), "call did not wait for the doctor row lock"
-    return holder, thread, result
+    return holder
 
 
-def finish(holder, thread, commit):
-    if commit:
-        holder.commit()
-    else:
-        holder.rollback()
-    holder.close()
-    thread.join(timeout=10)
-    assert not thread.is_alive()
+def create(database, actor, doctor, start, end, kind="leave"):
+    with connect(database) as conn:
+        return schedule_exceptions.create_exception(conn, actor, doctor, kind, start, end, "")
+
+
+def attempt(database, start):
+    try:
+        return book(database, start)["status"]
+    except HTTPException as error:
+        return error.status_code
 
 
 @pytest.mark.parametrize("doctor", [DOCTOR_ID, None])
 def test_exception_waits_for_reservation_and_reports_it(database, doctor):
     actor = staff_actor(database)
-
-    def create():
-        with connect(database) as conn:
-            return admin.create_exception(conn, actor, doctor, "leave", at(10), at(11), "")
-
-    holder, thread, result = held_doctor_lock(database, create)
+    holder = holding_doctor_lock(database)
+    worker = start_blocked(
+        database, holder, lambda: create(database, actor, doctor, at(10), at(11))
+    )
     # The lock holder plays a reservation that won the lock first and commits inside the window.
     appointment = uuid4()
     holder.execute(
@@ -461,62 +643,119 @@ def test_exception_waits_for_reservation_and_reports_it(database, doctor):
         " VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync','held-lock-0001','synthetic')",
         (appointment, CLINIC, DOCTOR_ID, SERVICE_ID, at(10, 15), at(10, 30), at(10, 30)),
     )
-    finish(holder, thread, commit=True)
-    assert result["r"]["conflicting_appointment_ids"] == [appointment]
+    holder.commit()
+    holder.close()
+    assert worker.result()["conflicting_appointment_ids"] == [appointment]
 
 
 def test_reservation_waits_for_exception_and_is_rejected(database):
     actor = staff_actor(database)
-
-    def attempt():
-        try:
-            return book(database, at(10))["status"]
-        except HTTPException as error:
-            return error.status_code
-
-    holder, thread, result = held_doctor_lock(database, attempt)
+    holder = holding_doctor_lock(database)
+    worker = start_blocked(database, holder, lambda: attempt(database, at(10)))
     # The lock holder plays an exception creation that won the lock first.
     holder.execute(
         "INSERT INTO schedule_exceptions (id,clinic_id,doctor_id,kind,starts_at,ends_at,created_by)"
         " VALUES (%s,%s,%s,'leave',%s,%s,%s)",
         (uuid4(), CLINIC, DOCTOR_ID, at(9, 30), at(11), actor["id"]),
     )
-    finish(holder, thread, commit=True)
-    assert result["r"] == 409
+    holder.commit()
+    holder.close()
+    assert worker.result() == 409
     with connect(database) as conn:
         assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
 
 
+def test_create_doctor_waits_for_clinic_wide_exception(database):
+    actor = staff_actor(database)
+    holder = connect(database)
+    lock_doctor_set(holder, CLINIC, exclusive=True)  # Plays a clinic-wide exception in flight.
+
+    def add_doctor():
+        with connect(database) as conn:
+            return admin.create_doctor(conn, actor, "Late arrival")
+
+    worker = start_blocked(database, holder, add_doctor)
+    holder.rollback()
+    holder.close()
+    assert worker.result()["active"] is True
+
+
+def test_clinic_wide_exception_waits_for_doctor_creation(database):
+    actor = staff_actor(database)
+    holder = connect(database)
+    new_doctor = admin.create_doctor(holder, actor, "In flight")  # Shared doctor-set lock held.
+    worker = start_blocked(
+        database, holder, lambda: create(database, actor, None, at(9), at(17), "holiday")
+    )
+    holder.commit()
+    holder.close()
+    worker.result()
+    with connect(database) as conn:
+        # The clinic-wide exception locked the new doctor's row too: it is fully committed.
+        assert conn.execute("SELECT 1 FROM doctors WHERE id=%s", (new_doctor["id"],)).fetchone()
+
+
+def test_hours_and_service_edits_race_clinic_wide_exception_without_deadlock(database):
+    actor = staff_actor(database)
+    other_doctor, other_service = second_doctor(database)
+    hours = [HoursWindow(weekday=DAY.weekday(), opens="09:00", closes="17:00")]
+
+    def run(barrier, function, *args):
+        barrier.wait()
+        with connect(database) as conn:
+            return function(conn, actor, *args)
+
+    for trial in range(5):
+        barrier = Barrier(4)
+        start = at(9) + timedelta(minutes=30 * trial)
+        calls = [
+            (
+                schedule_exceptions.create_exception,
+                None,
+                "break",
+                start,
+                start + timedelta(minutes=15),
+                "",
+            ),
+            (admin.replace_hours, other_doctor, hours),
+            (admin.replace_hours, DOCTOR_ID, hours),
+            (admin.update_service, other_service, {"buffer_after_minutes": trial}),
+        ]
+        workers = [Worker(partial(run, barrier, *call)) for call in calls]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.result()  # Raises DeadlockDetected if the lock order were inconsistent.
+    with connect(database) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM schedule_exceptions").fetchone()["n"] == 5
+
+
 @pytest.mark.parametrize("doctor", [DOCTOR_ID, None])
-def test_concurrent_exception_and_reservation_never_both_silently(database, doctor):
+def test_exception_reservation_race_smoke(database, doctor):
+    """Smoke test: which side wins each trial is not controlled (the lock-holder tests above
+    prove both orderings). Whatever the interleaving, the invariant must hold."""
     actor = staff_actor(database)
     reported = set()
     for trial in range(8):
         start = at(9) + timedelta(minutes=30 * trial)
         barrier = Barrier(2)
-        result = {}
 
-        def create(start=start, barrier=barrier, result=result):
+        def make(start=start, barrier=barrier):
             barrier.wait()
-            with connect(database) as conn:
-                result["exception"] = admin.create_exception(
-                    conn, actor, doctor, "break", start, start + timedelta(minutes=15), ""
-                )
+            return create(database, actor, doctor, start, start + timedelta(minutes=15), "break")
 
-        def reserve(start=start, barrier=barrier, result=result):
+        def reserve(start=start, barrier=barrier):
             barrier.wait()
             try:
-                result["booking"] = book(database, start)
+                return book(database, start)
             except HTTPException as error:
-                result["booking"] = error.status_code
+                return error.status_code
 
-        threads = [Thread(target=create), Thread(target=reserve)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=10)
-            assert not t.is_alive()
-        booking, conflicts = result["booking"], result["exception"]["conflicting_appointment_ids"]
+        workers = [Worker(make), Worker(reserve)]
+        for worker in workers:
+            worker.start()
+        exception, booking = (worker.result() for worker in workers)
+        conflicts = exception["conflicting_appointment_ids"]
         if booking == 409:
             assert conflicts == []  # The exception committed first and blocked the booking.
         else:
@@ -526,9 +765,10 @@ def test_concurrent_exception_and_reservation_never_both_silently(database, doct
     # reported as conflicting when that exception was created.
     with connect(database) as conn:
         inside = conn.execute(
-            f"""SELECT a.id FROM appointments a JOIN schedule_exceptions e
+            """SELECT a.id FROM appointments a JOIN schedule_exceptions e
             ON e.clinic_id=a.clinic_id AND (e.doctor_id IS NULL OR e.doctor_id=a.doctor_id)
             AND a.starts_at < e.ends_at AND a.blocks_until > e.starts_at
-            WHERE a.status IN {ACTIVE}"""  # noqa: S608
+            WHERE a.status = ANY(%s)""",
+            (list(ACTIVE_STATUSES),),
         ).fetchall()
     assert {r["id"] for r in inside} == reported

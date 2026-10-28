@@ -1,3 +1,4 @@
+import re
 from datetime import date, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
@@ -7,6 +8,7 @@ from pydantic import (
     AfterValidator,
     AwareDatetime,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     RootModel,
@@ -202,8 +204,22 @@ class HoursReplace(RootModel[Annotated[list[HoursWindow], Field(max_length=50)]]
 
 # Schedule exceptions (holidays, leave, breaks)
 ExceptionKind = Literal["holiday", "leave", "break"]
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _no_control_characters(value):
+    # Checked before trimming so a trailing newline is rejected rather than silently dropped.
+    if isinstance(value, str) and CONTROL_CHARACTERS.search(value):
+        raise ValueError("control characters are not allowed")
+    return value
+
+
 # Operational note such as "Diwali" or "Lunch"; never patient details.
-ExceptionLabel = Annotated[str, StringConstraints(strip_whitespace=True, max_length=80)]
+ExceptionLabel = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(strip_whitespace=True, max_length=80),
+]
 MAX_EXCEPTION = timedelta(days=366)
 
 
@@ -234,4 +250,6 @@ class ExceptionOut(StrictModel):
 
 class ExceptionCreated(ExceptionOut):
     # Active appointments overlapping the exception; they are not cancelled automatically.
+    # At most 100 ids; conflict_count is the true total.
     conflicting_appointment_ids: list[UUID]
+    conflict_count: int

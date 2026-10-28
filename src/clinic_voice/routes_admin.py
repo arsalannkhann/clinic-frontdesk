@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import AwareDatetime
 
-from clinic_voice import admin
+from clinic_voice import admin, schedule_exceptions
 from clinic_voice.deps import database, require_role
 from clinic_voice.schemas import (
     ClinicConfig,
@@ -98,18 +98,19 @@ def put_hours(doctor_id: UUID, request: HoursReplace, staff=Depends(writer)):
 def list_exceptions(
     starts: Annotated[AwareDatetime | None, Query(alias="from")] = None,
     ends: Annotated[AwareDatetime | None, Query(alias="to")] = None,
+    limit: Annotated[int, Query(ge=1, le=1000)] = 200,
     staff=Depends(reader),
 ):
     if starts and ends and ends <= starts:
         raise HTTPException(422, "to must be after from")
     with database() as conn:
-        return admin.list_exceptions(conn, staff["clinic_id"], starts, ends)
+        return schedule_exceptions.list_exceptions(conn, staff["clinic_id"], starts, ends, limit)
 
 
 @router.post("/exceptions", response_model=ExceptionCreated, status_code=201)
 def create_exception(request: ExceptionCreate, staff=Depends(writer)):
     with database() as conn:
-        return admin.create_exception(
+        return schedule_exceptions.create_exception(
             conn,
             staff,
             request.doctor_id,
@@ -123,5 +124,5 @@ def create_exception(request: ExceptionCreate, staff=Depends(writer)):
 @router.delete("/exceptions/{exception_id}", status_code=204)
 def delete_exception(exception_id: UUID, staff=Depends(writer)):
     with database() as conn:
-        admin.delete_exception(conn, staff, exception_id)
+        schedule_exceptions.delete_exception(conn, staff, exception_id)
     return Response(status_code=204)

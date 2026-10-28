@@ -1,6 +1,6 @@
 import hashlib
 import json
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -8,7 +8,8 @@ from fastapi import HTTPException
 from psycopg.errors import ExclusionViolation, UniqueViolation
 
 from clinic_voice.db import connect
-from clinic_voice.domain import candidate_slots, utc_now
+from clinic_voice.domain import ACTIVE_STATUSES, candidate_slots, utc_now
+from clinic_voice.locks import lock_doctors
 
 
 def get_context(conn, clinic_id, doctor_id, service_id):
@@ -25,8 +26,40 @@ def get_context(conn, clinic_id, doctor_id, service_id):
     return context
 
 
-def slots(conn, clinic_id, doctor_id, service_id, day):
-    context = get_context(conn, clinic_id, doctor_id, service_id)
+def busy_intervals(conn, clinic_id, doctor_id, start, end):
+    """Local busy time overlapping [start, end) as (start, end) pairs.
+
+    Appointments hold the doctor until blocks_until (end plus the buffer snapshotted at
+    booking); schedule exceptions apply to their doctor or, with no doctor, the whole clinic.
+    """
+    rows = conn.execute(
+        """SELECT starts_at, blocks_until AS ends_at FROM appointments
+        WHERE clinic_id=%s AND doctor_id=%s AND status = ANY(%s)
+        AND starts_at < %s AND blocks_until > %s
+        UNION ALL
+        SELECT starts_at, ends_at FROM schedule_exceptions
+        WHERE clinic_id=%s AND (doctor_id IS NULL OR doctor_id=%s)
+        AND starts_at < %s AND ends_at > %s""",
+        (
+            clinic_id,
+            doctor_id,
+            list(ACTIVE_STATUSES),
+            end,
+            start,
+            clinic_id,
+            doctor_id,
+            end,
+            start,
+        ),
+    ).fetchall()
+    return [(r["starts_at"], r["ends_at"]) for r in rows]
+
+
+def slots(conn, clinic_id, doctor_id, service_id, day, extra_busy=(), context=None):
+    """Available starts for one day. extra_busy adds (start, end) pairs, e.g. external
+    calendar busy time; context reuses an already-fetched get_context row."""
+    if context is None:
+        context = get_context(conn, clinic_id, doctor_id, service_id)
     zone = ZoneInfo(context["timezone"])
     now = utc_now()
     horizon = context["horizon_days"]
@@ -36,26 +69,17 @@ def slots(conn, clinic_id, doctor_id, service_id, day):
         "SELECT opens, closes FROM working_hours WHERE clinic_id=%s AND doctor_id=%s AND weekday=%s",
         (clinic_id, doctor_id, day.weekday()),
     ).fetchall()
+    buffer = timedelta(minutes=context["buffer_after_minutes"])
     day_start = datetime.combine(day, time(0), zone)
-    day_end = datetime.combine(day + timedelta(days=1), time(0), zone)
-    # Appointments hold the doctor until blocks_until (end plus the buffer snapshotted at booking).
-    busy = conn.execute(
-        """SELECT starts_at, blocks_until AS ends_at FROM appointments
-        WHERE clinic_id=%s AND doctor_id=%s
-        AND status IN ('pending_sync', 'confirmed', 'needs_review')
-        AND starts_at < %s AND blocks_until > %s
-        UNION ALL
-        SELECT starts_at, ends_at FROM schedule_exceptions
-        WHERE clinic_id=%s AND (doctor_id IS NULL OR doctor_id=%s)
-        AND starts_at < %s AND ends_at > %s""",
-        (clinic_id, doctor_id, day_end, day_start, clinic_id, doctor_id, day_end, day_start),
-    ).fetchall()
+    # A late slot's buffer can run past midnight into busy time that starts the next day.
+    day_end = datetime.combine(day + timedelta(days=1), time(0), zone) + buffer
+    busy = busy_intervals(conn, clinic_id, doctor_id, day_start, day_end)
     return candidate_slots(
         day,
         [(r["opens"], r["closes"]) for r in hours],
         context["duration_minutes"],
         zone,
-        [(r["starts_at"], r["ends_at"]) for r in busy],
+        busy + list(extra_busy),
         now,
         buffer=context["buffer_after_minutes"],
         earliest=now + timedelta(minutes=context["lead_time_minutes"]),
@@ -85,8 +109,6 @@ def replay(conn, clinic_id, key, fingerprint):
 def reserve(url, clinic_id, request, key):
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
-    from datetime import UTC
-
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
     fingerprint = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
     try:
@@ -98,17 +120,16 @@ def reserve(url, clinic_id, request, key):
             previous = replay(conn, clinic_id, key, fingerprint)
             if previous:
                 return previous
-            # Short DB-only lock orders competing writes for the same doctor.
+            # Short DB-only lock orders competing writes for the same doctor (see locks.py).
             # GiST exclusion alone can deadlock simultaneous overlapping inserts.
-            conn.execute(
-                "SELECT id FROM doctors WHERE clinic_id=%s AND id=%s FOR UPDATE",
-                (clinic_id, request.doctor_id),
-            )
+            lock_doctors(conn, clinic_id, [request.doctor_id])
             context = get_context(conn, clinic_id, request.doctor_id, request.service_id)
             day = request.starts_at.astimezone(ZoneInfo(context["timezone"])).date()
-            if request.starts_at not in slots(
-                conn, clinic_id, request.doctor_id, request.service_id, day
-            ):
+            available = slots(
+                conn, clinic_id, request.doctor_id, request.service_id, day, context=context
+            )
+            # Compare instants, never zone-local wall times.
+            if request.starts_at.astimezone(UTC) not in {s.astimezone(UTC) for s in available}:
                 raise HTTPException(409, "Slot unavailable or outside working hours")
             appointment_id = uuid4()
             ends_at = request.starts_at + timedelta(minutes=context["duration_minutes"])

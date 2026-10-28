@@ -646,6 +646,18 @@
             }
           },
           {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 1000,
+              "minimum": 1,
+              "default": 200,
+              "title": "Limit"
+            }
+          },
+          {
             "name": "authorization",
             "in": "header",
             "required": false,
@@ -1564,6 +1576,10 @@
             },
             "type": "array",
             "title": "Conflicting Appointment Ids"
+          },
+          "conflict_count": {
+            "type": "integer",
+            "title": "Conflict Count"
           }
         },
         "additionalProperties": false,
@@ -1575,7 +1591,8 @@
           "starts_at",
           "ends_at",
           "label",
-          "conflicting_appointment_ids"
+          "conflicting_appointment_ids",
+          "conflict_count"
         ],
         "title": "ExceptionCreated"
       },

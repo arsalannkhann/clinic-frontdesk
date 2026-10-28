@@ -99,3 +99,50 @@ def test_exception_interval_blocks_like_busy():
     busy = [(at(12), at(13))]  # Break
     result = candidate_slots(DAY, [(time(11), time(14))], 30, ZONE, busy, LONG_AGO, buffer=15)
     assert hhmm(result) == ["11:00", "13:00", "13:30"]
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def utc_hhmm(values):
+    return [v.astimezone(UTC).strftime("%H:%M") for v in values]
+
+
+def test_spring_forward_steps_in_absolute_time():
+    # 2030-03-10: 02:00 EST jumps to 03:00 EDT. 01:00-04:00 local is two real hours.
+    result = candidate_slots(date(2030, 3, 10), [(time(1), time(4))], 30, NEW_YORK, [], LONG_AGO)
+    assert utc_hhmm(result) == ["06:00", "06:30", "07:00", "07:30"]
+    assert [v.strftime("%H:%M%z") for v in result] == [
+        "01:00-0500",
+        "01:30-0500",
+        "03:00-0400",
+        "03:30-0400",
+    ]
+    assert len({v.astimezone(UTC) for v in result}) == len(result)
+
+
+def test_spring_forward_grid_does_not_restart_at_wall_clock():
+    # A 45-minute grid continues across the gap instead of producing a nonexistent 02:30.
+    result = candidate_slots(date(2030, 3, 10), [(time(1), time(4))], 45, NEW_YORK, [], LONG_AGO)
+    assert [v.strftime("%H:%M%z") for v in result] == ["01:00-0500", "01:45-0500"]
+
+
+def test_fall_back_includes_repeated_hour_once_per_instant():
+    # 2030-11-03: 02:00 EDT falls back to 01:00 EST. 01:00-03:00 local is three real hours.
+    result = candidate_slots(date(2030, 11, 3), [(time(1), time(3))], 30, NEW_YORK, [], LONG_AGO)
+    assert utc_hhmm(result) == ["05:00", "05:30", "06:00", "06:30", "07:00", "07:30"]
+    assert [v.strftime("%H:%M%z") for v in result] == [
+        "01:00-0400",
+        "01:30-0400",
+        "01:00-0500",
+        "01:30-0500",
+        "02:00-0500",
+        "02:30-0500",
+    ]
+
+
+def test_busy_interval_in_repeated_hour_blocks_only_that_instant():
+    busy = [(datetime(2030, 11, 3, 6, tzinfo=UTC), datetime(2030, 11, 3, 6, 30, tzinfo=UTC))]
+    result = candidate_slots(date(2030, 11, 3), [(time(1), time(2))], 30, NEW_YORK, busy, LONG_AGO)
+    # The second 01:00 (EST) is busy; the first 01:00 (EDT) remains.
+    assert utc_hhmm(result) == ["05:00", "05:30", "06:30"]
