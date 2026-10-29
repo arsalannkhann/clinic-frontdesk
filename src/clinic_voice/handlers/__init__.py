@@ -1,11 +1,11 @@
 """Outbox handler registry: job kind -> Handler(run, on_dead).
 
-Kinds the outbox CHECK allows but that have no entry here (reminder.schedule, provision.step)
-are reserved for later tasks; a job of such a kind is dead-lettered with 'unknown_kind'.
-Nothing enqueues them.
+Kinds the outbox CHECK allows but that have no entry here (reminder.schedule) are reserved
+for later tasks; a job of such a kind is dead-lettered with 'unknown_kind'. Nothing
+enqueues them.
 """
 
-from clinic_voice.handlers import bolna, calendar, reminders
+from clinic_voice.handlers import bolna, calendar, provisioning, reminders
 from clinic_voice.outbox import Handler
 
 HANDLERS: dict[str, Handler] = {
@@ -18,4 +18,5 @@ HANDLERS: dict[str, Handler] = {
     "notification.send": Handler(reminders.send_message, on_dead=reminders.contact_on_dead),
     "reminder.call": Handler(reminders.place_call, on_dead=reminders.contact_on_dead),
     "reminder.stop": Handler(reminders.stop, on_dead=reminders.stop_on_dead),
+    "provision.step": Handler(provisioning.step, on_dead=provisioning.on_dead),
 }

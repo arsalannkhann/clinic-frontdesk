@@ -117,7 +117,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "014_reminders.sql"
+REQUIRED_MIGRATION = "015_provisioning.sql"
 
 
 @app.get("/health/live")

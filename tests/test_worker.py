@@ -421,7 +421,7 @@ def test_superseded_appointment_completes_without_provider_calls(mapped, change)
 
 def test_unknown_kind_dead_letters_without_touching_appointment(mapped):
     appointment_id = book(mapped)
-    job_id = insert_job(mapped, "provision.step", appointment_id)  # Reserved, no handler.
+    job_id = insert_job(mapped, "reminder.schedule", appointment_id)  # Reserved, no handler.
     with connect(mapped) as conn:
         conn.execute(
             "UPDATE outbox SET available_at = now() + interval '1 hour'"

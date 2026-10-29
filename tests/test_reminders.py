@@ -1014,6 +1014,7 @@ def test_worker_without_a_port_leaves_its_kinds(env):
     assert set(excluded_kinds(calendar_only)) == {
         "bolna.reconcile",
         "reminder.call",
+        "provision.step",
         "notification.send",
     }
     at(env, REMINDER_AT)

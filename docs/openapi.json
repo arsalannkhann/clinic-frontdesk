@@ -1042,6 +1042,266 @@
         }
       }
     },
+    "/v1/admin/provisioning": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Get Provisioning",
+        "description": "Provisioning state, provider ids (no secrets, no phone numbers) and recent events.",
+        "operationId": "get_provisioning_v1_admin_provisioning_get",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/provisioning/advance": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Advance Provisioning",
+        "description": "Enqueue the next provisioning step (owner). 409 if a step is already pending or the\nstate has no next step. A worker with a Bolna port runs it.",
+        "operationId": "advance_provisioning_v1_admin_provisioning_advance_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningAdvanced"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/provisioning/number": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Select Provisioning Number",
+        "description": "Select an existing number of the Bolna account by id (owner). Nothing is purchased;\nthe number step checks the id against the account's numbers.",
+        "operationId": "select_provisioning_number_v1_admin_provisioning_number_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProvisioningNumber"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/provisioning/activate": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Activate Provisioning",
+        "description": "verified -> active (owner). Does not enable outbound contact.",
+        "operationId": "activate_provisioning_v1_admin_provisioning_activate_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/provisioning/reset": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Reset Provisioning",
+        "description": "failed | manual_review -> the state whose step must run again (owner).",
+        "operationId": "reset_provisioning_v1_admin_provisioning_reset_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvisioningOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/admin/appointments": {
       "get": {
         "tags": [
@@ -3603,6 +3863,18 @@
           "daily_contact_budget": {
             "type": "integer",
             "title": "Daily Contact Budget"
+          },
+          "emergency_text": {
+            "type": "string",
+            "title": "Emergency Text"
+          },
+          "handoff_text": {
+            "type": "string",
+            "title": "Handoff Text"
+          },
+          "scripts_approved": {
+            "type": "boolean",
+            "title": "Scripts Approved"
           }
         },
         "additionalProperties": false,
@@ -3617,7 +3889,10 @@
           "quiet_hours_start",
           "quiet_hours_end",
           "reminder_lead_minutes",
-          "daily_contact_budget"
+          "daily_contact_budget",
+          "emergency_text",
+          "handoff_text",
+          "scripts_approved"
         ],
         "title": "ClinicConfig"
       },
@@ -3735,6 +4010,41 @@
               }
             ],
             "title": "Daily Contact Budget"
+          },
+          "emergency_text": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Emergency Text"
+          },
+          "handoff_text": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 1000
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Handoff Text"
+          },
+          "scripts_approved": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Scripts Approved"
           }
         },
         "additionalProperties": false,
@@ -4234,6 +4544,274 @@
           "new_password"
         ],
         "title": "PasswordChange"
+      },
+      "ProvisioningAdvanced": {
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Job Id"
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "calendar_connected",
+              "agent_created",
+              "number_assigned",
+              "verified",
+              "active",
+              "failed",
+              "manual_review"
+            ],
+            "title": "State"
+          },
+          "step": {
+            "type": "string",
+            "enum": [
+              "calendar",
+              "agent",
+              "number",
+              "verify"
+            ],
+            "title": "Step"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "job_id",
+          "state",
+          "step"
+        ],
+        "title": "ProvisioningAdvanced"
+      },
+      "ProvisioningAttempts": {
+        "properties": {
+          "calendar": {
+            "type": "integer",
+            "title": "Calendar"
+          },
+          "agent": {
+            "type": "integer",
+            "title": "Agent"
+          },
+          "number": {
+            "type": "integer",
+            "title": "Number"
+          },
+          "verify": {
+            "type": "integer",
+            "title": "Verify"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "calendar",
+          "agent",
+          "number",
+          "verify"
+        ],
+        "title": "ProvisioningAttempts"
+      },
+      "ProvisioningEventOut": {
+        "properties": {
+          "from_state": {
+            "type": "string",
+            "title": "From State"
+          },
+          "to_state": {
+            "type": "string",
+            "title": "To State"
+          },
+          "step": {
+            "type": "string",
+            "title": "Step"
+          },
+          "outcome": {
+            "type": "string",
+            "title": "Outcome"
+          },
+          "actor_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Actor Id"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "from_state",
+          "to_state",
+          "step",
+          "outcome",
+          "actor_id",
+          "created_at"
+        ],
+        "title": "ProvisioningEventOut"
+      },
+      "ProvisioningNumber": {
+        "properties": {
+          "phone_number_id": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9-]{1,64}$",
+            "title": "Phone Number Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "phone_number_id"
+        ],
+        "title": "ProvisioningNumber"
+      },
+      "ProvisioningOut": {
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "calendar_connected",
+              "agent_created",
+              "number_assigned",
+              "verified",
+              "active",
+              "failed",
+              "manual_review"
+            ],
+            "title": "State"
+          },
+          "resume_state": {
+            "type": "string",
+            "enum": [
+              "draft",
+              "calendar_connected",
+              "agent_created",
+              "number_assigned",
+              "verified",
+              "active",
+              "failed",
+              "manual_review"
+            ],
+            "title": "Resume State"
+          },
+          "agent_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Id"
+          },
+          "agent_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Name"
+          },
+          "tool_credential_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tool Credential Id"
+          },
+          "phone_number_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Number Id"
+          },
+          "attempts": {
+            "$ref": "#/components/schemas/ProvisioningAttempts"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "version": {
+            "type": "integer",
+            "title": "Version"
+          },
+          "updated_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Updated At"
+          },
+          "step_pending": {
+            "type": "boolean",
+            "title": "Step Pending"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/ProvisioningEventOut"
+            },
+            "type": "array",
+            "title": "Events"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "state",
+          "resume_state",
+          "agent_id",
+          "agent_name",
+          "tool_credential_id",
+          "phone_number_id",
+          "attempts",
+          "last_error",
+          "version",
+          "updated_at",
+          "step_pending",
+          "events"
+        ],
+        "title": "ProvisioningOut"
       },
       "ReminderOut": {
         "properties": {

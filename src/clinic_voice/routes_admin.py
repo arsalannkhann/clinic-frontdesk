@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import AwareDatetime
 
-from clinic_voice import admin, reminders, schedule_exceptions
+from clinic_voice import admin, provisioning, reminders, schedule_exceptions
 from clinic_voice.deps import database, require_role
 from clinic_voice.schemas import (
     ClinicConfig,
@@ -19,6 +19,9 @@ from clinic_voice.schemas import (
     HoursWindow,
     OutboxJobOut,
     OutboxStatus,
+    ProvisioningAdvanced,
+    ProvisioningNumber,
+    ProvisioningOut,
     ReminderOut,
     ReminderStatus,
     ServiceCreate,
@@ -29,6 +32,7 @@ from clinic_voice.schemas import (
 router = APIRouter(prefix="/v1/admin", tags=["admin"])
 reader = require_role("owner", "admin", "viewer")
 writer = require_role("owner", "admin")
+owner = require_role("owner")
 
 
 @router.get("/clinic", response_model=ClinicConfig)
@@ -158,3 +162,40 @@ def list_reminders(
     status=needs_review for contacts whose outcome is unknown."""
     with database() as conn:
         return reminders.list_reminders(conn, staff["clinic_id"], status, limit)
+
+
+@router.get("/provisioning", response_model=ProvisioningOut)
+def get_provisioning(staff=Depends(reader)):
+    """Provisioning state, provider ids (no secrets, no phone numbers) and recent events."""
+    with database() as conn:
+        return provisioning.view(conn, staff["clinic_id"])
+
+
+@router.post("/provisioning/advance", response_model=ProvisioningAdvanced, status_code=202)
+def advance_provisioning(staff=Depends(owner)):
+    """Enqueue the next provisioning step (owner). 409 if a step is already pending or the
+    state has no next step. A worker with a Bolna port runs it."""
+    with database() as conn:
+        return provisioning.advance(conn, staff)
+
+
+@router.post("/provisioning/number", response_model=ProvisioningOut)
+def select_provisioning_number(request: ProvisioningNumber, staff=Depends(owner)):
+    """Select an existing number of the Bolna account by id (owner). Nothing is purchased;
+    the number step checks the id against the account's numbers."""
+    with database() as conn:
+        return provisioning.select_number(conn, staff, request.phone_number_id)
+
+
+@router.post("/provisioning/activate", response_model=ProvisioningOut)
+def activate_provisioning(staff=Depends(owner)):
+    """verified -> active (owner). Does not enable outbound contact."""
+    with database() as conn:
+        return provisioning.activate(conn, staff)
+
+
+@router.post("/provisioning/reset", response_model=ProvisioningOut)
+def reset_provisioning(staff=Depends(owner)):
+    """failed | manual_review -> the state whose step must run again (owner)."""
+    with database() as conn:
+        return provisioning.reset(conn, staff)

@@ -144,6 +144,22 @@ ReminderLead = Annotated[int, Field(ge=60, le=10080)]
 ContactBudget = Annotated[int, Field(ge=0, le=100000)]
 
 
+def _plain_script(value):
+    # Spoken scripts: no control characters (newlines included) and no braces or percent
+    # signs, which Bolna would read as template variables or format specifiers.
+    if isinstance(value, str) and re.search(r"[\x00-\x1f\x7f{}%]", value):
+        raise ValueError("control characters, braces and percent signs are not allowed")
+    return value
+
+
+# Empty clears the text (and with it the approval).
+ScriptText = Annotated[
+    str,
+    BeforeValidator(_plain_script),
+    StringConstraints(strip_whitespace=True, max_length=1000),
+]
+
+
 class ClinicConfig(StrictModel):
     id: UUID
     name: str
@@ -157,6 +173,11 @@ class ClinicConfig(StrictModel):
     quiet_hours_end: str
     reminder_lead_minutes: int
     daily_contact_budget: int
+    # Clinic-approved scripts (T10). scripts_approved is cleared whenever a text changes
+    # without being approved in the same request; activation requires both, approved.
+    emergency_text: str
+    handoff_text: str
+    scripts_approved: bool
 
 
 class ClinicUpdate(PatchModel):
@@ -169,6 +190,9 @@ class ClinicUpdate(PatchModel):
     quiet_hours_end: ClockTime | None = None
     reminder_lead_minutes: ReminderLead | None = None
     daily_contact_budget: ContactBudget | None = None
+    emergency_text: ScriptText | None = None
+    handoff_text: ScriptText | None = None
+    scripts_approved: bool | None = None
 
     @model_validator(mode="after")
     def _quiet_window(self):
@@ -644,3 +668,59 @@ class WebhookReceipt(StrictModel):
     """accepted: stored with a processing job. duplicate: this event was already stored."""
 
     status: Literal["accepted", "duplicate"]
+
+
+# Clinic provisioning (T10, routes_admin.py)
+ProvisioningState = Literal[
+    "draft",
+    "calendar_connected",
+    "agent_created",
+    "number_assigned",
+    "verified",
+    "active",
+    "failed",
+    "manual_review",
+]
+# A Bolna phone number id from GET /phone-numbers/all (never the number itself).
+PhoneNumberId = Annotated[str, Field(pattern=r"^[A-Za-z0-9-]{1,64}$")]
+
+
+class ProvisioningEventOut(StrictModel):
+    from_state: str
+    to_state: str
+    step: str
+    outcome: str
+    actor_id: UUID | None
+    created_at: AwareDatetime
+
+
+class ProvisioningAttempts(StrictModel):
+    calendar: int
+    agent: int
+    number: int
+    verify: int
+
+
+class ProvisioningOut(StrictModel):
+    state: ProvisioningState
+    resume_state: ProvisioningState  # Where a reset returns.
+    agent_id: str | None
+    agent_name: str | None  # Deterministic provider reference used for lookups.
+    tool_credential_id: UUID | None  # The agent's tool credential (id only).
+    phone_number_id: str | None
+    attempts: ProvisioningAttempts
+    last_error: str | None
+    version: int  # 0 until provisioning has started.
+    updated_at: AwareDatetime | None
+    step_pending: bool
+    events: list[ProvisioningEventOut]  # Newest first, at most 50.
+
+
+class ProvisioningNumber(StrictModel):
+    phone_number_id: PhoneNumberId
+
+
+class ProvisioningAdvanced(StrictModel):
+    job_id: UUID
+    state: ProvisioningState
+    step: Literal["calendar", "agent", "number", "verify"]

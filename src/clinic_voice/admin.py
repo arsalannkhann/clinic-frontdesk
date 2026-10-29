@@ -26,8 +26,10 @@ def _update(conn, table, columns, clinic_id, row_id, changes):
 
 CLINIC_COLUMNS = (
     "id,name,timezone,lead_time_minutes,horizon_days,outbound_enabled,quiet_hours_start,"
-    "quiet_hours_end,reminder_lead_minutes,daily_contact_budget"
+    "quiet_hours_end,reminder_lead_minutes,daily_contact_budget,emergency_text,handoff_text,"
+    "scripts_approved"
 )
+SCRIPT_COLUMNS = ("emergency_text", "handoff_text")
 
 
 def _clinic_out(row):
@@ -57,6 +59,10 @@ def update_clinic(conn, staff, changes):
     settings apply to contacts planned or attempted afterwards: each send re-checks
     outbound_enabled, quiet hours and the budget. A change of outbound_enabled is audited
     separately ('clinic.outbound_enabled' / 'clinic.outbound_disabled').
+
+    Emergency and handoff scripts (T10): changing either text clears scripts_approved unless
+    the same request sets it; approval needs both texts non-empty (422 otherwise) and is
+    audited as 'clinic.scripts_approved'.
     """
     clinic_id = staff["clinic_id"]
     columns = (
@@ -69,21 +75,32 @@ def update_clinic(conn, staff, changes):
         "quiet_hours_end",
         "reminder_lead_minutes",
         "daily_contact_budget",
+        *SCRIPT_COLUMNS,
+        "scripts_approved",
     )
     if not changes or not set(changes) <= set(columns):
         raise ValueError("invalid update columns")
+    changes = dict(changes)
+    if set(SCRIPT_COLUMNS) & set(changes) and "scripts_approved" not in changes:
+        changes["scripts_approved"] = False  # Edited text must be approved again.
     try:
         row = conn.execute(
             f"UPDATE clinics SET {', '.join(f'{k}=%s' for k in changes)} WHERE id=%s"  # noqa: S608
             f" RETURNING {CLINIC_COLUMNS}",
             (*changes.values(), clinic_id),
         ).fetchone()
-    except CheckViolation:
-        # The only clinic CHECK the request model cannot see: start = end after a
-        # one-sided change.
+    except CheckViolation as error:
+        # The clinic CHECKs the request model cannot see: quiet start = end after a one-sided
+        # change, and approval of an empty script.
         conn.rollback()
+        if error.diag.constraint_name == "clinics_scripts_approved_check":
+            raise HTTPException(
+                422, "emergency and handoff texts are required before approval"
+            ) from None
         raise HTTPException(422, "quiet hours start and end must differ") from None
     audit(conn, clinic_id, staff["id"], "clinic.updated", clinic_id)
+    if changes.get("scripts_approved"):
+        audit(conn, clinic_id, staff["id"], "clinic.scripts_approved", clinic_id)
     if "outbound_enabled" in changes:
         action = (
             "clinic.outbound_enabled" if changes["outbound_enabled"] else "clinic.outbound_disabled"
@@ -269,6 +286,10 @@ def requeue_outbox(conn, staff, job_id):
         raise HTTPException(404, NOT_FOUND)
     if peek["status"] != "dead":
         raise HTTPException(409, "Only dead jobs can be requeued")
+    if peek["kind"] == "provision.step":
+        # Its dead-letter hook moved provisioning to manual_review; recover with reset and
+        # advance (owner), which re-check the state and keep one step in flight.
+        raise HTTPException(409, "Provisioning steps are re-run with reset and advance")
     if peek["appointment_id"] is not None:
         conn.execute(
             "SELECT id FROM appointments WHERE clinic_id=%s AND id=%s FOR UPDATE",

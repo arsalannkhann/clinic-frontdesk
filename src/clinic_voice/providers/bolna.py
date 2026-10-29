@@ -5,8 +5,8 @@ Endpoints follow the official API reference recorded in docs/SOURCE_REVIEW.md (c
 only. Number purchase is deliberately not implemented.
 
 Error mapping (shared ProviderError classes from providers/calendar.py). Writes are
-create/update agent, inbound setup, start call and stop call; reads are get execution and
-list phone numbers.
+create/update agent, inbound setup, start call and stop call; reads are get agent, list
+agents, get execution and list phone numbers.
 - Reads: 429 and 5xx are ProviderRetryable (with Retry-After when present); nothing changed.
 - Writes: 5xx is ProviderTimeout('http_<status>'): the provider may have acted before
   failing, so the outcome is unknown and must be looked up before any retry. 429 is
@@ -14,12 +14,17 @@ list phone numbers.
   number is still activating and no call was queued; wait retry_after_seconds); on other
   writes it is ProviderTimeout('http_429') as well.
 - 401/403: ProviderPermanent('unauthorized'); other 4xx: ProviderPermanent('http_<status>').
-  get_execution 404 is None.
+  get_execution and get_agent 404 are None (Bolna documents no 404 for GET /v2/agent/{id};
+  our assumption).
 - Any 2xx on a write is accepted. A 2xx whose body lacks the expected id (create agent,
   start call) is ProviderTimeout('malformed'): the write may have happened.
 - Timeouts: on writes a timeout after the request may have been sent is ProviderTimeout
   (outcome unknown, never success). On reads, and for connection failures before anything
   was sent, ProviderRetryable.
+
+summarize_agent() is the single allowlist for agent data (GET /v2/agent/{id} and
+/v2/agent/all): id, agent_name, each tool's URL and the credential id parsed from each
+tool's api_token. The token's secret part, prompts and every other field are dropped.
 
 minimize_execution() is the single allowlist for execution data (webhook bodies and
 GET /executions alike); STATUS_RANK and FINAL_STATUSES define the monotonic status order
@@ -41,6 +46,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 
+from clinic_voice import credentials
 from clinic_voice.providers.calendar import (
     ProviderError,
     ProviderPermanent,
@@ -239,9 +245,70 @@ class PhoneNumber:
     telephony_provider: str | None
 
 
+@dataclass(frozen=True)
+class Agent:
+    """Allowlisted agent fields. tool_urls maps tool name -> URL; token_credential_ids holds,
+    per tool, the tenant credential id (hex) of its api_token, or None when the token is
+    absent, masked or not a tool credential. No secret, prompt or other field is kept."""
+
+    id: str
+    name: str | None
+    tool_urls: dict = field(default_factory=dict)
+    token_credential_ids: tuple = ()
+
+
+def _maybe_json(value):
+    # The API reference types api_tools.tools as "a JSON string"; accept either form.
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value
+
+
+def _credential_id(api_token) -> str | None:
+    if not isinstance(api_token, str):
+        return None
+    scheme, _, token = api_token.partition(" ")
+    parsed = credentials.parse(token if scheme == "Bearer" else api_token)
+    return None if parsed is None else parsed[0].hex
+
+
+def summarize_agent(body) -> Agent | None:
+    """The allowlisted fields of an AgentV2 body (GET /v2/agent/{id}, items of
+    /v2/agent/all), or None without a usable id. The api_token secret is never kept."""
+    if not isinstance(body, dict):
+        return None
+    agent_id = body.get("id")
+    if not isinstance(agent_id, str) or not SAFE_ID.fullmatch(agent_id):
+        return None
+    name = body.get("agent_name")
+    urls, token_ids = {}, []
+    tasks = body.get("tasks")
+    for task in tasks if isinstance(tasks, list) else []:
+        tools_config = task.get("tools_config") if isinstance(task, dict) else None
+        api_tools = _maybe_json((tools_config or {}).get("api_tools"))
+        params = _maybe_json(api_tools.get("tools_params")) if isinstance(api_tools, dict) else None
+        for tool_name, entry in (params or {}).items() if isinstance(params, dict) else ():
+            if not isinstance(entry, dict) or not isinstance(tool_name, str):
+                continue
+            url = entry.get("url")
+            urls[tool_name] = url if isinstance(url, str) else None
+            token_ids.append(_credential_id(entry.get("api_token")))
+    return Agent(agent_id, name if isinstance(name, str) else None, urls, tuple(token_ids))
+
+
 class BolnaPort(Protocol):
     def create_agent(self, payload: dict) -> str:
         """POST /v2/agent. Returns the new agent id."""
+
+    def get_agent(self, agent_id: str) -> Agent | None:
+        """GET /v2/agent/{agent_id}, summarized; None when unknown."""
+
+    def list_agents(self) -> list[Agent]:
+        """GET /v2/agent/all, summarized (used to find an agent by its deterministic name
+        after an ambiguous create)."""
 
     def update_agent(self, agent_id: str, payload: dict) -> None:
         """PUT /v2/agent/{agent_id}: full replacement (PATCH cannot change tools_config)."""
@@ -284,13 +351,21 @@ class FakeBolna:
 
     Fault injection: fail_next(op, n, error_type) makes the next n calls of that method raise
     error_type (recorded in `calls`, nothing changed); timeout_after_call makes the next
-    start_outbound_call queue the call and then raise ProviderTimeout (outcome unknown)."""
+    start_outbound_call queue the call and then raise ProviderTimeout (outcome unknown);
+    timeout_after_write.add(op) does the same once for create_agent, update_agent or
+    assign_phone_number (the write happens, the caller sees a timeout).
+
+    consistent_agent_lookup: whether list_agents reflects every completed create at once.
+    The fake's listing is consistent; Bolna documents no such guarantee (BolnaClient: False)."""
+
+    consistent_agent_lookup = True
 
     def __init__(self, phone_numbers: list[PhoneNumber] | None = None):
         self._lock = Lock()
         self._counter = 0
         self._failures: dict[str, list[type[ProviderError]]] = {}
         self.timeout_after_call = False
+        self.timeout_after_write: set[str] = set()
         self.calls: list[tuple[str, tuple]] = []
         self.agents: dict[str, dict] = {}
         self.executions: dict[str, Execution] = {}
@@ -314,19 +389,46 @@ class FakeBolna:
         self._counter += 1
         return str(uuid5(NAMESPACE_URL, f"fake-bolna:{kind}:{self._counter}"))
 
+    def _written(self, op):
+        if op in self.timeout_after_write:
+            self.timeout_after_write.discard(op)
+            raise ProviderTimeout()
+
     def create_agent(self, payload):
         with self._lock:
             self.calls.append(("create_agent", (payload,)))
+            self._injected("create_agent")
             agent_id = self._next_id("agent")
             self.agents[agent_id] = payload
+            self._written("create_agent")
             return agent_id
 
     def update_agent(self, agent_id, payload):
         with self._lock:
             self.calls.append(("update_agent", (agent_id, payload)))
+            self._injected("update_agent")
             if agent_id not in self.agents:
                 raise ProviderPermanent("http_404")
             self.agents[agent_id] = payload
+            self._written("update_agent")
+
+    def _summary(self, agent_id):
+        config = (self.agents[agent_id] or {}).get("agent_config") or {}
+        return summarize_agent(
+            {"id": agent_id, "agent_name": config.get("agent_name"), "tasks": config.get("tasks")}
+        )
+
+    def get_agent(self, agent_id):
+        with self._lock:
+            self.calls.append(("get_agent", (agent_id,)))
+            self._injected("get_agent")
+            return self._summary(agent_id) if agent_id in self.agents else None
+
+    def list_agents(self):
+        with self._lock:
+            self.calls.append(("list_agents", ()))
+            self._injected("list_agents")
+            return [self._summary(agent_id) for agent_id in self.agents]
 
     def get_execution(self, execution_id):
         with self._lock:
@@ -336,16 +438,19 @@ class FakeBolna:
     def list_phone_numbers(self):
         with self._lock:
             self.calls.append(("list_phone_numbers", ()))
+            self._injected("list_phone_numbers")
             return list(self.phone_numbers)
 
     def assign_phone_number(self, phone_number_id, agent_id):
         with self._lock:
             self.calls.append(("assign_phone_number", (phone_number_id, agent_id)))
+            self._injected("assign_phone_number")
             for index, number in enumerate(self.phone_numbers):
                 if number.id == phone_number_id:
                     self.phone_numbers[index] = PhoneNumber(
                         number.id, number.phone_number, agent_id, number.telephony_provider
                     )
+                    self._written("assign_phone_number")
                     return
             raise ProviderPermanent("http_400")
 
@@ -430,6 +535,10 @@ class _Overrun(Exception):
 
 class BolnaClient:
     """BolnaPort over the Bolna REST API with a bearer API key."""
+
+    # Bolna documents no read-after-write guarantee for GET /v2/agent/all, so a create whose
+    # outcome is unknown and that the listing does not show is not retried (manual review).
+    consistent_agent_lookup = False
 
     def __init__(
         self,
@@ -517,6 +626,29 @@ class BolnaClient:
         response = self._send("PUT", f"/v2/agent/{_safe_id(agent_id)}", write=True, json=payload)
         if not response.is_success:
             raise _error_for(response, write=True)
+
+    def get_agent(self, agent_id):
+        response = self._send("GET", f"/v2/agent/{_safe_id(agent_id)}", write=False)
+        if response.status_code == 404:
+            return None
+        if response.status_code != 200:
+            raise _error_for(response)
+        agent = summarize_agent(_json(response))
+        if agent is None:
+            raise ProviderRetryable("malformed")
+        return agent
+
+    def list_agents(self):
+        response = self._send("GET", "/v2/agent/all", write=False)
+        if response.status_code != 200:
+            raise _error_for(response)
+        body = _json(response)
+        if not isinstance(body, list):
+            raise ProviderRetryable("malformed")
+        agents = [summarize_agent(item) for item in body]
+        if any(agent is None for agent in agents):
+            raise ProviderRetryable("malformed")
+        return agents
 
     def get_execution(self, execution_id):
         response = self._send("GET", f"/executions/{_safe_id(execution_id)}", write=False)

@@ -89,9 +89,10 @@ class Ports:
     clinic_id, account_id) when the provider rejected the account's credentials, and
     revoke_grant(conn, clinic_id, account_id) for calendar.revoke_grant jobs.
 
-    `bolna` is the Bolna platform port for bolna.reconcile and reminder calls (FakeBolna or
-    BolnaClient). None: reconciliation and reminder calls are not enqueued by this worker's
-    housekeeping, and the worker claims neither bolna.reconcile nor reminder.call jobs.
+    `bolna` is the Bolna platform port for bolna.reconcile, reminder calls and provisioning
+    (FakeBolna or BolnaClient). None: reconciliation and reminder calls are not enqueued by
+    this worker's housekeeping, and the worker claims no bolna.reconcile, reminder.call or
+    provision.step jobs.
 
     `messaging` is the patient messaging port for notification.send (FakeMessaging only; no
     live provider exists). None: the worker does not claim notification.send jobs."""
@@ -205,14 +206,14 @@ def _run_on_dead(conn, job):
 
 
 # Kinds a worker claims only when it has the port they need.
-BOLNA_KINDS = ("bolna.reconcile", "reminder.call")
+BOLNA_KINDS = ("bolna.reconcile", "reminder.call", "provision.step")
 MESSAGING_KINDS = ("notification.send",)
 
 
 def excluded_kinds(ports) -> tuple[str, ...] | None:
     """Kinds this worker must leave to another worker (neither attempted nor dead-lettered
-    here): bolna.reconcile and reminder.call without a Bolna port, notification.send without
-    a messaging port."""
+    here): bolna.reconcile, reminder.call and provision.step without a Bolna port,
+    notification.send without a messaging port."""
     excluded = ()
     if getattr(ports, "bolna", None) is None:
         excluded += BOLNA_KINDS
