@@ -264,17 +264,25 @@ def bolna_command(url, args, settings):
 
 
 def bolna_agent_command(url, args):
-    """Record (or clear) the clinic's Bolna agent id. Webhooks naming another agent are
-    then refused. Nothing is sent to Bolna."""
+    """Record (or clear) the clinic's Bolna agent id: the inbound agent (webhooks naming
+    another agent are then refused), or with --outbound the separate agent used for reminder
+    calls, which must not be the inbound agent and must carry no booking tools (an owner
+    review item, docs/OPERATIONS.md). Nothing is sent to Bolna."""
+    import psycopg
+
     agent_id = None if args.clear else str(args.agent_id)
+    column = "bolna_outbound_agent_id" if args.outbound else "bolna_agent_id"
     with connect(url) as conn:
-        row = conn.execute(
-            "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s RETURNING id",
-            (agent_id, args.clinic),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                f"UPDATE clinics SET {column}=%s WHERE id=%s RETURNING id",  # noqa: S608
+                (agent_id, args.clinic),
+            ).fetchone()
+        except psycopg.errors.CheckViolation:
+            raise SystemExit("The outbound agent must differ from the inbound agent") from None
     if row is None:
         raise SystemExit("Clinic not found")
-    print(f"bolna_agent_id={agent_id or ''}")
+    print(f"{column}={agent_id or ''}")
 
 
 def retention_command(url, args, settings):
@@ -351,6 +359,9 @@ def main(argv=None):
         "set-agent", help="Record the clinic's Bolna agent id (webhook cross-check)"
     )
     set_agent.add_argument("--clinic", type=UUID, required=True)
+    set_agent.add_argument(
+        "--outbound", action="store_true", help="Set the reminder-call agent instead"
+    )
     agent_choice = set_agent.add_mutually_exclusive_group(required=True)
     agent_choice.add_argument("--agent-id", type=UUID)
     agent_choice.add_argument("--clear", action="store_true")

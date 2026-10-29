@@ -1361,6 +1361,76 @@
         }
       }
     },
+    "/v1/admin/appointments/{appointment_id}/opt-out/remove": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Remove Opt Out",
+        "description": "Undo an opt-out of exactly (purpose, channel) for the appointment's patient (the\npatient-wide one and the one for this appointment). Suppressed contacts stay suppressed.",
+        "operationId": "remove_opt_out_v1_admin_appointments__appointment_id__opt_out_remove_post",
+        "parameters": [
+          {
+            "name": "appointment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Appointment Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StaffOptOut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StaffOptOutRemoved"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/admin/calendar/google/start": {
       "post": {
         "tags": [
@@ -3001,6 +3071,11 @@
             ],
             "title": "Scope",
             "default": "all"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
           }
         },
         "additionalProperties": false,
@@ -3010,13 +3085,17 @@
           "booking_reference"
         ],
         "title": "BolnaOptOut",
-        "description": "Opt the patient of a booking verified on this call out of reminders and confirmations\non the given channels (\"all\", \"calls\" or \"messages\")."
+        "description": "Stop reminders and confirmations of one booking verified on this call, on the given\nchannels (\"all\", \"calls\" or \"messages\"). Never covers the patient's other bookings.\nconfirmed=false only reads the change back; call again with confirmed=true."
       },
       "BolnaOptOutOut": {
         "properties": {
           "opted_out": {
             "type": "boolean",
             "title": "Opted Out"
+          },
+          "booking_reference": {
+            "type": "string",
+            "title": "Booking Reference"
           },
           "scope": {
             "type": "string",
@@ -3031,10 +3110,12 @@
         "type": "object",
         "required": [
           "opted_out",
+          "booking_reference",
           "scope",
           "spoken"
         ],
-        "title": "BolnaOptOutOut"
+        "title": "BolnaOptOutOut",
+        "description": "opted_out=false: nothing was changed (read back and call again with confirmed=true)."
       },
       "BolnaReschedule": {
         "properties": {
@@ -4686,6 +4767,30 @@
           "suppressed"
         ],
         "title": "StaffOptOutOut"
+      },
+      "StaffOptOutRemoved": {
+        "properties": {
+          "purpose": {
+            "type": "string",
+            "title": "Purpose"
+          },
+          "channel": {
+            "type": "string",
+            "title": "Channel"
+          },
+          "removed": {
+            "type": "integer",
+            "title": "Removed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "purpose",
+          "channel",
+          "removed"
+        ],
+        "title": "StaffOptOutRemoved"
       },
       "StaffUser": {
         "properties": {

@@ -17,5 +17,5 @@ HANDLERS: dict[str, Handler] = {
     "bolna.reconcile": Handler(bolna.reconcile),
     "notification.send": Handler(reminders.send_message, on_dead=reminders.contact_on_dead),
     "reminder.call": Handler(reminders.place_call, on_dead=reminders.contact_on_dead),
-    "reminder.stop": Handler(reminders.stop),
+    "reminder.stop": Handler(reminders.stop, on_dead=reminders.stop_on_dead),
 }

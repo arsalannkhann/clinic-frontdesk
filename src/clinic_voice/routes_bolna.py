@@ -106,6 +106,7 @@ def reserve_slot(request: BolnaReservation, response: Response, clinic_id=Depend
     crypto = gateway.session_crypto(settings)
     with database() as conn:
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        gateway.refuse_reminder_call(conn, clinic_id, request)
         doctor_id, service_id = gateway.resolve(conn, clinic_id, request.doctor, request.service)
     # The lookup connection is closed before service.reserve opens its own.
     return gateway.reserve(
@@ -135,6 +136,7 @@ def verify_booking(query: BolnaVerify, response: Response, clinic_id=Depends(ten
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         session_id = gateway.upsert_session(conn, clinic_id, query, crypto)
+        gateway.refuse_reminder_call(conn, clinic_id, query)
         return bookings.verify(conn, clinic_id, session_id, query, crypto[1])
 
 
@@ -144,6 +146,7 @@ def cancel_booking(request: BolnaCancel, response: Response, clinic_id=Depends(t
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        gateway.refuse_reminder_call(conn, clinic_id, request)
         return bookings.cancel(conn, clinic_id, session_id, request)
 
 
@@ -154,6 +157,7 @@ def reschedule_booking(request: BolnaReschedule, response: Response, clinic_id=D
     crypto = gateway.session_crypto(settings)
     with database() as conn:
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        gateway.refuse_reminder_call(conn, clinic_id, request)
     return bookings.reschedule(
         settings.database_url.get_secret_value(),
         clinic_id,
@@ -171,4 +175,5 @@ def opt_out(request: BolnaOptOut, response: Response, clinic_id=Depends(tenant))
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        gateway.refuse_reminder_call(conn, clinic_id, request)
         return bookings.opt_out(conn, clinic_id, session_id, request)

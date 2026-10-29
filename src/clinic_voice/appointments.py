@@ -241,3 +241,24 @@ def staff_opt_out(conn, staff, appointment_id, purpose, channel):
     )
     audit(conn, clinic_id, staff["id"], "patient.opted_out", appointment_id)
     return {"purpose": purpose, "channel": channel, "suppressed": suppressed}
+
+
+def staff_remove_opt_out(conn, staff, appointment_id, purpose, channel):
+    """Undo an opt-out (owner/admin, e.g. the patient asked the clinic for reminders again):
+    delete the opt-outs of exactly (purpose, channel) covering this appointment, patient-wide
+    or for this appointment. Contacts already suppressed stay suppressed; later ones are
+    planned again. Audited with the appointment id as target."""
+    clinic_id = staff["clinic_id"]
+    row = conn.execute(
+        "SELECT patient_id FROM appointments WHERE clinic_id=%s AND id=%s",
+        (clinic_id, appointment_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, NOT_FOUND)
+    if row["patient_id"] is None:
+        raise HTTPException(409, "Appointment has no patient record")
+    removed = reminders.remove_opt_out(
+        conn, clinic_id, row["patient_id"], appointment_id, purpose, channel
+    )
+    audit(conn, clinic_id, staff["id"], "patient.opt_out_removed", appointment_id)
+    return {"purpose": purpose, "channel": channel, "removed": removed}

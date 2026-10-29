@@ -490,11 +490,13 @@ def _opt_out_scope(value):
 
 
 class BolnaOptOut(BolnaCallContext):
-    """Opt the patient of a booking verified on this call out of reminders and confirmations
-    on the given channels ("all", "calls" or "messages")."""
+    """Stop reminders and confirmations of one booking verified on this call, on the given
+    channels ("all", "calls" or "messages"). Never covers the patient's other bookings.
+    confirmed=false only reads the change back; call again with confirmed=true."""
 
     booking_reference: SpokenReference
     scope: Annotated[Literal["all", "calls", "messages"], BeforeValidator(_opt_out_scope)] = "all"
+    confirmed: ReadBack = False
 
 
 class BolnaSlotsOut(StrictModel):
@@ -540,7 +542,10 @@ class BolnaChangeOut(StrictModel):
 
 
 class BolnaOptOutOut(StrictModel):
+    """opted_out=false: nothing was changed (read back and call again with confirmed=true)."""
+
     opted_out: bool
+    booking_reference: str
     scope: str
     spoken: str
 
@@ -599,6 +604,12 @@ class StaffOptOutOut(StrictModel):
     purpose: str
     channel: str
     suppressed: int  # Unsent contacts suppressed by this request.
+
+
+class StaffOptOutRemoved(StrictModel):
+    purpose: str
+    channel: str
+    removed: int  # Opt-outs deleted; contacts already suppressed stay suppressed.
 
 
 ReminderStatus = Literal[

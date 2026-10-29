@@ -18,6 +18,17 @@ Adapter obligations (the same error classes and rules as the calendar and Bolna 
 - get_message(reference) returns the message sent under that reference, or None if the
   provider has none. The worker calls it after an ambiguous timeout before any new send.
 - Non-fake adapters declare `timeout_seconds` (outbox.check_ports).
+- Every adapter declares two capabilities, which are provider acceptance criteria to be
+  proven from the provider's official documentation (docs/SOURCE_REVIEW.md) and contract
+  fixtures before they are set True:
+  - idempotent_reference: the provider deduplicates sends by our reference, so a second
+    send with the same reference never delivers a second message (for at least as long as a
+    contact can stay unsettled: EXPIRY in reminders.py);
+  - consistent_lookup: get_message is read-after-write consistent, so None means the
+    provider never accepted a message under that reference (not "not indexed yet").
+  After an ambiguous attempt whose lookup returns None, the worker sends again only when
+  both are True; otherwise the contact goes to needs_review and is never resent
+  automatically (a resend could deliver a duplicate).
 
 Message bodies are composed by the worker at send time and handed to the port only; they are
 never stored, logged or put in outbox payloads.
@@ -40,6 +51,9 @@ class SentMessage:
 
 
 class MessagingPort(Protocol):
+    idempotent_reference: bool
+    consistent_lookup: bool
+
     def send_message(self, to: str, body: str, reference: str) -> str:
         """Send one message; returns the provider message id."""
 
@@ -50,14 +64,19 @@ class MessagingPort(Protocol):
 class FakeMessaging:
     """Deterministic in-memory MessagingPort for tests and local development.
 
-    It does not deduplicate by reference (a real provider might not either), so tests prove
+    By default it behaves like a provider that meets both acceptance criteria:
+    idempotent_reference (a second send with a known reference returns the first message id
+    and delivers nothing) and consistent_lookup. Tests set either False to model a provider
+    that does not. With idempotent_reference False it delivers every send, so tests prove
     that the worker reconciles instead of re-sending. `sent` records (to, body, reference) of
     every delivered message, in order. Fault injection: fail_next(n, error_type) makes the
     next n operations (send or lookup) raise error_type; timeout_after_send delivers the next
     message and then raises ProviderTimeout; timeout_before_send raises ProviderTimeout
     without delivering. `lookups` counts get_message calls."""
 
-    def __init__(self):
+    def __init__(self, idempotent_reference: bool = True, consistent_lookup: bool = True):
+        self.idempotent_reference = idempotent_reference
+        self.consistent_lookup = consistent_lookup
         self._lock = Lock()
         self._counter = 0
         self._failures: list[type[ProviderError]] = []
@@ -84,6 +103,8 @@ class FakeMessaging:
             if self.timeout_before_send:
                 self.timeout_before_send = False
                 raise ProviderTimeout()
+            if self.idempotent_reference and reference in self.by_reference:
+                return self.by_reference[reference]
             self._counter += 1
             message_id = str(uuid5(NAMESPACE_URL, f"fake-message:{self._counter}"))
             self.sent.append((to, body, reference))

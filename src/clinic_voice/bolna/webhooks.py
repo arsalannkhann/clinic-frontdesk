@@ -229,7 +229,9 @@ def enqueue_reconciles(conn, after: timedelta, limit: int) -> int:
 # not documented as fixed codes (docs/SOURCE_REVIEW.md), and the free-text and
 # extracted_data fields are never stored. Nothing is inferred from them. Once Bolna documents
 # such a field (or the owner approves a contract-tested extraction schema), map it here and
-# record it with reminders.opt_out(..., source="webhook") in the webhook.process transaction.
+# record it with reminders.opt_out(..., source="webhook", appointment_id=<the reminder
+# call's appointment>) in the webhook.process transaction (never patient-wide: only staff
+# write patient-wide opt-outs).
 OPT_OUT_DISPOSITIONS: frozenset[str] = frozenset()
 
 

@@ -14,6 +14,7 @@ from threading import Barrier
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 
@@ -47,6 +48,7 @@ OTHER_CALLER = "+910000000456"
 NAME = "Synthetic Patient Alpha"
 OTHER_NAME = "Synthetic Patient Gamma"
 AGENT = "11111111-1111-4111-8111-111111111111"
+OUTBOUND = "22222222-2222-4222-8222-222222222222"
 OTHER_CLINIC = UUID("00000000-0000-4000-8000-0000000000c1")
 PASSWORD = "synthetic-password-01"
 CAL = "booking@example.test"
@@ -74,8 +76,9 @@ def env(database, monkeypatch):
     with connect(database) as conn:
         conn.execute("INSERT INTO clinics (id,name) VALUES (%s,'Other Synthetic')", (OTHER_CLINIC,))
         conn.execute(
-            "UPDATE clinics SET outbound_enabled=true, bolna_agent_id=%s WHERE id=%s",
-            (AGENT, CLINIC),
+            "UPDATE clinics SET outbound_enabled=true, bolna_agent_id=%s,"
+            " bolna_outbound_agent_id=%s WHERE id=%s",
+            (AGENT, OUTBOUND, CLINIC),
         )
         conn.execute("UPDATE doctors SET booking_calendar_id=%s WHERE clinic_id=%s", (CAL, CLINIC))
         _, token = credentials.issue(conn, CLINIC, "t9")
@@ -249,7 +252,12 @@ def test_no_consent_no_contact(env):
     made = book(env, consents={})
     confirm(env)
     assert rows(env["url"], "SELECT status FROM appointments")[0]["status"] == "confirmed"
-    assert contacts(env) == []
+    # Each refused contact is recorded as suppressed (so it is never planned again) with no job.
+    assert {(r["purpose"], r["channel"], r["status"], r["last_error"]) for r in contacts(env)} == {
+        ("booking_confirmation", "message", "suppressed", "no_consent"),
+        ("reminder", "call", "suppressed", "no_consent"),
+        ("reminder", "message", "suppressed", "no_consent"),
+    }
     assert jobs(env, "notification.send") == [] and jobs(env, "reminder.call") == []
     for moment in (NOW.replace(hour=9, minute=0), REMINDER_AT):
         at(env, moment)
@@ -259,9 +267,10 @@ def test_no_consent_no_contact(env):
     assert env["ports"].messaging.sent == [] and calls(env) == []
     # A declined consent is the same as none.
     declined = {key: "false" for key in ALL_CONSENTS}
-    book(env, consents=declined, starts_at=SLOT + timedelta(hours=1), name=OTHER_NAME)
+    other = book(env, consents=declined, starts_at=SLOT + timedelta(hours=1), name=OTHER_NAME)
     confirm(env)
-    assert contacts(env) == [] and made["status"] == "pending_sync"
+    assert {r["status"] for r in contacts(env, other["appointment_id"])} == {"suppressed"}
+    assert jobs(env, "notification.send") == [] and made["status"] == "pending_sync"
 
 
 def test_outbound_disabled_no_contact(env):
@@ -327,8 +336,11 @@ def test_confirmation_and_reminders_are_sent_once(env, caplog):
     at(env, REMINDER_AT + timedelta(minutes=1))
     work(env)
     [(agent, recipient, origin, scheduled, user_data)] = calls(env)
-    assert (agent, recipient, origin, scheduled) == (AGENT, CALLER, None, None)
-    assert user_data["booking_reference"] == made["booking_reference"]
+    # The separate outbound agent, never the inbound agent that carries the booking tools.
+    assert (agent, recipient, origin, scheduled) == (OUTBOUND, CALLER, None, None)
+    # No booking reference: it is what verifies a caller, and the answerer is unverified.
+    assert "booking_reference" not in user_data
+    assert made["booking_reference"] not in str(user_data)
     assert user_data["contact_reference"] == call["provider_reference"]
     assert NAME not in str(user_data)
     placed = contact(env, appointment_id, "reminder", "call")
@@ -459,6 +471,7 @@ def test_send_time_budget_counts_attempted_contacts(env):
         (r["status"], r["scheduled_for"])
         for r in contacts(env)
         if r["appointment_id"] in (UUID(first["appointment_id"]), UUID(second["appointment_id"]))
+        and r["purpose"] == "booking_confirmation"
     )
     # The second confirmation waits for tomorrow's budget (09:00 IST), still before the slot.
     assert statuses == [
@@ -585,7 +598,7 @@ def test_reschedule_creates_new_reminders_and_stops_old(env):
     at(env, moved - timedelta(hours=24))
     work(env)
     assert len(calls(env)) == 1
-    assert calls(env)[0][4]["booking_reference"] == r.json()["booking_reference"]
+    assert r.json()["booking_reference"] not in str(calls(env)[0][4])
 
 
 # Ambiguous timeouts
@@ -701,9 +714,13 @@ def test_retryable_call_error_retries_and_permanent_fails(env):
 # Opt-out
 
 
-def opt_out(env, execution_id, reference, scope="all", number=CALLER, token=None):
+def opt_out(env, execution_id, reference, scope="all", number=CALLER, token=None, confirmed=True):
+    extra = {"confirmed": "true"} if confirmed else {}
     return post(
-        env, OPT_OUT, body(execution_id, number, booking_reference=reference, scope=scope), token
+        env,
+        OPT_OUT,
+        body(execution_id, number, booking_reference=reference, scope=scope, **extra),
+        token,
     )
 
 
@@ -722,17 +739,25 @@ def test_opt_out_tool_requires_verification_and_suppresses(env):
     assert opt_out(env, session, mine["booking_reference"], token=env["other"]).status_code == 403
     assert rows(env["url"], "SELECT * FROM contact_preferences") == []
     assert verify(env, session, mine["booking_reference"]).status_code == 200
+    # Without confirmed=true the change is only read back.
+    r = opt_out(env, session, mine["booking_reference"], scope="calls", confirmed=False)
+    assert r.status_code == 200 and r.json()["opted_out"] is False
+    assert (
+        "Please confirm" in r.json()["spoken"] and "Nothing has been changed" in r.json()["spoken"]
+    )
+    assert rows(env["url"], "SELECT * FROM contact_preferences") == []
     r = opt_out(env, session, mine["booking_reference"], scope="calls")
     assert r.status_code == 200, r.text
     assert r.json()["opted_out"] is True and "calls" in r.json()["spoken"]
     assert r.headers["cache-control"] == "no-store"
     assert opt_out(env, session, mine["booking_reference"], scope="calls").status_code == 200
     [preference] = rows(env["url"], "SELECT * FROM contact_preferences")
-    assert (preference["purpose"], preference["channel"], preference["source"]) == (
-        "all",
-        "call",
-        "tool",
-    )
+    assert (
+        preference["purpose"],
+        preference["channel"],
+        preference["source"],
+        preference["appointment_id"],
+    ) == ("all", "call", "tool", UUID(mine["appointment_id"]))
     call = contact(env, mine["appointment_id"], "reminder", "call")
     assert (call["status"], call["last_error"]) == ("suppressed", "opted_out")
     assert contact(env, mine["appointment_id"], "reminder", "message")["status"] == "scheduled"
@@ -743,12 +768,41 @@ def test_opt_out_tool_requires_verification_and_suppresses(env):
     at(env, REMINDER_AT + timedelta(hours=1))
     work(env)
     assert [args[1] for args in calls(env)] == [OTHER_CALLER]
-    # Later contacts are not even planned for the opted-out channel.
+    # The opt-out covers that booking only: the same patient's later booking is reminded
+    # (a patient-wide opt-out is a staff action).
     later = book(env, starts_at=SLOT + timedelta(days=3))
     at(env, NOW)
     confirm(env)
-    assert contact(env, later["appointment_id"], "reminder", "call") is None
-    assert contact(env, later["appointment_id"], "reminder", "message") is not None
+    assert contact(env, later["appointment_id"], "reminder", "call")["status"] == "scheduled"
+
+
+def test_spoofed_caller_cannot_silence_the_patients_other_bookings(env):
+    """Caller ID and the patient's name attach a spoofer's booking to the victim's patient
+    record; verifying that new booking and opting out must not touch the victim's own."""
+    victim = book(env)
+    confirm(env)
+    attacker = str(uuid4())
+    spoofed = book(env, starts_at=SLOT + timedelta(hours=2), execution_id=attacker)
+    confirm(env)
+    patients = rows(
+        env["url"],
+        "SELECT DISTINCT patient_id FROM appointments WHERE id = ANY(%s)",
+        ([UUID(victim["appointment_id"]), UUID(spoofed["appointment_id"])],),
+    )
+    assert len(patients) == 1  # Attached to the victim's record.
+    session = str(uuid4())
+    assert verify(env, session, spoofed["booking_reference"]).status_code == 200
+    assert opt_out(env, session, spoofed["booking_reference"]).status_code == 200
+    assert {c["status"] for c in contacts(env, spoofed["appointment_id"])} == {"suppressed"}
+    assert {c["status"] for c in contacts(env, victim["appointment_id"])} == {"scheduled"}
+    # The victim's booking is still verified only by its own reference.
+    assert opt_out(env, session, victim["booking_reference"]).status_code == 403
+    at(env, NOW.replace(hour=9, minute=0))
+    work(env)
+    victim_confirmation = contact(env, victim["appointment_id"], "booking_confirmation", "message")
+    assert [m[2] for m in env["ports"].messaging.sent] == [
+        victim_confirmation["provider_reference"]
+    ]
 
 
 def test_staff_opt_out(env):
@@ -774,6 +828,32 @@ def test_staff_opt_out(env):
     assert event["target_id"] == UUID(made["appointment_id"])
     bad = env["client"].post(url, json={"channel": "sms"}, headers=admin)
     assert bad.status_code == 422
+
+
+def test_staff_can_remove_an_opt_out(env):
+    made = book(env)
+    confirm(env)
+    session = str(uuid4())
+    assert verify(env, session, made["booking_reference"]).status_code == 200
+    assert opt_out(env, session, made["booking_reference"]).status_code == 200
+    admin = staff_headers(env, "admin")
+    base = f"/v1/admin/appointments/{made['appointment_id']}/opt-out"
+    assert env["client"].post(base, json={}, headers=admin).status_code == 200  # Patient-wide.
+    assert len(rows(env["url"], "SELECT * FROM contact_preferences")) == 2
+    viewer = staff_headers(env, "viewer")
+    assert env["client"].post(base + "/remove", json={}, headers=viewer).status_code == 403
+    other = staff_headers(env, clinic=OTHER_CLINIC)
+    assert env["client"].post(base + "/remove", json={}, headers=other).status_code == 404
+    r = env["client"].post(base + "/remove", json={}, headers=admin)
+    assert r.status_code == 200 and r.json() == {"purpose": "all", "channel": "all", "removed": 2}
+    assert rows(env["url"], "SELECT * FROM contact_preferences") == []
+    [event] = rows(env["url"], "SELECT * FROM audit_events WHERE action='patient.opt_out_removed'")
+    assert event["target_id"] == UUID(made["appointment_id"])
+    # Suppressed contacts stay suppressed; the next booking is planned normally.
+    assert {c["status"] for c in contacts(env, made["appointment_id"])} == {"suppressed"}
+    later = book(env, starts_at=SLOT + timedelta(days=1))
+    confirm(env)
+    assert {c["status"] for c in contacts(env, later["appointment_id"])} == {"scheduled"}
 
 
 def test_unverified_decline_speaks_that_preference_needs_verification(env):
@@ -840,17 +920,54 @@ def test_cross_tenant_isolation(env):
     assert "provider_reference" not in listed[0] and "dedupe_key" not in listed[0]
     viewer = staff_headers(env, "viewer")
     assert env["client"].get("/v1/admin/reminders", headers=viewer).status_code == 403
-    # A job's clinic scopes every statement: a job pointing at another clinic's row no-ops.
-    reminder_id = contact(env, made["appointment_id"], "reminder", "call")["id"]
+    # A job's clinic scopes every statement. Another clinic's job cannot even name this
+    # clinic's appointment (composite foreign key), for any kind:
+    for kind in ("reminder.call", "notification.send", "reminder.stop"):
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):
+            execute(
+                env["url"],
+                "INSERT INTO outbox (id,clinic_id,appointment_id,kind,appointment_version)"
+                " VALUES (%s,%s,%s,%s,1)",
+                (uuid4(), OTHER_CLINIC, made["appointment_id"], kind),
+            )
+    # and its contact jobs carrying this clinic's real reminder ids contact nobody and
+    # change nothing here.
+    call = contact(env, made["appointment_id"], "reminder", "call")
+    message = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    foreign = []
+    for kind, reminder in (("reminder.call", call), ("notification.send", message)):
+        foreign.append(uuid4())
+        execute(
+            env["url"],
+            "INSERT INTO outbox (id,clinic_id,kind,payload) VALUES (%s,%s,%s,%s::jsonb)",
+            (foreign[-1], OTHER_CLINIC, kind, f'{{"reminder_id": "{reminder["id"]}"}}'),
+        )
+    before = {r["id"]: r for r in contacts(env, made["appointment_id"])}
+    at(env, REMINDER_AT)  # Due for this clinic; the foreign jobs must still do nothing.
     execute(
         env["url"],
-        "INSERT INTO outbox (id,clinic_id,kind,payload) VALUES (%s,%s,'reminder.call',%s::jsonb)",
-        (uuid4(), OTHER_CLINIC, f'{{"reminder_id": "{uuid4()}"}}'),
+        "UPDATE outbox SET available_at = now() - interval '1 second' WHERE clinic_id=%s",
+        (OTHER_CLINIC,),
     )
-    at(env, REMINDER_AT)
+    while run_once(env["url"], "w1", env["ports"], kinds=["reminder.call", "reminder.stop"]):
+        pass
+    # Only the foreign jobs are due (this clinic's are at their planned 2031 times).
+    assert env["ports"].messaging.sent == [] and env["ports"].bolna.calls == []
+    after = {r["id"]: r for r in contacts(env, made["appointment_id"])}
+    for reminder_id, row in before.items():
+        for column in ("status", "attempts", "updated_at", "last_error", "scheduled_for"):
+            assert after[reminder_id][column] == row[column]
+    while run_once(env["url"], "w1", env["ports"], kinds=["notification.send"]):
+        pass
+    assert env["ports"].messaging.sent == []
+    done = rows(env["url"], "SELECT status FROM outbox WHERE id = ANY(%s)", (foreign,))
+    assert [r["status"] for r in done] == ["done"] * 2
+    assert {r["id"]: r["status"] for r in contacts(env, made["appointment_id"])} == {
+        reminder_id: row["status"] for reminder_id, row in before.items()
+    }
+    # This clinic's own jobs still work.
     work(env)
     assert len(calls(env)) == 1
-    assert contact(env, made["appointment_id"], "reminder", "call")["id"] == reminder_id
 
 
 def test_clinic_contact_settings(env):
@@ -937,7 +1054,9 @@ def test_retention_purge_removes_opt_outs(env):
         patient = conn.execute(
             "SELECT patient_id FROM appointments WHERE id=%s", (made["appointment_id"],)
         ).fetchone()["patient_id"]
-        reminders.opt_out(conn, CLINIC, patient, "all", "all", "tool")
+        reminders.opt_out(
+            conn, CLINIC, patient, "all", "all", "tool", appointment_id=made["appointment_id"]
+        )
         conn.execute("UPDATE appointments SET status='cancelled'")
         conn.execute("UPDATE patients SET retention_until = now() - interval '1 day'")
         conn.commit()
@@ -946,3 +1065,408 @@ def test_retention_purge_removes_opt_outs(env):
     assert rows(env["url"], "SELECT * FROM contact_preferences") == []
     # The planned contacts stay (no patient data) and no longer find a patient to contact.
     assert len(contacts(env, made["appointment_id"])) == 3
+
+
+# Security review follow-ups
+
+
+def test_start_of_next_day_when_midnight_does_not_exist():
+    # America/Santiago springs forward at 2026-09-06 00:00 and America/Havana at
+    # 2026-03-08 00:00: local midnight does not exist, and one fold lands on the evening
+    # before. The next day starts at 01:00 local, on the next day.
+    for zone, moment, expected in (
+        (
+            ZoneInfo("America/Santiago"),
+            datetime(2026, 9, 5, 15, 0, tzinfo=ZoneInfo("America/Santiago")),
+            datetime(2026, 9, 6, 4, 0, tzinfo=UTC),
+        ),
+        (
+            ZoneInfo("America/Havana"),
+            datetime(2026, 3, 7, 15, 0, tzinfo=ZoneInfo("America/Havana")),
+            datetime(2026, 3, 8, 5, 0, tzinfo=UTC),
+        ),
+    ):
+        start = reminders.start_of_next_day(moment, zone)
+        assert start == expected
+        assert reminders.local_day(start, zone) == moment.date() + timedelta(days=1)
+        assert start.astimezone(zone).hour == 1
+        # Repeated postponement always makes progress.
+        assert reminders.start_of_next_day(start, zone) > start + timedelta(hours=12)
+
+
+class Takeover:
+    """A messaging port whose first send happens after another worker has taken the job
+    over (the first worker's lease expired mid-send). Wraps a FakeMessaging."""
+
+    timeout_seconds = 1
+
+    def __init__(self, env, inner):
+        self.env = env
+        self.inner = inner
+        self.idempotent_reference = inner.idempotent_reference
+        self.consistent_lookup = inner.consistent_lookup
+        self.taken_over = False
+
+    def get_message(self, reference):
+        return self.inner.get_message(reference)
+
+    def send_message(self, to, body, reference):
+        if not self.taken_over:
+            self.taken_over = True
+            execute(
+                self.env["url"],
+                "UPDATE outbox SET lease_expires_at = now() - interval '1 second'"
+                " WHERE kind='notification.send' AND status='processing'",
+            )
+            ports = Ports(calendar=FakeCalendar(), messaging=self.inner)
+            assert run_once(self.env["url"], "w2", ports, kinds=["notification.send"]) == 1
+        return self.inner.send_message(to, body, reference)
+
+
+@pytest.mark.parametrize("consistent", [True, False])
+def test_lease_lost_mid_send_never_overwrites_the_new_owner(env, consistent):
+    made = book(env, consents={"consent_booking_confirmation": "true"})
+    confirm(env)
+    inner = FakeMessaging(consistent_lookup=consistent)
+    port = Takeover(env, inner)
+    at(env, NOW.replace(hour=9, minute=0))
+    work(env, ports=Ports(calendar=FakeCalendar(), messaging=port))
+    row = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    [job] = jobs(env, "notification.send")
+    assert len(inner.sent) == 1  # Delivered once, whoever sent first.
+    if consistent:
+        # The new owner found nothing yet, resent under the same reference (deduplicated by
+        # the provider) and recorded attempt 2; the old worker's late write was fenced out.
+        assert (row["status"], row["attempts"]) == ("sent", 2)
+        assert row["provider_message_id"] == inner.by_reference[row["provider_reference"]]
+    else:
+        # A lookup that may lag cannot prove nothing was sent: staff review, no resend, and
+        # the old worker does not overwrite it.
+        assert (row["status"], row["last_error"]) == ("needs_review", "lookup_not_found")
+    assert job["status"] == "done"
+
+
+@pytest.mark.parametrize("flags", [{"idempotent_reference": False}, {"consistent_lookup": False}])
+def test_lookup_not_found_resends_only_with_both_capabilities(env, flags):
+    made = book(env, consents={"consent_booking_confirmation": "true"})
+    confirm(env)
+    messaging = FakeMessaging(**flags)
+    ports = Ports(calendar=FakeCalendar(), messaging=messaging)
+    messaging.timeout_before_send = True
+    at(env, NOW.replace(hour=9, minute=0))
+    work(env, ports=ports)
+    work(env, ports=ports)
+    row = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    assert (row["status"], row["last_error"]) == ("needs_review", "lookup_not_found")
+    assert messaging.sent == [] and messaging.lookups == 1
+    work(env, ports=ports)
+    assert messaging.sent == []
+
+
+def test_messaging_port_must_declare_capabilities(env):
+    class Partial:
+        timeout_seconds = 1
+        idempotent_reference = True
+
+        def send_message(self, to, body, reference):
+            raise AssertionError
+
+        def get_message(self, reference):
+            raise AssertionError
+
+    with pytest.raises(ValueError, match="consistent_lookup"):
+        check_ports(Ports(calendar=FakeCalendar(), messaging=Partial()))
+
+
+def test_booking_tools_are_refused_on_reminder_calls(env):
+    made = book(env, consents={"consent_reminder_call": "true"})
+    confirm(env)
+    at(env, REMINDER_AT)
+    work(env)
+    execution_id = contact(env, made["appointment_id"], "reminder", "call")["provider_execution_id"]
+    reference = made["booking_reference"]
+    requests = (
+        (VERIFY, {"booking_reference": reference}),
+        (CANCEL, {"booking_reference": reference, "confirmed": "true"}),
+        (
+            RESCHEDULE,
+            {
+                "booking_reference": reference,
+                "starts_at": (SLOT + timedelta(days=1)).isoformat(),
+                "confirmed": "true",
+            },
+        ),
+        (OPT_OUT, {"booking_reference": reference, "confirmed": "true"}),
+        (
+            RESERVE,
+            {
+                "doctor": "Demo Doctor",
+                "service": "Consultation",
+                "starts_at": (SLOT + timedelta(days=1)).isoformat(),
+                "patient_name": NAME,
+            },
+        ),
+    )
+    # The reminder call's own execution id (any agent), or the outbound agent (any
+    # execution, e.g. a reminder call whose execution id was never learned).
+    for execution, agent in ((execution_id, AGENT), (str(uuid4()), OUTBOUND)):
+        for path, extra in requests:
+            payload = {"execution_id": execution, "from_number": CALLER, "agent_id": agent}
+            r = post(env, path, {**payload, **extra})
+            assert r.status_code == 403, (path, r.text)
+            assert r.json()["detail"] == gateway.REMINDER_CALL
+    assert {r["status"] for r in rows(env["url"], "SELECT status FROM appointments")} == {
+        "confirmed"
+    }
+    assert rows(env["url"], "SELECT * FROM contact_preferences") == []
+    # An inbound call still works.
+    assert verify(env, str(uuid4()), reference).status_code == 200
+
+
+def test_reminder_call_needs_a_separate_outbound_agent(env, capsys):
+    made = book(env, consents={"consent_reminder_call": "true"})
+    confirm(env)
+    clinic = str(CLINIC)
+    cli.main(["bolna", "set-agent", "--clinic", clinic, "--outbound", "--clear"])
+    at(env, REMINDER_AT)
+    work(env)
+    row = contact(env, made["appointment_id"], "reminder", "call")
+    assert (row["status"], row["last_error"]) == ("suppressed", "no_outbound_agent")
+    assert calls(env) == []
+    # The inbound agent (it carries the booking tools) is refused as the outbound agent.
+    with pytest.raises(SystemExit):
+        cli.main(["bolna", "set-agent", "--clinic", clinic, "--outbound", "--agent-id", AGENT])
+    cli.main(["bolna", "set-agent", "--clinic", clinic, "--outbound", "--agent-id", OUTBOUND])
+    assert f"bolna_outbound_agent_id={OUTBOUND}" in capsys.readouterr().out
+    assert (
+        rows(env["url"], "SELECT bolna_outbound_agent_id FROM clinics WHERE id=%s", (CLINIC,))[0][
+            "bolna_outbound_agent_id"
+        ]
+        == OUTBOUND
+    )
+
+
+def place_call(env, consents=None):
+    made = book(env, consents=consents or {"consent_reminder_call": "true"})
+    confirm(env)
+    at(env, REMINDER_AT)
+    work(env)
+    return made, contact(env, made["appointment_id"], "reminder", "call")
+
+
+def test_stop_waits_for_an_in_flight_call_without_spending_attempts(env):
+    made, placed = place_call(env)
+    execute(
+        env["url"],
+        "UPDATE reminders SET status='sending', sent_at=NULL WHERE id=%s",
+        (placed["id"],),
+    )
+    headers = staff_headers(env)
+    env["client"].post(f"/v1/admin/appointments/{made['appointment_id']}/cancel", headers=headers)
+    [job] = jobs(env, "reminder.stop")
+    work(env)
+    [deferred] = jobs(env, "reminder.stop")
+    assert (deferred["status"], deferred["last_error"]) == ("pending", "contact_in_flight")
+    assert deferred["max_attempts"] == job["max_attempts"] + 1
+    assert calls(env, "stop_scheduled_call") == []
+    execute(
+        env["url"], "UPDATE reminders SET status='sent', sent_at=now() WHERE id=%s", (placed["id"],)
+    )
+    work(env)
+    assert calls(env, "stop_scheduled_call") == [(placed["provider_execution_id"],)]
+
+
+def test_dead_stop_job_sends_unstopped_calls_to_review(env):
+    made, placed = place_call(env)
+    headers = staff_headers(env)
+    env["client"].post(f"/v1/admin/appointments/{made['appointment_id']}/cancel", headers=headers)
+    execute(env["url"], "UPDATE outbox SET max_attempts=1 WHERE kind='reminder.stop'")
+    env["ports"].bolna.fail_next("stop_scheduled_call", 1, ProviderRetryable)
+    work(env)
+    [job] = jobs(env, "reminder.stop")
+    assert job["status"] == "dead"
+    row = contact(env, made["appointment_id"], "reminder", "call")
+    assert (row["status"], row["last_error"]) == ("needs_review", "stop_failed")
+    assert row["sent_at"] is not None and row["stop_outcome"] is None
+
+
+def test_opt_out_stops_a_placed_call_and_keeps_other_contacts(env):
+    made, placed = place_call(env, consents=ALL_CONSENTS)
+    execute(
+        env["url"],
+        "UPDATE reminders SET status='scheduled', sent_at=NULL"
+        " WHERE appointment_id=%s AND purpose='reminder' AND channel='message'",
+        (made["appointment_id"],),
+    )
+    session = str(uuid4())
+    assert verify(env, session, made["booking_reference"]).status_code == 200
+    assert opt_out(env, session, made["booking_reference"], scope="calls").status_code == 200
+    [job] = jobs(env, "reminder.stop")
+    assert job["payload"] == {"reason": "opted_out"} and job["appointment_version"] == 1
+    work(env, kinds=["reminder.stop"])
+    stopped = contact(env, made["appointment_id"], "reminder", "call")
+    assert (stopped["status"], stopped["stop_outcome"]) == ("sent", "stopped")
+    # An opt-out stop does not cancel the appointment's other contacts.
+    assert contact(env, made["appointment_id"], "reminder", "message")["status"] == "scheduled"
+    # A later cancellation of the same version shares the stop job.
+    headers = staff_headers(env)
+    r = env["client"].post(
+        f"/v1/admin/appointments/{made['appointment_id']}/cancel", headers=headers
+    )
+    assert r.status_code == 200, r.text
+    assert len(jobs(env, "reminder.stop")) == 1
+    message = contact(env, made["appointment_id"], "reminder", "message")
+    assert (message["status"], message["last_error"]) == ("cancelled", "appointment_changed")
+
+
+def test_housekeeping_moves_contacts_without_a_live_job_to_review(env):
+    made = book(env)
+    confirm(env)
+    call = contact(env, made["appointment_id"], "reminder", "call")
+    message = contact(env, made["appointment_id"], "reminder", "message")
+    confirmation = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    # The call's job is done and the message's is gone; the confirmation's is still pending.
+    execute(
+        env["url"],
+        "UPDATE outbox SET status='done' WHERE payload->>'reminder_id' = %s",
+        (str(call["id"]),),
+    )
+    execute(
+        env["url"], "DELETE FROM outbox WHERE payload->>'reminder_id' = %s", (str(message["id"]),)
+    )
+    with connect(env["url"]) as conn:
+        assert reminders.sweep_lost(conn) == 0  # Changed too recently.
+    execute(env["url"], "UPDATE reminders SET updated_at = now() - interval '1 hour'")
+    with connect(env["url"]) as conn:
+        assert reminders.sweep_lost(conn) == 2
+    for row in (call, message):
+        swept = contact(env, made["appointment_id"], row["purpose"], row["channel"])
+        assert (swept["status"], swept["last_error"]) == ("needs_review", "job_lost")
+    kept = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    assert kept["status"] == "scheduled" and kept["id"] == confirmation["id"]
+
+
+def test_lead_time_edit_never_plans_a_second_reminder(env):
+    made = book(env)
+    confirm(env)
+    execute(env["url"], "UPDATE clinics SET reminder_lead_minutes=120 WHERE id=%s", (CLINIC,))
+    with connect(env["url"]) as conn:
+        ctx = reminders.context(conn, CLINIC, made["appointment_id"])
+        assert ctx["reminder_lead_minutes"] == 120
+        reminders.lock_planning(conn, CLINIC, ctx["id"])
+        assert reminders.plan_reminders(conn, ctx, service.utc_now()) == 0
+        conn.commit()
+        assert reminders.schedule_due(conn) == 0
+    kinds = sorted((r["purpose"], r["channel"]) for r in contacts(env, made["appointment_id"]))
+    assert kinds == [
+        ("booking_confirmation", "message"),
+        ("reminder", "call"),
+        ("reminder", "message"),
+    ]
+
+
+def test_send_rereads_clinic_settings_after_locking(env, monkeypatch):
+    made = book(env, consents={"consent_booking_confirmation": "true"})
+    confirm(env)
+    original = reminders.lock_budget_day
+
+    def lock_then_disable(conn, clinic_id, day):
+        original(conn, clinic_id, day)
+        # Committed by staff after the send's first read, before its row locks.
+        execute(env["url"], "UPDATE clinics SET outbound_enabled=false WHERE id=%s", (CLINIC,))
+
+    monkeypatch.setattr(reminders, "lock_budget_day", lock_then_disable)
+    at(env, NOW.replace(hour=9, minute=0))
+    work(env)
+    row = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    assert (row["status"], row["last_error"]) == ("suppressed", "outbound_disabled")
+    assert env["ports"].messaging.sent == []
+
+
+def test_planning_failure_does_not_block_confirmation(env, monkeypatch, caplog):
+    def broken(conn, clinic_id, appointment_id, version):
+        conn.execute("SELECT 1 / 0")
+
+    monkeypatch.setattr(reminders, "on_confirmed", broken)
+    made = book(env)
+    confirm(env)
+    [appointment] = rows(
+        env["url"], "SELECT status FROM appointments WHERE id=%s", (made["appointment_id"],)
+    )
+    assert appointment["status"] == "confirmed"
+    assert {j["status"] for j in jobs(env, "calendar.create")} == {"done"}
+    assert contacts(env) == []
+    [record] = [r for r in caplog.records if "contact planning failed" in r.getMessage()]
+    assert "DivisionByZero" in record.getMessage() and "1 / 0" not in record.getMessage()
+
+
+def test_backfill_is_not_starved_by_opted_out_appointments(env):
+    execute(env["url"], "UPDATE clinics SET outbound_enabled=false WHERE id=%s", (CLINIC,))
+    early = [
+        book(env, starts_at=SLOT + timedelta(hours=n), execution_id=str(uuid4())) for n in (1, 2, 3)
+    ]
+    legitimate = book(
+        env, name=OTHER_NAME, number=OTHER_CALLER, starts_at=SLOT + timedelta(hours=4)
+    )
+    confirm(env)
+    assert contacts(env) == []
+    with connect(env["url"]) as conn:
+        for made in early:
+            row = conn.execute(
+                "SELECT patient_id FROM appointments WHERE id=%s", (made["appointment_id"],)
+            ).fetchone()
+            reminders.opt_out(
+                conn,
+                CLINIC,
+                row["patient_id"],
+                "reminder",
+                "all",
+                "tool",
+                appointment_id=made["appointment_id"],
+            )
+        conn.commit()
+    execute(env["url"], "UPDATE clinics SET outbound_enabled=true WHERE id=%s", (CLINIC,))
+    # A batch smaller than the opted-out appointments ahead of the legitimate one (the same
+    # logic as more than BACKFILL_BATCH of them): it still reaches the legitimate one.
+    with connect(env["url"]) as conn:
+        assert reminders.schedule_due(conn, limit=2) == 2
+        assert reminders.schedule_due(conn, limit=2) == 0
+    assert {
+        (c["purpose"], c["channel"], c["status"])
+        for c in contacts(env, legitimate["appointment_id"])
+    } == {("reminder", "call", "scheduled"), ("reminder", "message", "scheduled")}
+    for made in early:
+        assert contacts(env, made["appointment_id"]) == []
+
+
+def test_refused_reminder_is_recorded_so_backfill_skips_it(env):
+    made = book(env, consents={"consent_reminder_call": "true"})
+    confirm(env)
+    message = contact(env, made["appointment_id"], "reminder", "message")
+    assert (message["status"], message["last_error"]) == ("suppressed", "no_consent")
+    with connect(env["url"]) as conn:
+        assert reminders.schedule_due(conn) == 0
+
+
+def test_outcome_write_is_fenced_on_the_attempt(env):
+    from clinic_voice.handlers import reminders as handlers
+
+    made = book(env, consents={"consent_booking_confirmation": "true"})
+    confirm(env)
+    row = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    # A newer attempt (2) is in flight; the stale worker of attempt 1 reports a failure.
+    execute(
+        env["url"], "UPDATE reminders SET status='sending', attempts=2 WHERE id=%s", (row["id"],)
+    )
+    with connect(env["url"]) as conn:
+        assert not handlers._set(
+            conn, CLINIC, row["id"], "failed", "provider_permanent", attempts=1
+        )
+        assert (
+            contact(env, made["appointment_id"], "booking_confirmation", "message")["status"]
+            == "sending"
+        )
+        assert handlers._set(conn, CLINIC, row["id"], "sent", None, attempts=2)
+    assert (
+        contact(env, made["appointment_id"], "booking_confirmation", "message")["status"] == "sent"
+    )

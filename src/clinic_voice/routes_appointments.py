@@ -17,6 +17,7 @@ from clinic_voice.schemas import (
     StaffAppointmentOut,
     StaffOptOut,
     StaffOptOutOut,
+    StaffOptOutRemoved,
 )
 
 log = logging.getLogger("clinic_voice.appointments")
@@ -70,5 +71,15 @@ def opt_out(appointment_id: UUID, request: StaffOptOut, staff=Depends(writer)):
     """Opt the appointment's patient out of confirmations and/or reminders."""
     with database() as conn:
         return appointments.staff_opt_out(
+            conn, staff, appointment_id, request.purpose, request.channel
+        )
+
+
+@router.post("/{appointment_id}/opt-out/remove", response_model=StaffOptOutRemoved)
+def remove_opt_out(appointment_id: UUID, request: StaffOptOut, staff=Depends(writer)):
+    """Undo an opt-out of exactly (purpose, channel) for the appointment's patient (the
+    patient-wide one and the one for this appointment). Suppressed contacts stay suppressed."""
+    with database() as conn:
+        return appointments.staff_remove_opt_out(
             conn, staff, appointment_id, request.purpose, request.channel
         )

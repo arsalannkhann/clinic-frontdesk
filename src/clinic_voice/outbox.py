@@ -150,7 +150,8 @@ def _check_timeout(name, adapter, lease):
 def check_ports(ports, lease=DEFAULT_LEASE):
     """Every adapter (or resolver) except the in-process FakeCalendar, FakeBolna and
     FakeMessaging must declare a numeric `timeout_seconds` (not a bool), at most
-    lease / LEASE_TIMEOUT_RATIO."""
+    lease / LEASE_TIMEOUT_RATIO. A messaging adapter must also declare its reconciliation
+    capabilities, idempotent_reference and consistent_lookup (providers/messaging.py)."""
     adapter = ports.calendar if ports.calendar is not None else ports.calendar_for
     if not isinstance(adapter, FakeCalendar):
         _check_timeout("calendar", adapter, lease)
@@ -158,8 +159,12 @@ def check_ports(ports, lease=DEFAULT_LEASE):
     if bolna is not None and not isinstance(bolna, FakeBolna):
         _check_timeout("bolna", bolna, lease)
     messaging = getattr(ports, "messaging", None)
-    if messaging is not None and not isinstance(messaging, FakeMessaging):
-        _check_timeout("messaging", messaging, lease)
+    if messaging is not None:
+        if not isinstance(messaging, FakeMessaging):
+            _check_timeout("messaging", messaging, lease)
+        for capability in ("idempotent_reference", "consistent_lookup"):
+            if not isinstance(getattr(messaging, capability, None), bool):
+                raise ValueError(f"messaging adapter must declare {capability} (bool)")
 
 
 def backoff(attempts: int) -> timedelta:
@@ -477,13 +482,15 @@ HOUSEKEEPING_INTERVAL = 600.0
 
 
 def _default_housekeeping(conn, ports=None):
-    """Prune expired OAuth states; backfill reminders of confirmed appointments
+    """Prune expired OAuth states; move contacts whose job is gone to review
+    (reminders.sweep_lost); backfill reminders of confirmed appointments
     (reminders.schedule_due, outbound-enabled clinics only); with a Bolna port, also enqueue
     (bounded) reconciliation of call sessions that have no final provider status."""
     from clinic_voice import reminders
     from clinic_voice.calendar_accounts import prune_oauth_states
 
     prune_oauth_states(conn)
+    reminders.sweep_lost(conn)
     reminders.schedule_due(conn)
     if ports is not None and getattr(ports, "bolna", None) is not None:
         from clinic_voice.bolna.webhooks import enqueue_reconciles

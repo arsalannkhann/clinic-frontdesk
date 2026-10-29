@@ -38,6 +38,10 @@ SUPPORTED_LANGUAGES = ("en", "hi")
 MAX_SESSION_ACTIVE = 3
 E164 = re.compile(r"\+[1-9]\d{6,14}")
 NOT_CONFIGURED = "Call session storage not configured"
+REMINDER_CALL = (
+    "I cannot book, verify or change appointments on this call."
+    " Please call the clinic directly and the team will help you."
+)
 PLACEHOLDER_FAQ = (
     "No clinic-approved answers are configured. Offer to take the question to clinic staff."
 )
@@ -126,6 +130,28 @@ def upsert_session(conn, clinic_id, context, crypto) -> UUID:
         )
     conn.commit()
     return row["id"]
+
+
+def refuse_reminder_call(conn, clinic_id, context) -> None:
+    """403 with a speakable message when this execution is one of the clinic's outbound
+    reminder calls: its execution id is a placed reminder call's, or its agent id is the
+    clinic's bolna_outbound_agent_id. Whoever answers a reminder call is not verified (the
+    call went to a number on file, and the answerer may not be the patient), so the tools
+    that book, verify, change or opt out are refused there even if the outbound agent was
+    misconfigured with them. Both values are provider-asserted; they are only ever used to
+    refuse. The clinic's own number is not stored, so it is not checked."""
+    agent_id = provider_uuid(context.agent_id)
+    row = conn.execute(
+        """SELECT EXISTS (SELECT 1 FROM reminders WHERE clinic_id=%s AND channel='call'
+            AND provider_execution_id=%s) AS placed,
+        EXISTS (SELECT 1 FROM clinics WHERE id=%s AND bolna_outbound_agent_id IS NOT NULL
+            AND bolna_outbound_agent_id=%s) AS outbound""",
+        (clinic_id, str(context.execution_id), clinic_id, agent_id),
+    ).fetchone()
+    conn.commit()
+    if row["placed"] or row["outbound"]:
+        log.warning("booking tool refused on a reminder call")
+        raise HTTPException(403, REMINDER_CALL)
 
 
 def derive_key(execution_id: UUID, tool: str, args: dict) -> str:

@@ -336,11 +336,14 @@ def _replayed(conn, clinic_id, key, request_hash, row, zone):
 
 
 def opt_out(conn, clinic_id, session_id, request):
-    """Opt the patient of a booking this session verified (reference + caller number) out
-    of reminders and confirmations on the requested channels. Requires that verification:
-    caller ID alone is spoofable, and an opt-out by caller number could silence another
-    patient's reminders (ADR 0008). Unverified (or handoff) sessions get a speakable 403.
-    Idempotent; suppresses that patient's unsent contacts at once."""
+    """Stop reminders and confirmations of the one booking this session verified (reference
+    + caller number) on the requested channels. Requires that verification: caller ID alone
+    is spoofable. Scoped to that appointment, never patient-wide: a caller can be attached
+    to another patient's record by caller ID and name (patients.attach), so a patient-wide
+    opt-out from a verified booking could still silence another patient's other bookings
+    (ADR 0008). Patient-wide opt-outs are staff only. confirmed=false reads the change back
+    and changes nothing. Unverified (or handoff) sessions get a speakable 403. Idempotent;
+    suppresses that appointment's unsent contacts at once."""
     try:
         row = _verified(conn, clinic_id, session_id, request.booking_reference)
     except HTTPException as error:
@@ -350,12 +353,26 @@ def opt_out(conn, clinic_id, session_id, request):
     if row["patient_id"] is None:
         raise HTTPException(409, OPT_OUT_NO_PATIENT)
     channel = OPT_OUT_SCOPES[request.scope]
-    reminders.opt_out(conn, clinic_id, row["patient_id"], "all", channel, "tool")
+    zone = _zone(conn, clinic_id)
+    words = OPT_OUT_WORDS[channel]
+    out = {"booking_reference": row["booking_reference"], "scope": request.scope}
+    if not request.confirmed:
+        return {
+            **out,
+            "opted_out": False,
+            "spoken": (
+                f"Please confirm: stop appointment {words} for the appointment on"
+                f" {_when(row['starts_at'], zone)}? Nothing has been changed yet."
+            ),
+        }
+    reminders.opt_out(
+        conn, clinic_id, row["patient_id"], "all", channel, "tool", appointment_id=row["id"]
+    )
     return {
+        **out,
         "opted_out": True,
-        "scope": request.scope,
         "spoken": (
-            f"Done. The clinic will not send you appointment {OPT_OUT_WORDS[channel]}"
-            " about your bookings. Clinic staff can change this if you want them again."
+            f"Done. The clinic will not send you {words} about the appointment on"
+            f" {_when(row['starts_at'], zone)}. Clinic staff can change this if you ask them."
         ),
     }

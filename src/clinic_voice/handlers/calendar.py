@@ -149,8 +149,7 @@ def _confirm(conn, job, ports, target, calendar_id, event_id) -> bool:
     lease was lost; the new owner reaches the same idempotent outcome).
 
     The confirming transaction also plans the confirmation message and reminders
-    (reminders.on_confirmed; nothing unless the clinic has outbound_enabled and the patient
-    consented). If the appointment stopped being pending_sync at this version while the
+    (reminders.on_confirmed, in a savepoint; nothing unless the clinic has outbound_enabled). If the appointment stopped being pending_sync at this version while the
     event was being written: at the same version (confirmed elsewhere or moved to review by staff) the event id
     is recorded and the job completes; if it was cancelled or rescheduled, the job withdraws
     its own event.
@@ -164,8 +163,14 @@ def _confirm(conn, job, ports, target, calendar_id, event_id) -> bool:
         (event_id, calendar_id, account_id, *scope),
     ).fetchone()
     if confirmed is not None:
-        # Same transaction: the confirmation message and reminders exist iff it commits.
-        reminders.on_confirmed(conn, *scope)
+        # Same transaction: the confirmation message and reminders exist iff it commits. In
+        # a savepoint, so a planning failure never blocks the confirmation itself (the
+        # housekeeping backfill plans the reminders later; the confirmation message is lost).
+        try:
+            with conn.transaction():
+                reminders.on_confirmed(conn, *scope)
+        except Exception as error:
+            log.error("contact planning failed id=%s error=%s", job.id, type(error).__name__)
     else:
         current = conn.execute(
             "SELECT status, version FROM appointments WHERE clinic_id=%s AND id=%s",

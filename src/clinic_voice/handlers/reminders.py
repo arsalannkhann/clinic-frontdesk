@@ -3,32 +3,42 @@
 notification.send and reminder.call carry {reminder_id}. An attempt:
 1. Settles a row left 'unknown' (ambiguous timeout) or 'sending' (a worker died mid-send)
    before anything else: a message is looked up by its stable provider reference
-   (MessagingPort.get_message); found means sent, not found means nothing was sent and the
-   contact is attempted again. A call cannot be looked up (Bolna documents no lookup by
-   client reference, and a timed-out POST /call returns no execution id), so it becomes
-   needs_review for staff and is never placed again automatically.
+   (MessagingPort.get_message). Found means sent. Not found means nothing was sent only if
+   the port declares both idempotent_reference and consistent_lookup; then the contact is
+   attempted again (a duplicate send is deduplicated by the provider). Otherwise it goes to
+   needs_review and is never resent automatically. A call cannot be looked up (Bolna
+   documents no lookup by client reference, and a timed-out POST /call returns no execution
+   id), so it becomes needs_review for staff and is never placed again automatically.
 2. In one transaction: locks the appointment row (FOR SHARE), the contact-budget day, the
-   reminder row; re-checks the appointment status and version (a stale version cancels the
-   contact), the start time, expiry, outbound_enabled, consent and opt-out; defers the job
-   until the planned time or out of quiet hours; enforces the daily budget (postpone or
-   suppress); then marks the row 'sending', renews the job's lease (fenced) and decrypts the
-   patient's phone number. Nothing is sent if any check fails or the lease was lost.
+   reminder row and the clinic row (FOR SHARE), and re-reads the clinic's contact settings
+   under those locks; re-checks the appointment status and version (a stale version cancels
+   the contact), the start time, expiry, outbound_enabled, consent and opt-out; defers the
+   job until the planned time or out of quiet hours; enforces the daily budget (postpone or
+   suppress); then marks the row 'sending' (attempts + 1), renews the job's lease (fenced)
+   and decrypts the patient's phone number. Nothing is sent if any check fails or the lease
+   was lost.
 3. Sends with the connection idle. The message body or call context is composed here and
-   handed to the port only; it is never stored or logged.
-4. Records the outcome on the row in its own commit (even if the lease was since lost: the
-   contact happened), then settles the job. A timeout records 'unknown' and (messages)
-   retries, so the next attempt reconciles first; a retryable error returns the row to
-   'scheduled' and retries; a permanent error marks it failed and dead-letters the job.
+   handed to the port only; it is never stored or logged. Reminder calls use the clinic's
+   bolna_outbound_agent_id, never the inbound agent that carries the booking tools.
+4. Records the outcome on the row in its own commit, fenced on the row's status and
+   attempts: a worker whose lease was lost still records what happened unless a newer
+   attempt (or a reconciliation) has already moved the row, which it never overwrites.
+   Then settles the job. A timeout records 'unknown' and (messages) retries, so the next
+   attempt reconciles first; a retryable error returns the row to 'scheduled' and retries; a
+   permanent error marks it failed and dead-letters the job.
 
-reminder.stop (appointment id and old version on the job) cancels that version's unsent
-contacts and stops each placed call that has no stop outcome yet through
-BolnaPort.stop_scheduled_call. A refused stop (the call is no longer queued or scheduled)
-is recorded as not_stoppable unless a lookup shows the call was stopped. While a contact of
-that version is still 'sending' the job retries shortly.
+reminder.stop (appointment id and version on the job) stops each placed call of that
+version that has no stop outcome yet through BolnaPort.stop_scheduled_call; enqueued by a
+cancellation or reschedule (which also cancels that version's unsent contacts, again here)
+or by an opt-out (payload reason 'opted_out': calls only). A refused stop (the call is no
+longer queued or scheduled) is recorded as not_stoppable unless a lookup shows the call was
+stopped. While a call of that version is still 'sending' the job is deferred (no attempt
+spent). A dead stop job moves its unstopped calls to needs_review.
 """
 
 import logging
 from datetime import timedelta
+from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from clinic_voice import reminders, service
@@ -71,9 +81,11 @@ def _keyring() -> Keyring | None:
         return None
 
 
-def _set(conn, clinic_id, reminder_id, status, code, *, current=("sending",), **values):
+def _set(conn, clinic_id, reminder_id, status, code, *, attempts, current=("sending",), **values):
     """Move a reminder from one of `current` to `status`, with code as last_error; commits.
-    values: provider_execution_id / provider_message_id. Returns whether a row moved."""
+    Fenced on `attempts` (the row's attempt count when this worker read or set it), so a
+    worker that lost its lease never overwrites a newer attempt's outcome. values:
+    provider_execution_id / provider_message_id. Returns whether a row moved."""
     sets = ["status=%(status)s", "last_error=%(code)s", "updated_at=now()"]
     if status == "sent":
         sets.append("sent_at=now()")
@@ -82,17 +94,20 @@ def _set(conn, clinic_id, reminder_id, status, code, *, current=("sending",), **
             sets.append(f"{column}=%({column})s")
     row = conn.execute(
         f"UPDATE reminders SET {', '.join(sets)} WHERE clinic_id=%(clinic)s AND id=%(id)s"  # noqa: S608
-        " AND status = ANY(%(current)s) RETURNING id",
+        " AND status = ANY(%(current)s) AND attempts = %(attempts)s RETURNING id",
         {
             "status": status,
             "code": code,
             "clinic": clinic_id,
             "id": reminder_id,
+            "attempts": attempts,
             "current": list(current),
             **values,
         },
     ).fetchone()
     conn.commit()
+    if row is None:
+        log.warning("contact outcome not recorded: row moved on reminder=%s", reminder_id)
     return row is not None
 
 
@@ -118,7 +133,7 @@ def _port(ports, channel):
 
 def _load(conn, job, reminder_id):
     row = conn.execute(
-        "SELECT id, channel, status, provider_reference FROM reminders"
+        "SELECT id, channel, status, attempts, provider_reference FROM reminders"
         " WHERE clinic_id=%s AND id=%s",
         (job.clinic_id, reminder_id),
     ).fetchone()
@@ -159,8 +174,9 @@ def _reconcile(conn, job, port, row, channel):
     """Settle an ambiguous earlier attempt. Returns the job outcome, or None when nothing was
     sent and the contact may be attempted again (the row is back to 'scheduled')."""
     unsettled = ("unknown", "sending")
+    fence = {"attempts": row["attempts"], "current": unsettled}
     if channel == "call":
-        _set(conn, job.clinic_id, row["id"], "needs_review", "outcome_unknown", current=unsettled)
+        _set(conn, job.clinic_id, row["id"], "needs_review", "outcome_unknown", **fence)
         log.warning("contact needs review id=%s kind=%s code=outcome_unknown", job.id, job.kind)
         return complete(conn, job)
     require_idle(conn)
@@ -178,12 +194,20 @@ def _reconcile(conn, job, port, row, channel):
             row["id"],
             "sent",
             None,
-            current=unsettled,
             provider_message_id=message_id,
+            **fence,
         )
         log.info("contact reconciled id=%s kind=%s outcome=sent", job.id, job.kind)
         return complete(conn, job)
-    _set(conn, job.clinic_id, row["id"], "scheduled", "reconciled_not_sent", current=unsettled)
+    if not (
+        getattr(port, "idempotent_reference", False) is True
+        and getattr(port, "consistent_lookup", False) is True
+    ):
+        # None may mean "not indexed yet", and a resend may not be deduplicated.
+        _set(conn, job.clinic_id, row["id"], "needs_review", "lookup_not_found", **fence)
+        log.warning("contact needs review id=%s kind=%s code=lookup_not_found", job.id, job.kind)
+        return complete(conn, job)
+    _set(conn, job.clinic_id, row["id"], "scheduled", "reconciled_not_sent", **fence)
     return None
 
 
@@ -202,12 +226,17 @@ def _blocked(conn, ctx, reminder, now, keyring):
     if not ctx["outbound_enabled"]:
         return "suppressed", "outbound_disabled"
     refused = reminders.refusal(
-        conn, ctx["clinic_id"], ctx["patient_id"], reminder["purpose"], reminder["channel"]
+        conn,
+        ctx["clinic_id"],
+        ctx["patient_id"],
+        ctx["id"],
+        reminder["purpose"],
+        reminder["channel"],
     )
     if refused:
         return "suppressed", refused
-    if reminder["channel"] == "call" and not ctx["bolna_agent_id"]:
-        return "failed", "agent_unconfigured"
+    if reminder["channel"] == "call" and not ctx["bolna_outbound_agent_id"]:
+        return "suppressed", "no_outbound_agent"
     if keyring is None:
         return "failed", "keyring_unconfigured"
     return None
@@ -272,9 +301,26 @@ def _attempt(conn, job, port, channel, reminder_id) -> bool:
     if reminder is None:
         conn.rollback()
         return complete(conn, job)
-    blocked = _blocked(conn, ctx, reminder, now, keyring)  # Again, now that the row is locked.
+    # Again, now that the row is locked, with the clinic's settings re-read under its lock.
+    ctx = reminders.context(conn, job.clinic_id, job.appointment_id, lock="settings")
+    blocked = _blocked(conn, ctx, reminder, now, keyring)
     if blocked:
         return _settle(conn, job, *blocked, reminder_id)
+    zone = ZoneInfo(ctx["timezone"])
+    start, end = ctx["quiet_hours_start"], ctx["quiet_hours_end"]
+    if reminders.local_day(now, zone) != day:
+        conn.rollback()  # The time zone changed under us: start over with the new day.
+        return defer(conn, job, now, "settings_changed")
+    if reminders.in_quiet(now, zone, start, end):
+        return _postpone(
+            conn,
+            job,
+            reminder_id,
+            reminders.next_allowed(now, zone, start, end),
+            latest,
+            zone,
+            "quiet_hours",
+        )
     used = reminders.budget_used(conn, job.clinic_id, day, reminders.ATTEMPTED, reminder_id)
     if used >= ctx["daily_contact_budget"]:
         later = reminders.next_allowed(reminders.start_of_next_day(now, zone), zone, start, end)
@@ -291,7 +337,7 @@ def _attempt(conn, job, port, channel, reminder_id) -> bool:
         (day, job.clinic_id, reminder_id),
     )
     conn.commit()
-    return _send(conn, job, port, channel, ctx, reminder, phone, zone)
+    return _send(conn, job, port, channel, ctx, reminder, reminder["attempts"] + 1, phone, zone)
 
 
 def _postpone(conn, job, reminder_id, when, latest, zone, code) -> bool:
@@ -307,7 +353,7 @@ def _postpone(conn, job, reminder_id, when, latest, zone, code) -> bool:
     return defer(conn, job, when, code)  # Commits the move with the deferral (fenced).
 
 
-def _send(conn, job, port, channel, ctx, reminder, phone, zone) -> bool:
+def _send(conn, job, port, channel, ctx, reminder, attempts, phone, zone) -> bool:
     require_idle(conn)
     clinic_id, reminder_id = job.clinic_id, reminder["id"]
     reference = reminder["provider_reference"]
@@ -323,29 +369,24 @@ def _send(conn, job, port, channel, ctx, reminder, phone, zone) -> bool:
             provider_id = port.send_message(phone, body, reference)
         else:
             provider_id = port.start_outbound_call(
-                ctx["bolna_agent_id"],
+                ctx["bolna_outbound_agent_id"],
                 phone,
                 user_data=reminders.call_context(
-                    reminder["purpose"],
-                    ctx["clinic_name"],
-                    ctx["starts_at"],
-                    zone,
-                    ctx["booking_reference"],
-                    reference,
+                    reminder["purpose"], ctx["clinic_name"], ctx["starts_at"], zone, reference
                 ),
             )
     except ProviderRetryable as error:
-        _set(conn, clinic_id, reminder_id, "scheduled", "retryable")
+        _set(conn, clinic_id, reminder_id, "scheduled", "retryable", attempts=attempts)
         return provider_failure(conn, job, error)
     except ProviderPermanent:
-        _set(conn, clinic_id, reminder_id, "failed", "provider_permanent")
+        _set(conn, clinic_id, reminder_id, "failed", "provider_permanent", attempts=attempts)
         return fail_dead(conn, job, "provider_permanent")
     except ValueError:
-        _set(conn, clinic_id, reminder_id, "failed", "bad_request")
+        _set(conn, clinic_id, reminder_id, "failed", "bad_request", attempts=attempts)
         return fail_dead(conn, job, "bad_request")
     except ProviderError:
         # ProviderTimeout or an unclassified error: the provider may have acted.
-        _set(conn, clinic_id, reminder_id, "unknown", "timeout")
+        _set(conn, clinic_id, reminder_id, "unknown", "timeout", attempts=attempts)
         log.warning("contact outcome unknown id=%s kind=%s", job.id, job.kind)
         if channel == "call":
             _set(
@@ -354,18 +395,27 @@ def _send(conn, job, port, channel, ctx, reminder, phone, zone) -> bool:
                 reminder_id,
                 "needs_review",
                 "outcome_unknown",
+                attempts=attempts,
                 current=("unknown",),
             )
             return complete(conn, job)
         return retry(conn, job, "timeout")  # The next attempt looks the message up first.
     values = {}
     if channel == "call":
-        values["provider_execution_id"] = provider_id
+        # Canonical form, so the tool gateway can match the execution id of a reminder call.
+        values["provider_execution_id"] = _canonical(provider_id)
     elif isinstance(provider_id, str) and 0 < len(provider_id) <= MAX_MESSAGE_ID:
         values["provider_message_id"] = provider_id
-    _set(conn, clinic_id, reminder_id, "sent", None, **values)
+    _set(conn, clinic_id, reminder_id, "sent", None, attempts=attempts, **values)
     log.info("contact sent id=%s kind=%s", job.id, job.kind)
     return complete(conn, job)
+
+
+def _canonical(execution_id):
+    try:
+        return str(UUID(str(execution_id)))
+    except ValueError:
+        return execution_id
 
 
 def contact_on_dead(conn, job):
@@ -388,15 +438,16 @@ def contact_on_dead(conn, job):
 
 
 def stop(conn, job, ports) -> bool:
-    if job.appointment_id is None:
+    if job.appointment_id is None or job.appointment_version is None:
         return fail_dead(conn, job, "bad_payload")
     scope = (job.clinic_id, job.appointment_id, job.appointment_version)
-    conn.execute(
-        "UPDATE reminders SET status='cancelled', last_error='appointment_changed',"
-        " updated_at=now() WHERE clinic_id=%s AND appointment_id=%s AND appointment_version=%s"
-        " AND status='scheduled'",
-        scope,
-    )
+    if (job.payload or {}).get("reason") != "opted_out":
+        conn.execute(
+            "UPDATE reminders SET status='cancelled', last_error='appointment_changed',"
+            " updated_at=now() WHERE clinic_id=%s AND appointment_id=%s"
+            " AND appointment_version=%s AND status='scheduled'",
+            scope,
+        )
     calls = conn.execute(
         """SELECT id, status, provider_execution_id FROM reminders
         WHERE clinic_id=%s AND appointment_id=%s AND appointment_version=%s AND channel='call'
@@ -407,7 +458,8 @@ def stop(conn, job, ports) -> bool:
     ).fetchall()
     conn.commit()
     if any(call["status"] == "sending" for call in calls):
-        return retry(conn, job, "contact_in_flight", STOP_RETRY)
+        # Waiting for the call's own job to settle it is not a failure: spend no attempt.
+        return defer(conn, job, service.utc_now() + STOP_RETRY, "contact_in_flight")
     if not calls:
         return complete(conn, job)
     port = getattr(ports, "bolna", None)
@@ -434,6 +486,20 @@ def stop(conn, job, ports) -> bool:
         conn.commit()
         log.info("reminder call stop id=%s outcome=%s", job.id, outcome)
     return complete(conn, job)
+
+
+def stop_on_dead(conn, job):
+    """A dead reminder.stop: its placed calls that have no stop outcome may still ring, so
+    they go to staff review (the row keeps sent_at)."""
+    if job.appointment_id is None or job.appointment_version is None:
+        return
+    conn.execute(
+        """UPDATE reminders SET status='needs_review', last_error='stop_failed', updated_at=now()
+        WHERE id IN (SELECT id FROM reminders WHERE clinic_id=%s AND appointment_id=%s
+            AND appointment_version=%s AND channel='call' AND stop_outcome IS NULL
+            AND status IN ('sending', 'sent') FOR UPDATE SKIP LOCKED)""",
+        (job.clinic_id, job.appointment_id, job.appointment_version),
+    )
 
 
 def _stopped_already(port, execution_id) -> str:
