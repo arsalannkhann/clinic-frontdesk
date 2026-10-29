@@ -61,18 +61,6 @@
                 "parameters": {
                   "type": "object",
                   "properties": {
-                    "execution_id": {
-                      "type": "string",
-                      "description": "Call reference supplied by the platform. Never ask the caller for it."
-                    },
-                    "from_number": {
-                      "type": "string",
-                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
-                    },
-                    "agent_id": {
-                      "type": "string",
-                      "description": "Agent id supplied by the platform. Never ask the caller for it."
-                    },
                     "doctor": {
                       "type": "string",
                       "description": "Doctor name exactly as listed in the clinic context."
@@ -84,15 +72,27 @@
                     "day": {
                       "type": "string",
                       "description": "Date in YYYY-MM-DD in the clinic timezone."
+                    },
+                    "execution_id": {
+                      "type": "string",
+                      "description": "Call reference supplied by the platform. Never ask the caller for it."
+                    },
+                    "from_number": {
+                      "type": "string",
+                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
+                    },
+                    "agent_id": {
+                      "type": "string",
+                      "description": "Agent id supplied by the platform. Never ask the caller for it."
                     }
                   },
                   "required": [
-                    "execution_id",
-                    "from_number",
-                    "agent_id",
                     "doctor",
                     "service",
-                    "day"
+                    "day",
+                    "execution_id",
+                    "from_number",
+                    "agent_id"
                   ]
                 },
                 "key": "custom_task",
@@ -104,18 +104,6 @@
                 "parameters": {
                   "type": "object",
                   "properties": {
-                    "execution_id": {
-                      "type": "string",
-                      "description": "Call reference supplied by the platform. Never ask the caller for it."
-                    },
-                    "from_number": {
-                      "type": "string",
-                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
-                    },
-                    "agent_id": {
-                      "type": "string",
-                      "description": "Agent id supplied by the platform. Never ask the caller for it."
-                    },
                     "doctor": {
                       "type": "string",
                       "description": "Doctor name exactly as listed in the clinic context."
@@ -127,26 +115,7 @@
                     "starts_at": {
                       "type": "string",
                       "description": "The exact slot time returned by check_slots (ISO 8601 with offset)."
-                    }
-                  },
-                  "required": [
-                    "execution_id",
-                    "from_number",
-                    "agent_id",
-                    "doctor",
-                    "service",
-                    "starts_at"
-                  ]
-                },
-                "key": "custom_task",
-                "pre_call_message": "One moment while I hold that time."
-              },
-              {
-                "name": "appointment_status",
-                "description": "Check the status of a request reserved earlier in this same call. Say confirmed only if this tool says it is confirmed.",
-                "parameters": {
-                  "type": "object",
-                  "properties": {
+                    },
                     "execution_id": {
                       "type": "string",
                       "description": "Call reference supplied by the platform. Never ask the caller for it."
@@ -158,17 +127,48 @@
                     "agent_id": {
                       "type": "string",
                       "description": "Agent id supplied by the platform. Never ask the caller for it."
-                    },
-                    "appointment_id": {
-                      "type": "string",
-                      "description": "The appointment_id returned by reserve_slot in this call."
                     }
                   },
                   "required": [
+                    "doctor",
+                    "service",
+                    "starts_at",
                     "execution_id",
                     "from_number",
-                    "agent_id",
-                    "appointment_id"
+                    "agent_id"
+                  ]
+                },
+                "key": "custom_task",
+                "pre_call_message": "One moment while I hold that time."
+              },
+              {
+                "name": "appointment_status",
+                "description": "Check the status of a request reserved earlier in this same call. Say confirmed only if this tool says it is confirmed.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "appointment_id": {
+                      "type": "string",
+                      "description": "The appointment_id returned by reserve_slot in this call."
+                    },
+                    "execution_id": {
+                      "type": "string",
+                      "description": "Call reference supplied by the platform. Never ask the caller for it."
+                    },
+                    "from_number": {
+                      "type": "string",
+                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
+                    },
+                    "agent_id": {
+                      "type": "string",
+                      "description": "Agent id supplied by the platform. Never ask the caller for it."
+                    }
+                  },
+                  "required": [
+                    "appointment_id",
+                    "execution_id",
+                    "from_number",
+                    "agent_id"
                   ]
                 },
                 "key": "custom_task",
@@ -207,19 +207,19 @@
                 "method": "POST",
                 "url": "https://voice.example.test/v1/bolna/tools/check-slots",
                 "api_token": "Bearer <redacted>",
-                "param": "{\"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\", \"doctor\": \"%(doctor)s\", \"service\": \"%(service)s\", \"day\": \"%(day)s\"}"
+                "param": "{\"doctor\": \"%(doctor)s\", \"service\": \"%(service)s\", \"day\": \"%(day)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
               },
               "reserve_slot": {
                 "method": "POST",
                 "url": "https://voice.example.test/v1/bolna/tools/reserve-slot",
                 "api_token": "Bearer <redacted>",
-                "param": "{\"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\", \"doctor\": \"%(doctor)s\", \"service\": \"%(service)s\", \"starts_at\": \"%(starts_at)s\"}"
+                "param": "{\"doctor\": \"%(doctor)s\", \"service\": \"%(service)s\", \"starts_at\": \"%(starts_at)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
               },
               "appointment_status": {
                 "method": "POST",
                 "url": "https://voice.example.test/v1/bolna/tools/appointment-status",
                 "api_token": "Bearer <redacted>",
-                "param": "{\"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\", \"appointment_id\": \"%(appointment_id)s\"}"
+                "param": "{\"appointment_id\": \"%(appointment_id)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
               },
               "clinic_context": {
                 "method": "POST",

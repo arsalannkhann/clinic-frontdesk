@@ -27,7 +27,12 @@ from clinic_voice.config import get_settings
 from clinic_voice.crypto import CryptoError, Keyring, phone_hash
 from clinic_voice.db import connect
 from clinic_voice.providers.bolna import BolnaClient, Execution, FakeBolna, PhoneNumber
-from clinic_voice.providers.calendar import ProviderPermanent, ProviderRetryable, ProviderTimeout
+from clinic_voice.providers.calendar import (
+    ProviderError,
+    ProviderPermanent,
+    ProviderRetryable,
+    ProviderTimeout,
+)
 from clinic_voice.schemas import ReservationRequest
 
 FIXTURES = Path(__file__).parent / "fixtures" / "bolna"
@@ -550,6 +555,8 @@ def test_compiler_structure_follows_docs():
         params = tools["tools_params"][tool["name"]]
         param = json.loads(params["param"])
         assert param == {name: f"%({name})s" for name in properties}
+        # Platform-rendered context fields come last in the template (injection hardening).
+        assert list(param)[-3:] == ["execution_id", "from_number", "agent_id"]
         assert params["method"] == "POST" and params["url"].startswith(GATEWAY + "/v1/bolna/")
     routes = set(app.openapi()["paths"])
     for params in tools["tools_params"].values():
@@ -698,38 +705,100 @@ def test_client_happy_paths():
     assert "synthetic-bolna-key" not in repr(bolna)
 
 
+def reads(bolna):
+    return (
+        lambda: bolna.list_phone_numbers(),
+        lambda: bolna.get_execution(EXECUTION),
+    )
+
+
+def writes(bolna):
+    return (
+        lambda: bolna.create_agent({}),
+        lambda: bolna.update_agent(AGENT, {}),
+        lambda: bolna.assign_phone_number("0123456789abcdef0123456789abcdef", AGENT),
+        lambda: bolna.start_outbound_call(AGENT, "+910000000002"),
+        lambda: bolna.stop_scheduled_call(EXECUTION),
+    )
+
+
 def test_client_error_mapping(caplog):
     caplog.set_level(logging.DEBUG)
+    body = fixture("api_error_400.json")
+    # (status, headers, expected for reads, expected for writes); expected = (kind, code, wait)
     cases = [
+        (429, {"Retry-After": "7"}, (ProviderRetryable, "http_429", 7.0), None),
+        (500, {}, (ProviderRetryable, "http_500", None), (ProviderTimeout, "http_500", None)),
+        (502, {}, (ProviderRetryable, "http_502", None), (ProviderTimeout, "http_502", None)),
         (
-            429,
-            {"Retry-After": "7"},
-            fixture("api_error_400.json"),
-            ProviderRetryable,
-            "http_429",
-            7.0,
+            503,
+            {"Retry-After": "9"},
+            (ProviderRetryable, "http_503", 9.0),
+            (ProviderTimeout, "http_503", None),
         ),
-        (503, {}, fixture("api_error_400.json"), ProviderRetryable, "http_503", None),
-        (400, {}, fixture("api_error_400.json"), ProviderPermanent, "http_400", None),
-        (401, {}, fixture("api_error_400.json"), ProviderPermanent, "unauthorized", None),
-        (403, {}, fixture("api_error_400.json"), ProviderPermanent, "unauthorized", None),
+        (400, {}, (ProviderPermanent, "http_400", None), (ProviderPermanent, "http_400", None)),
+        (
+            401,
+            {},
+            (ProviderPermanent, "unauthorized", None),
+            (ProviderPermanent, "unauthorized", None),
+        ),
+        (
+            403,
+            {},
+            (ProviderPermanent, "unauthorized", None),
+            (ProviderPermanent, "unauthorized", None),
+        ),
     ]
-    for status, headers, body, kind, code, wait in cases:
+    for status, headers, on_read, on_write in cases:
         bolna, _ = client_for(
-            lambda r, s=status, h=headers, b=body: httpx.Response(s, headers=h, json=b)
+            lambda r, s=status, h=headers: httpx.Response(s, headers=h, json=body)
         )
-        for action in (
-            lambda bolna=bolna: bolna.create_agent({}),
-            lambda bolna=bolna: bolna.list_phone_numbers(),
-            lambda bolna=bolna: bolna.get_execution(EXECUTION),
-            lambda bolna=bolna: bolna.stop_scheduled_call(EXECUTION),
-        ):
-            with pytest.raises(kind) as error:
-                action()
-            assert str(error.value) == code
-            assert getattr(error.value, "retry_after", None) == wait
-            assert MARKER not in str(error.value) and error.value.__cause__ is None
+        groups = [(reads(bolna), on_read)]
+        if on_write is not None:
+            groups.append((writes(bolna), on_write))
+        for actions, (kind, code, wait) in groups:
+            for action in actions:
+                with pytest.raises(ProviderError) as error:
+                    action()
+                assert type(error.value) is kind, (status, code)
+                assert str(error.value) == code
+                assert getattr(error.value, "retry_after", None) == wait
+                assert MARKER not in str(error.value) and error.value.__cause__ is None
     assert MARKER not in caplog.text and "synthetic-bolna-key" not in caplog.text
+
+
+def test_client_write_429_is_unknown_unless_documented_safe():
+    bolna, _ = client_for(lambda r: httpx.Response(429, json=fixture("api_error_400.json")))
+    for action in writes(bolna)[:3] + writes(bolna)[4:]:
+        with pytest.raises(ProviderTimeout) as error:
+            action()
+        assert str(error.value) == "http_429"
+    # POST /call documents 429 as "number still activating; nothing queued": retryable.
+    with pytest.raises(ProviderRetryable):
+        writes(bolna)[3]()
+
+
+def test_client_accepts_any_2xx_on_writes():
+    bolna, _ = client_for(lambda r: httpx.Response(204))
+    bolna.update_agent(AGENT, {})
+    bolna.assign_phone_number("0123456789abcdef0123456789abcdef", AGENT)
+    bolna.stop_scheduled_call(EXECUTION)
+    bolna, _ = client_for(lambda r: httpx.Response(200, json=fixture("api_create_agent_201.json")))
+    assert bolna.create_agent({}) == AGENT
+    bolna, _ = client_for(lambda r: httpx.Response(202, json=fixture("api_call_200.json")))
+    assert (
+        bolna.start_outbound_call(AGENT, "+910000000002") == "44444444-4444-4444-8444-444444444444"
+    )
+    # An unexpected 2xx whose body cannot be parsed: the write may have happened.
+    bolna, _ = client_for(lambda r: httpx.Response(202, text="<html>"))
+    for action in (
+        lambda: bolna.create_agent({}),
+        lambda: bolna.start_outbound_call(AGENT, "+910000000002"),
+    ):
+        with pytest.raises(ProviderTimeout) as error:
+            action()
+        assert str(error.value) == "malformed"
 
 
 def test_client_call_429_uses_body_retry_after():
@@ -824,3 +893,137 @@ def test_fake_bolna_is_deterministic():
         a.stop_scheduled_call(scheduled)
     with pytest.raises(ProviderPermanent):
         a.update_agent("unknown", {})
+
+
+# Review fixes: template injection, replay wording, per-session cap
+
+
+def render(tool_name, values):
+    """Render a compiled tool's param template the way a naive %(name)s substitution would:
+    no JSON escaping of the substituted values."""
+    params = compiled(agent_config.REDACTED)["agent_config"]["tasks"][0]["tools_config"][
+        "api_tools"
+    ]["tools_params"][tool_name]
+    return params["param"] % values
+
+
+def test_quote_injected_duplicate_key_rejected(env):
+    injected = f'Demo Doctor", "execution_id": "{OTHER_EXECUTION}'
+    raw = render(
+        "check_slots",
+        {
+            "doctor": injected,
+            "service": "Consultation",
+            "day": str(DAY),
+            "execution_id": EXECUTION,
+            "from_number": CALLER,
+            "agent_id": AGENT,
+        },
+    )
+    assert raw.count('"execution_id"') == 2  # The injection really produced a duplicate key.
+    for path in (
+        "/v1/bolna/tools/check-slots",
+        "/v1/bolna/tools/reserve-slot",
+        "/v1/bolna/tools/appointment-status",
+        "/v1/bolna/context",
+    ):
+        r = env["client"].post(
+            path,
+            content=raw,
+            headers={**auth(env["token"]), "Content-Type": "application/json"},
+        )
+        assert r.status_code == 422
+        assert r.json() == {"detail": "Duplicate JSON keys are not allowed"}
+        assert OTHER_EXECUTION not in r.text and CALLER not in r.text and "Demo" not in r.text
+    nested = '{"execution_id": "' + EXECUTION + '", "x": {"a": 1, "a": 2}}'
+    r = env["client"].post(
+        "/v1/bolna/context",
+        content=nested,
+        headers={**auth(env["token"]), "Content-Type": "application/json"},
+    )
+    assert r.status_code == 422
+    assert sessions(env["url"]) == []
+    # A well-formed rendering of the same template is accepted.
+    clean = render(
+        "check_slots",
+        {
+            "doctor": "Demo Doctor",
+            "service": "Consultation",
+            "day": str(DAY),
+            "execution_id": EXECUTION,
+            "from_number": CALLER,
+            "agent_id": AGENT,
+        },
+    )
+    r = env["client"].post(
+        "/v1/bolna/tools/check-slots",
+        content=clean,
+        headers={**auth(env["token"]), "Content-Type": "application/json"},
+    )
+    assert r.status_code == 200
+
+
+def test_replay_speaks_current_status(env):
+    first = post(env, "/v1/bolna/tools/reserve-slot", reserve_body()).json()
+    assert first["spoken"] == service.spoken_status("pending_sync")
+    for status in ("cancelled", "needs_review", "confirmed"):
+        with connect(env["url"]) as conn:
+            conn.execute("UPDATE appointments SET status=%s", (status,))
+        again = post(env, "/v1/bolna/tools/reserve-slot", reserve_body())
+        assert again.status_code == 202
+        assert again.json()["status"] == status
+        assert again.json()["spoken"] == service.spoken_status(status)
+        assert again.json()["appointment_id"] == first["appointment_id"]
+
+
+def test_session_cap(env):
+    path = "/v1/bolna/tools/reserve-slot"
+    assert gateway.MAX_SESSION_ACTIVE == 3
+    made = [
+        post(env, path, reserve_body(starts_at=SLOT + timedelta(minutes=15 * i))) for i in range(3)
+    ]
+    assert [r.status_code for r in made] == [202, 202, 202]
+    fourth = post(env, path, reserve_body(starts_at=SLOT + timedelta(hours=2)))
+    assert fourth.status_code == 409
+    assert fourth.json() == {"detail": service.SESSION_LIMIT_MESSAGE}
+    # Replays are never capped.
+    assert post(env, path, reserve_body()).json() == made[0].json()
+    # Another call session has its own cap.
+    other = post(
+        env, path, reserve_body(execution=OTHER_EXECUTION, starts_at=SLOT + timedelta(hours=2))
+    )
+    assert other.status_code == 202
+    # Only pending_sync/confirmed count: a cancelled one frees a place.
+    with connect(env["url"]) as conn:
+        conn.execute(
+            "UPDATE appointments SET status='cancelled' WHERE id=%s",
+            (made[1].json()["appointment_id"],),
+        )
+    assert post(env, path, reserve_body(starts_at=SLOT + timedelta(hours=3))).status_code == 202
+    with connect(env["url"]) as conn:
+        count = conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"]
+    assert count == 5
+
+
+def test_session_cap_holds_under_concurrency(env, monkeypatch):
+    monkeypatch.setattr(gateway, "MAX_SESSION_ACTIVE", 1)
+    post(
+        env,
+        "/v1/bolna/tools/check-slots",
+        call(doctor="Demo Doctor", service="Consultation", day=str(DAY)),
+    )
+    barrier = Barrier(3)
+    client = env["client"]
+
+    def run(i):
+        barrier.wait()
+        body = reserve_body(starts_at=SLOT + timedelta(minutes=15 * i))
+        return client.post(
+            "/v1/bolna/tools/reserve-slot", json=body, headers=auth(env["token"])
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        outcomes = sorted(pool.map(run, range(3)))
+    assert outcomes == [202, 409, 409]
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 1

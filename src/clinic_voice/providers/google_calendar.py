@@ -28,10 +28,8 @@ Error mapping (see the CalendarPort obligations in providers/calendar.py):
 """
 
 import logging
-import re
 import time
 from datetime import UTC, datetime, timedelta
-from email.utils import parsedate_to_datetime
 from threading import Lock
 from urllib.parse import quote
 
@@ -46,6 +44,7 @@ from clinic_voice.providers.calendar import (
     ProviderTimeout,
     merge_intervals,
 )
+from clinic_voice.providers.http import MAX_RETRY_AFTER, retry_after  # noqa: F401 (re-export)
 
 log = logging.getLogger("clinic_voice.google")
 
@@ -61,7 +60,6 @@ SCOPES = (
 )
 DEFAULT_TIMEOUT = 10.0
 TOKEN_EXPIRY_MARGIN = 60.0
-MAX_RETRY_AFTER = 3600.0
 RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
 PLACEHOLDER_START = datetime(1970, 1, 1, tzinfo=UTC)
 
@@ -74,25 +72,6 @@ class OAuthError(Exception):
         super().__init__(code)
         self.code = code
         self.retryable = retryable
-
-
-def retry_after(response: httpx.Response) -> float | None:
-    value = response.headers.get("retry-after")
-    if not value:
-        return None
-    value = value.strip()
-    # str.isdigit() accepts characters such as superscripts that float() rejects; ASCII only.
-    if re.fullmatch(r"[0-9]{1,10}", value):
-        seconds = float(value)
-    else:
-        try:
-            when = parsedate_to_datetime(value)
-        except (TypeError, ValueError, IndexError, OverflowError):
-            return None
-        if when.tzinfo is None:
-            when = when.replace(tzinfo=UTC)
-        seconds = (when - datetime.now(UTC)).total_seconds()
-    return min(max(seconds, 0.0), MAX_RETRY_AFTER)
 
 
 def _reason(response: httpx.Response) -> str | None:

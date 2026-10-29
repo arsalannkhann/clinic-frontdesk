@@ -2,6 +2,8 @@
 locks in this global order, and never in reverse, so the paths cannot deadlock:
 
 1. Action advisory lock: reserve() serializes one idempotency key ("<clinic>:<key>").
+1a. Call session row FOR NO KEY UPDATE (Bolna gateway reservations only): serializes the
+   per-session appointment cap check in reserve().
 2. Doctor-set advisory lock ("doctors:<clinic>"): shared by create_doctor, exclusive for a
    clinic-wide schedule exception, so no doctor appears mid-way through that exception.
 3. Doctor rows FOR UPDATE in ascending id order.

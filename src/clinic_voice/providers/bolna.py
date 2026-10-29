@@ -4,16 +4,22 @@ Endpoints follow the official API reference recorded in docs/SOURCE_REVIEW.md (c
 2026-10-29); none has been exercised against the live API. Tests use httpx.MockTransport
 only. Number purchase is deliberately not implemented.
 
-Error mapping (shared ProviderError classes from providers/calendar.py):
-- 429 and 5xx: ProviderRetryable, with Retry-After (header) or, for POST /call, the body's
-  retry_after_seconds when present.
+Error mapping (shared ProviderError classes from providers/calendar.py). Writes are
+create/update agent, inbound setup, start call and stop call; reads are get execution and
+list phone numbers.
+- Reads: 429 and 5xx are ProviderRetryable (with Retry-After when present); nothing changed.
+- Writes: 5xx is ProviderTimeout('http_<status>'): the provider may have acted before
+  failing, so the outcome is unknown and must be looked up before any retry. 429 is
+  ProviderRetryable only where Bolna documents that nothing was done (POST /call: the
+  number is still activating and no call was queued; wait retry_after_seconds); on other
+  writes it is ProviderTimeout('http_429') as well.
 - 401/403: ProviderPermanent('unauthorized'); other 4xx: ProviderPermanent('http_<status>').
   get_execution 404 is None.
-- Timeouts: for writes (create/update agent, inbound setup, start/stop call) a timeout after
-  the request may have been sent is ProviderTimeout (outcome unknown, never success). For
-  reads, and for connection failures before anything was sent, ProviderRetryable.
-- A 2xx write whose body lacks the expected id is ProviderTimeout('malformed'): the write
-  may have happened, so callers must reconcile by lookup rather than retry blindly.
+- Any 2xx on a write is accepted. A 2xx whose body lacks the expected id (create agent,
+  start call) is ProviderTimeout('malformed'): the write may have happened.
+- Timeouts: on writes a timeout after the request may have been sent is ProviderTimeout
+  (outcome unknown, never success). On reads, and for connection failures before anything
+  was sent, ProviderRetryable.
 
 Exceptions carry fixed short codes only. Bodies (transcripts, numbers, provider messages)
 and the API key are never logged or raised; httpx errors are not chained.
@@ -34,11 +40,12 @@ from clinic_voice.providers.calendar import (
     ProviderRetryable,
     ProviderTimeout,
 )
-from clinic_voice.providers.google_calendar import MAX_RETRY_AFTER, retry_after
+from clinic_voice.providers.http import MAX_RETRY_AFTER, retry_after
 
 DEFAULT_BASE = "https://api.bolna.ai"
 DEFAULT_TIMEOUT = 10.0
-# Execution statuses documented as terminal (no further webhook updates expected).
+# Statuses we treat as terminal (no further updates expected). This is our reading of the
+# documented status enum; Bolna does not document which statuses are final.
 TERMINAL_STATUSES = frozenset(
     {
         "completed",
@@ -213,8 +220,13 @@ def _body_retry_after(response: httpx.Response) -> float | None:
     return min(max(float(value), 0.0), MAX_RETRY_AFTER)
 
 
-def _error_for(response: httpx.Response) -> ProviderError:
+def _error_for(
+    response: httpx.Response, *, write: bool = False, safe_429: bool = False
+) -> ProviderError:
+    """safe_429: the endpoint documents that a 429 means nothing was done."""
     status = response.status_code
+    if write and (status >= 500 or (status == 429 and not safe_429)):
+        return ProviderTimeout(f"http_{status}")  # Outcome unknown: look up before retrying.
     if status == 429 or status >= 500:
         wait = retry_after(response)
         if wait is None and status == 429:
@@ -278,8 +290,8 @@ class BolnaClient:
 
     def create_agent(self, payload):
         response = self._send("POST", "/v2/agent", write=True, json=payload)
-        if response.status_code not in (200, 201):
-            raise _error_for(response)
+        if not response.is_success:
+            raise _error_for(response, write=True)
         body = _json(response)
         agent_id = body.get("agent_id") if isinstance(body, dict) else None
         if not isinstance(agent_id, str) or not SAFE_ID.fullmatch(agent_id):
@@ -288,8 +300,8 @@ class BolnaClient:
 
     def update_agent(self, agent_id, payload):
         response = self._send("PUT", f"/v2/agent/{_safe_id(agent_id)}", write=True, json=payload)
-        if response.status_code != 200:
-            raise _error_for(response)
+        if not response.is_success:
+            raise _error_for(response, write=True)
 
     def get_execution(self, execution_id):
         response = self._send("GET", f"/executions/{_safe_id(execution_id)}", write=False)
@@ -345,8 +357,8 @@ class BolnaClient:
             write=True,
             json={"agent_id": _safe_id(agent_id), "phone_number_id": _safe_id(phone_number_id)},
         )
-        if response.status_code != 200:
-            raise _error_for(response)
+        if not response.is_success:
+            raise _error_for(response, write=True)
 
     def start_outbound_call(
         self,
@@ -367,9 +379,9 @@ class BolnaClient:
         if user_data is not None:
             body["user_data"] = user_data
         response = self._send("POST", "/call", write=True, json=body)
-        if response.status_code != 200:
+        if not response.is_success:
             # 429 here is documented as "number still activating; no call was queued".
-            raise _error_for(response)
+            raise _error_for(response, write=True, safe_429=True)
         data = _json(response)
         execution_id = data.get("execution_id") if isinstance(data, dict) else None
         if not isinstance(execution_id, str) or not SAFE_ID.fullmatch(execution_id):
@@ -378,5 +390,5 @@ class BolnaClient:
 
     def stop_scheduled_call(self, execution_id):
         response = self._send("POST", f"/call/{_safe_id(execution_id)}/stop", write=True)
-        if response.status_code != 200:
-            raise _error_for(response)
+        if not response.is_success:
+            raise _error_for(response, write=True)

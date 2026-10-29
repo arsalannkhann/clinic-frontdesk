@@ -182,11 +182,15 @@ def tool_definitions(base_url: str, tool_token: str) -> dict:
     api_token = _token_header(tool_token)
     tools, params = [], {}
     for tool in TOOLS:
+        # Context fields go LAST in properties and in the param template: if Bolna substitutes
+        # values without JSON escaping, a quote-injected tool argument could add a duplicate
+        # key, and the later (platform-rendered) occurrence would win in a lenient parser.
+        # The gateway also rejects duplicate keys outright (routes_bolna.py).
         properties = {
-            name: {"type": "string", "description": text} for name, text in CONTEXT_PARAMS.items()
+            name: {"type": "string", "description": text} for name, text in tool["params"].items()
         }
         properties.update(
-            {name: {"type": "string", "description": text} for name, text in tool["params"].items()}
+            {name: {"type": "string", "description": text} for name, text in CONTEXT_PARAMS.items()}
         )
         definition = {
             "name": tool["name"],

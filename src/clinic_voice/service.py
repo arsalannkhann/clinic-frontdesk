@@ -151,9 +151,16 @@ def replay(conn, clinic_id, key, fingerprint):
         return response(row)
 
 
-def reserve(url, clinic_id, request, key, call_session_id=None):
+SESSION_LIMIT_MESSAGE = (
+    "I cannot hold any more times on this call. Clinic staff will help with further bookings."
+)
+
+
+def reserve(url, clinic_id, request, key, call_session_id=None, max_session_active=None):
     """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
-    session that created it (the gateway derives `key` from that session's execution id)."""
+    session that created it (the gateway derives `key` from that session's execution id).
+    max_session_active caps that session's pending_sync/confirmed appointments (409 beyond
+    it); replays are never capped."""
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
@@ -167,6 +174,20 @@ def reserve(url, clinic_id, request, key, call_session_id=None):
             previous = replay(conn, clinic_id, key, fingerprint)
             if previous:
                 return previous
+            if call_session_id is not None and max_session_active is not None:
+                # Lock order 1a (locks.py): serializes concurrent distinct reservations of
+                # one session so the cap holds.
+                conn.execute(
+                    "SELECT id FROM call_sessions WHERE clinic_id=%s AND id=%s FOR NO KEY UPDATE",
+                    (clinic_id, call_session_id),
+                )
+                held = conn.execute(
+                    """SELECT count(*) AS n FROM appointments WHERE clinic_id=%s
+                    AND call_session_id=%s AND status IN ('pending_sync', 'confirmed')""",
+                    (clinic_id, call_session_id),
+                ).fetchone()["n"]
+                if held >= max_session_active:
+                    raise HTTPException(409, SESSION_LIMIT_MESSAGE)
             # Short DB-only lock orders competing writes for the same doctor (see locks.py).
             # GiST exclusion alone can deadlock simultaneous overlapping inserts.
             lock_doctors(conn, clinic_id, [request.doctor_id])

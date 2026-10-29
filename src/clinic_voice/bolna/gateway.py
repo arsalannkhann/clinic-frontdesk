@@ -32,6 +32,8 @@ log = logging.getLogger("clinic_voice.bolna")
 PROVIDER = "bolna"
 KEY_PREFIX = "bolna:"
 SUPPORTED_LANGUAGES = ("en", "hi")
+# Most pending_sync/confirmed appointments one call session may create; more is a handoff.
+MAX_SESSION_ACTIVE = 3
 E164 = re.compile(r"\+[1-9]\d{6,14}")
 NOT_CONFIGURED = "Call session storage not configured"
 PLACEHOLDER_FAQ = (
@@ -107,7 +109,7 @@ def upsert_session(conn, clinic_id, context, crypto) -> UUID:
         return row["id"]
     row = conn.execute(
         """SELECT id, status, agent_id, caller_number_hash IS NULL AS no_number
-        FROM call_sessions WHERE clinic_id=%s AND execution_id=%s FOR UPDATE""",
+        FROM call_sessions WHERE clinic_id=%s AND execution_id=%s FOR NO KEY UPDATE""",
         (clinic_id, execution_id),
     ).fetchone()
     if row["status"] != "active":
@@ -193,8 +195,9 @@ def check_slots(conn, clinic_id, query):
     return {"slots": available, "spoken": spoken_slots(available, zone, query.day)}
 
 
-def reserve(url, conn, clinic_id, session_id, request):
-    doctor_id, service_id = resolve(conn, clinic_id, request.doctor, request.service)
+def reserve(url, clinic_id, session_id, request, doctor_id, service_id):
+    """Reserve through service.reserve with the derived key. The caller resolves the names
+    and releases its own connection first, so one reservation holds one connection."""
     args = {
         "doctor_id": str(doctor_id),
         "service_id": str(service_id),
@@ -207,12 +210,15 @@ def reserve(url, conn, clinic_id, session_id, request):
         ReservationRequest(doctor_id=doctor_id, service_id=service_id, starts_at=request.starts_at),
         key,
         call_session_id=session_id,
+        max_session_active=MAX_SESSION_ACTIVE,
     )
+    # A replay returns the appointment's current status (it may since have been confirmed,
+    # cancelled or sent for review): speak that, never a fixed "reserved".
     return {
         "appointment_id": result["appointment_id"],
         "status": result["status"],
         "starts_at": result["starts_at"],
-        "spoken": result["spoken_confirmation"],
+        "spoken": service.spoken_status(result["status"]),
     }
 
 
