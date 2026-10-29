@@ -49,6 +49,34 @@ PLACEHOLDER_EMERGENCY = (
     "No clinic-approved emergency script is configured. Say you cannot help with emergencies"
     " and ask the caller to contact local emergency services."
 )
+PLACEHOLDER_HANDOFF = (
+    "No clinic-approved handoff script is configured. Offer to pass a message to clinic staff."
+)
+NOT_ACCEPTING = (
+    "This line isn't accepting bookings yet. Please call the clinic directly and the team will"
+    " help you."
+)
+# Provisioning states (migration 015) in which the line answers at all, and in which it may
+# change bookings. verified also allows changes while the owner has test calls enabled.
+LINE_OPEN = ("verified", "active")
+
+
+def require_line(conn, clinic_id, changes: bool) -> None:
+    """Refuse the tool (403, speakable NOT_ACCEPTING) unless the clinic's line is open:
+    active for every tool; verified for context and read-only tools, and for
+    booking-changing tools too while clinics.test_calls_enabled is on. A clinic without a
+    provisioning row is not active. Runs before anything is written (no call session is
+    recorded for a refused request)."""
+    row = conn.execute(
+        "SELECT p.state, c.test_calls_enabled FROM clinics c"
+        " LEFT JOIN provisioning p ON p.clinic_id = c.id WHERE c.id=%s",
+        (clinic_id,),
+    ).fetchone()
+    state = row["state"] if row else None
+    if state == "active" or (state == "verified" and (not changes or row["test_calls_enabled"])):
+        return
+    conn.rollback()
+    raise HTTPException(403, NOT_ACCEPTING)
 
 
 def session_crypto(settings) -> tuple[Keyring, bytes]:
@@ -354,9 +382,14 @@ def appointment_status(conn, clinic_id, query):
 
 
 def clinic_context(conn, clinic_id):
-    clinic = conn.execute("SELECT name, timezone FROM clinics WHERE id=%s", (clinic_id,)).fetchone()
+    clinic = conn.execute(
+        "SELECT name, timezone, emergency_text, handoff_text, scripts_approved FROM clinics"
+        " WHERE id=%s",
+        (clinic_id,),
+    ).fetchone()
     if not clinic:
         raise HTTPException(404, "Clinic not found")
+    approved = clinic["scripts_approved"]
     rows = conn.execute(
         """SELECT d.id, d.name AS doctor, s.name AS service FROM doctors d
         LEFT JOIN services s ON s.clinic_id=d.clinic_id AND s.doctor_id=d.id AND s.active
@@ -376,6 +409,7 @@ def clinic_context(conn, clinic_id):
         "doctors": list(doctors.values()),
         "supported_languages": list(SUPPORTED_LANGUAGES),
         "faq_text": PLACEHOLDER_FAQ,
-        "emergency_text": PLACEHOLDER_EMERGENCY,
-        "approved_text": False,
+        "emergency_text": clinic["emergency_text"] if approved else PLACEHOLDER_EMERGENCY,
+        "handoff_text": clinic["handoff_text"] if approved else PLACEHOLDER_HANDOFF,
+        "approved_text": approved,
     }

@@ -51,6 +51,7 @@ EVENT_LIMIT = 50
 
 COLUMNS = (
     "state,resume_state,agent_id,agent_name,agent_create_pending,tool_credential_id,"
+    "attempt_credential_id,"
     "phone_number_id,calendar_attempts,agent_attempts,number_attempts,verify_attempts,"
     "last_error,version,updated_at"
 )
@@ -272,3 +273,48 @@ def reset(conn, staff):
     record(conn, clinic_id, row["state"], row["resume_state"], "reset", "reset", staff["id"])
     audit(conn, clinic_id, staff["id"], "provisioning.reset")
     return view(conn, clinic_id)
+
+
+class ManualActivationRefused(Exception):
+    """str(error) is a fixed operator-facing reason."""
+
+
+def activate_manual(conn, clinic_id) -> None:
+    """Mark a clinic set up by hand (agent recorded with `bolna set-agent`, number routed in
+    the Bolna dashboard) as active, so the gateway serves it. Operator CLI only. Checks what
+    still applies: the clinic exists and has no provisioning row (provisioned clinics are
+    activated through the API), its calendar is ready, its scripts are approved and its
+    bolna_agent_id is set. Writes the row (state active, the hand-set agent id, no number
+    id) and an event with no actor, outcome manual_activation. Nothing is sent to Bolna."""
+    clinic = conn.execute(
+        "SELECT bolna_agent_id, emergency_text, handoff_text, scripts_approved FROM clinics"
+        " WHERE id=%s FOR UPDATE",
+        (clinic_id,),
+    ).fetchone()
+    if clinic is None:
+        raise ManualActivationRefused("Clinic not found")
+    if load(conn, clinic_id, lock=True) is not None:
+        raise ManualActivationRefused(
+            "Clinic already has provisioning state; use the provisioning API"
+        )
+    if clinic["bolna_agent_id"] is None:
+        raise ManualActivationRefused("Set the agent first: clinic-voice bolna set-agent")
+    if not (
+        clinic["scripts_approved"]
+        and clinic["emergency_text"].strip()
+        and clinic["handoff_text"].strip()
+    ):
+        raise ManualActivationRefused("Approved emergency and handoff scripts are required")
+    if not calendar_ready(conn, clinic_id):
+        raise ManualActivationRefused("Connect a calendar and map a doctor first")
+    if conn.execute(
+        "SELECT 1 FROM provisioning WHERE agent_id=%s", (clinic["bolna_agent_id"],)
+    ).fetchone():
+        raise ManualActivationRefused("That agent is provisioned for another clinic")
+    conn.execute(
+        "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
+        " VALUES (%s,'active','verified',%s)",
+        (clinic_id, clinic["bolna_agent_id"]),
+    )
+    record(conn, clinic_id, "draft", "active", "activate", "manual_activation")
+    audit(conn, clinic_id, None, "provisioning.manual_activation")

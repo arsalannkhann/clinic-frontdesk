@@ -55,7 +55,7 @@ MARKER = "SYNTHETIC-BODY-MARKER"
 
 
 @pytest.fixture
-def env(database, monkeypatch):
+def env(database, monkeypatch, open_line):
     monkeypatch.setattr(service, "utc_now", lambda: NOW.astimezone(UTC))
     monkeypatch.setenv("DATABASE_URL", database)
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEYS", KEYS)
@@ -65,6 +65,7 @@ def env(database, monkeypatch):
         conn.execute(
             "INSERT INTO clinics (id,name) VALUES (%s,'Other Synthetic Clinic')", (OTHER_CLINIC,)
         )
+        open_line(conn, CLINIC, OTHER_CLINIC)
         conn.execute(
             "INSERT INTO doctors (id,clinic_id,name) VALUES (%s,%s,'Other Doctor')",
             (OTHER_DOCTOR, OTHER_CLINIC),
@@ -495,6 +496,7 @@ def test_context_has_no_phi(env):
         "supported_languages": ["en", "hi"],
         "faq_text": gateway.PLACEHOLDER_FAQ,
         "emergency_text": gateway.PLACEHOLDER_EMERGENCY,
+        "handoff_text": gateway.PLACEHOLDER_HANDOFF,
         "approved_text": False,
     }
     for secret in (CALLER, appointment_id, EXECUTION, str(DOCTOR_ID)):

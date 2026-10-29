@@ -285,6 +285,20 @@ def bolna_agent_command(url, args):
     print(f"{column}={agent_id or ''}")
 
 
+def provisioning_command(url, args):
+    """activate-manual: mark a hand-configured clinic active (provisioning.activate_manual).
+    Prints a fixed reason when a prerequisite is missing."""
+    from clinic_voice import provisioning
+
+    with connect(url) as conn:
+        try:
+            provisioning.activate_manual(conn, args.clinic)
+        except provisioning.ManualActivationRefused as error:
+            conn.rollback()
+            raise SystemExit(str(error)) from None
+    print(f"provisioning state=active clinic={args.clinic}")
+
+
 def retention_command(url, args, settings):
     """Purge expired patient records and old call sessions. Prints counts only."""
     from clinic_voice.retention import purge
@@ -365,6 +379,13 @@ def main(argv=None):
     agent_choice = set_agent.add_mutually_exclusive_group(required=True)
     agent_choice.add_argument("--agent-id", type=UUID)
     agent_choice.add_argument("--clear", action="store_true")
+    provisioning = commands.add_parser("provisioning", help="Clinic provisioning (operator)")
+    provisioning_actions = provisioning.add_subparsers(dest="action", required=True)
+    manual = provisioning_actions.add_parser(
+        "activate-manual",
+        help="Mark a clinic set up by hand (bolna set-agent) active after checking prerequisites",
+    )
+    manual.add_argument("--clinic", type=UUID, required=True)
     retention = commands.add_parser("retention", help="Data retention (operator-run only)")
     retention_actions = retention.add_subparsers(dest="action", required=True)
     purge = retention_actions.add_parser(
@@ -408,6 +429,8 @@ def main(argv=None):
         bolna_agent_command(url, args)
     elif args.command == "bolna":
         bolna_command(url, args, settings)
+    elif args.command == "provisioning":
+        provisioning_command(url, args)
     elif args.command == "retention":
         retention_command(url, args, settings)
     else:

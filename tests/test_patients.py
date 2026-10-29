@@ -53,7 +53,7 @@ RESERVE = "/v1/bolna/tools/reserve-slot"
 
 
 @pytest.fixture
-def env(database, monkeypatch):
+def env(database, monkeypatch, open_line):
     monkeypatch.setattr(service, "utc_now", lambda: NOW.astimezone(UTC))
     monkeypatch.setattr(staff, "SCRYPT_N", 2**10)
     monkeypatch.setenv("DATABASE_URL", database)
@@ -62,6 +62,7 @@ def env(database, monkeypatch):
     get_settings.cache_clear()
     with connect(database) as conn:
         conn.execute("INSERT INTO clinics (id,name) VALUES (%s,'Other Synthetic')", (OTHER_CLINIC,))
+        open_line(conn, CLINIC, OTHER_CLINIC)
         _, token = credentials.issue(conn, CLINIC, "t7")
         _, other = credentials.issue(conn, OTHER_CLINIC, "t7-other")
         conn.execute("UPDATE doctors SET booking_calendar_id=%s WHERE id=%s", (CAL, DOCTOR_ID))

@@ -60,7 +60,7 @@ ALLOWED_KEYS = {
 
 
 @pytest.fixture
-def env(database, monkeypatch):
+def env(database, monkeypatch, open_line):
     monkeypatch.setattr(staff, "SCRYPT_N", 2**10)
     monkeypatch.setenv("DATABASE_URL", database)
     monkeypatch.setenv("TOKEN_ENCRYPTION_KEYS", KEYS)
@@ -72,6 +72,7 @@ def env(database, monkeypatch):
         conn.execute(
             "INSERT INTO clinics (id,name) VALUES (%s,'Other Synthetic Clinic')", (OTHER_CLINIC,)
         )
+        open_line(conn, CLINIC, OTHER_CLINIC)
         _, hook = credentials.issue(conn, CLINIC, "bolna-webhook", scope="webhook")
         _, other_hook = credentials.issue(conn, OTHER_CLINIC, "bolna-webhook", scope="webhook")
         _, tool = credentials.issue(conn, CLINIC, "bolna-tools")

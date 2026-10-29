@@ -178,6 +178,8 @@ class ClinicConfig(StrictModel):
     emergency_text: str
     handoff_text: str
     scripts_approved: bool
+    # While provisioning is verified, also allow booking-changing tools (owner test calls).
+    test_calls_enabled: bool
 
 
 class ClinicUpdate(PatchModel):
@@ -192,7 +194,8 @@ class ClinicUpdate(PatchModel):
     daily_contact_budget: ContactBudget | None = None
     emergency_text: ScriptText | None = None
     handoff_text: ScriptText | None = None
-    scripts_approved: bool | None = None
+    scripts_approved: bool | None = None  # Owner only.
+    test_calls_enabled: bool | None = None  # Owner only.
 
     @model_validator(mode="after")
     def _quiet_window(self):
@@ -587,9 +590,12 @@ class BolnaContextOut(StrictModel):
     today: date
     doctors: list[BolnaDoctorOut]
     supported_languages: list[str]
-    faq_text: str
+    faq_text: str  # Always a placeholder: no clinic FAQ content exists yet.
     emergency_text: str
-    approved_text: bool  # False: the two texts above are placeholders, not clinic-approved.
+    handoff_text: str
+    # True: emergency_text and handoff_text are the clinic's approved scripts. False: both
+    # are placeholders.
+    approved_text: bool
 
 
 # Staff appointment views (routes_appointments.py)

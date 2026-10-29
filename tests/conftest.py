@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from psycopg.conninfo import conninfo_to_dict
@@ -23,3 +24,20 @@ def database():
         )
     seed(url)
     yield url
+
+
+def _open_line(conn, *clinics):
+    """Mark clinics' provisioning active so the Bolna gateway serves them (T10 gating).
+    Gateway tests that are not about gating start from an open line."""
+    for clinic in clinics:
+        conn.execute(
+            "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
+            " VALUES (%s,'active','verified',%s)"
+            " ON CONFLICT (clinic_id) DO UPDATE SET state='active'",
+            (clinic, str(uuid4())),
+        )
+
+
+@pytest.fixture
+def open_line():
+    return _open_line

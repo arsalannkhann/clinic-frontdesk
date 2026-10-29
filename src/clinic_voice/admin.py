@@ -27,9 +27,10 @@ def _update(conn, table, columns, clinic_id, row_id, changes):
 CLINIC_COLUMNS = (
     "id,name,timezone,lead_time_minutes,horizon_days,outbound_enabled,quiet_hours_start,"
     "quiet_hours_end,reminder_lead_minutes,daily_contact_budget,emergency_text,handoff_text,"
-    "scripts_approved"
+    "scripts_approved,test_calls_enabled"
 )
 SCRIPT_COLUMNS = ("emergency_text", "handoff_text")
+OWNER_COLUMNS = ("scripts_approved", "test_calls_enabled")
 
 
 def _clinic_out(row):
@@ -60,9 +61,11 @@ def update_clinic(conn, staff, changes):
     outbound_enabled, quiet hours and the budget. A change of outbound_enabled is audited
     separately ('clinic.outbound_enabled' / 'clinic.outbound_disabled').
 
-    Emergency and handoff scripts (T10): changing either text clears scripts_approved unless
-    the same request sets it; approval needs both texts non-empty (422 otherwise) and is
-    audited as 'clinic.scripts_approved'.
+    Emergency and handoff scripts (T10): owners and admins edit the texts; changing either
+    clears scripts_approved unless the same request sets it. Only an owner sets
+    scripts_approved or test_calls_enabled (403 otherwise). Approval needs both texts
+    non-empty (422 otherwise) and is audited as 'clinic.scripts_approved';
+    test_calls_enabled changes as 'clinic.test_calls_enabled' / 'clinic.test_calls_disabled'.
     """
     clinic_id = staff["clinic_id"]
     columns = (
@@ -76,10 +79,12 @@ def update_clinic(conn, staff, changes):
         "reminder_lead_minutes",
         "daily_contact_budget",
         *SCRIPT_COLUMNS,
-        "scripts_approved",
+        *OWNER_COLUMNS,
     )
     if not changes or not set(changes) <= set(columns):
         raise ValueError("invalid update columns")
+    if set(OWNER_COLUMNS) & set(changes) and staff["role"] != "owner":
+        raise HTTPException(403, "Insufficient role")
     changes = dict(changes)
     if set(SCRIPT_COLUMNS) & set(changes) and "scripts_approved" not in changes:
         changes["scripts_approved"] = False  # Edited text must be approved again.
@@ -101,6 +106,13 @@ def update_clinic(conn, staff, changes):
     audit(conn, clinic_id, staff["id"], "clinic.updated", clinic_id)
     if changes.get("scripts_approved"):
         audit(conn, clinic_id, staff["id"], "clinic.scripts_approved", clinic_id)
+    if "test_calls_enabled" in changes:
+        action = (
+            "clinic.test_calls_enabled"
+            if changes["test_calls_enabled"]
+            else "clinic.test_calls_disabled"
+        )
+        audit(conn, clinic_id, staff["id"], action, clinic_id)
     if "outbound_enabled" in changes:
         action = (
             "clinic.outbound_enabled" if changes["outbound_enabled"] else "clinic.outbound_disabled"

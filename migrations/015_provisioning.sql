@@ -8,13 +8,21 @@
 -- change, number selection, reset and activation, and fences jobs (a job carries the
 -- version it was enqueued at).
 --
--- No secret is stored: tool_credential_id names the tenant credential issued for the agent
--- (its plaintext lived only in worker memory). The owner selects phone_number_id (a Bolna
+-- No secret is stored. tool_credential_id names the tenant credential the agent is known to
+-- hold (set when Bolna acknowledged the agent write); attempt_credential_id the one issued
+-- for an agent write whose outcome is still unknown (a timeout), which the agent may hold.
+-- Their plaintext lived only in worker memory. The owner selects phone_number_id (a Bolna
 -- number id; the number itself is never stored). agent_name is the deterministic provider
 -- reference ("clinic-<clinic hex>-v1") used to find an agent after an ambiguous create;
 -- agent_create_pending is the write-ahead intent set before POST /v2/agent and cleared once
 -- the agent id is recorded. The tool-free outbound (reminder) agent is not provisioned
 -- here; it stays a manual owner step (clinic-voice bolna set-agent --outbound).
+--
+-- A clinic set up by hand (bolna set-agent) gets its row from
+-- `clinic-voice provisioning activate-manual`: state active with the hand-set agent id and
+-- no phone_number_id (the number was routed outside this system). The Bolna gateway refuses
+-- booking tools unless the state is active (or verified with clinics.test_calls_enabled),
+-- and every tool unless it is verified or active; no row counts as not active.
 ALTER TABLE tenant_credentials
     ADD CONSTRAINT tenant_credentials_clinic_id_key UNIQUE (clinic_id, id);
 
@@ -34,6 +42,7 @@ CREATE TABLE provisioning (
     agent_name text CHECK (agent_name IS NULL OR agent_name ~ '^clinic-[0-9a-f]{32}-v[0-9]{1,4}$'),
     agent_create_pending boolean NOT NULL DEFAULT false,
     tool_credential_id uuid,
+    attempt_credential_id uuid,
     phone_number_id text CHECK (phone_number_id IS NULL OR phone_number_id ~ '^[A-Za-z0-9-]{1,64}$'),
     calendar_attempts integer NOT NULL DEFAULT 0 CHECK (calendar_attempts >= 0),
     agent_attempts integer NOT NULL DEFAULT 0 CHECK (agent_attempts >= 0),
@@ -44,9 +53,10 @@ CREATE TABLE provisioning (
     version integer NOT NULL DEFAULT 1 CHECK (version >= 1),
     updated_at timestamptz NOT NULL DEFAULT now(),
     FOREIGN KEY (clinic_id, tool_credential_id) REFERENCES tenant_credentials(clinic_id, id),
+    FOREIGN KEY (clinic_id, attempt_credential_id) REFERENCES tenant_credentials(clinic_id, id),
     CHECK (state NOT IN ('agent_created', 'number_assigned', 'verified', 'active')
         OR agent_id IS NOT NULL),
-    CHECK (state NOT IN ('number_assigned', 'verified', 'active') OR phone_number_id IS NOT NULL)
+    CHECK (state NOT IN ('number_assigned', 'verified') OR phone_number_id IS NOT NULL)
 );
 -- The Bolna account is shared by every clinic: one number serves one clinic.
 CREATE UNIQUE INDEX provisioning_phone_number ON provisioning (phone_number_id)
@@ -88,10 +98,15 @@ CREATE UNIQUE INDEX outbox_provision_step ON outbox (clinic_id)
     WHERE kind = 'provision.step' AND status IN ('pending', 'processing');
 
 -- Clinic-approved scripts the agent must use for emergencies and human handoff. Editing a
--- text clears the approval unless the same change approves it. Activation requires both
--- non-empty and approved. (The Bolna context tool still serves placeholders; wiring these
--- texts into it is a follow-up.)
+-- text clears the approval unless the same change approves it; only an owner approves.
+-- Activation requires both non-empty and approved; the Bolna context tool serves them once
+-- approved (placeholders otherwise).
+--
+-- test_calls_enabled (owner only, audited, default false): while provisioning is verified
+-- (not yet active), the gateway also allows booking-changing tools, so the owner can place
+-- test calls before activation.
 ALTER TABLE clinics
+    ADD COLUMN test_calls_enabled boolean NOT NULL DEFAULT false,
     ADD COLUMN emergency_text text NOT NULL DEFAULT ''
         CHECK (char_length(emergency_text) <= 1000),
     ADD COLUMN handoff_text text NOT NULL DEFAULT '' CHECK (char_length(handoff_text) <= 1000),

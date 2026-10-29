@@ -65,7 +65,7 @@ ALL_CONSENTS = {
 
 
 @pytest.fixture
-def env(database, monkeypatch):
+def env(database, monkeypatch, open_line):
     clock = {"now": NOW}
     monkeypatch.setattr(service, "utc_now", lambda: clock["now"].astimezone(UTC))
     monkeypatch.setattr(staff, "SCRYPT_N", 2**10)
@@ -75,6 +75,7 @@ def env(database, monkeypatch):
     get_settings.cache_clear()
     with connect(database) as conn:
         conn.execute("INSERT INTO clinics (id,name) VALUES (%s,'Other Synthetic')", (OTHER_CLINIC,))
+        open_line(conn, CLINIC, OTHER_CLINIC)
         conn.execute(
             "UPDATE clinics SET outbound_enabled=true, bolna_agent_id=%s,"
             " bolna_outbound_agent_id=%s WHERE id=%s",

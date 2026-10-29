@@ -2,11 +2,21 @@
 
 Payload {version}: the provisioning version when the step was enqueued. A job whose version
 no longer matches (a reset, a number change, another step) completes as 'stale' and does
-nothing. Each run first counts the step attempt in its own committed statement (more than
-STEP_MAX_ATTEMPTS runs of one step goes to manual_review), then reads with the connection
-idle, calls Bolna with no transaction open, and applies the outcome in one transaction that
-takes its own fenced outbox row, then the provisioning row (re-checking version and state),
-writes the transition and its provisioning_events row and completes the job.
+nothing. Each run reads with the connection idle, calls Bolna with no transaction open, and
+applies the outcome in one transaction that takes its own fenced outbox row, then the
+provisioning row (re-checking version and state), writes the transition and its
+provisioning_events row and completes the job.
+
+Attempt budget: a step's counter grows for each provider write (agent create/update, number
+assignment) and each provider error; refusals (calendar_not_connected, number_not_in_account,
+...) and successful reads do not count. A step whose counter has reached STEP_MAX_ATTEMPTS
+goes to manual_review (retries_exhausted) before any further provider call.
+
+Credentials: an agent write is sent with a credential recorded as attempt_credential_id; once
+Bolna acknowledges it, it becomes tool_credential_id. Whenever a step ends in failed or
+manual_review, every provisioning credential of the clinic except tool_credential_id (held
+by the agent) and attempt_credential_id (possibly held: a write whose outcome is unknown)
+is revoked; a write Bolna refused (4xx) or never sent gives its credential up at once.
 
 Steps:
 - calendar (draft): provisioning.calendar_ready, no provider call. Not ready is a refusal:
@@ -14,7 +24,7 @@ Steps:
 - agent (calendar_connected): compile the agent (agent_config) under the deterministic name
   agent_name(); find an existing agent by the stored agent_id, else by name in
   list_agents(); then issue a fresh tool credential (plaintext in memory only; its id is
-  recorded) and update the found agent (PUT, full replacement) or create one. Before a
+  recorded as attempt_credential_id) and update the found agent (PUT, full replacement) or create one. Before a
   create, agent_create_pending is committed as write intent. A create that timed out (or a
   crash after the intent) is reconciled on the next attempt by the name lookup; when the
   port has no lookup, or the lookup is not documented as consistent and finds nothing, the
@@ -83,6 +93,7 @@ def _finish(conn, job, row, to_state, step, outcome, *, resume=None, **values) -
         log.info("provision step stale id=%s", job.id)
         return complete(conn, job)
     changes = dict(values)
+    stopped = to_state in ("failed", "manual_review")
     advanced = to_state != row["state"] and to_state not in ("failed", "manual_review")
     # A refusal (same state), failure or review keeps its code; an advance clears it.
     changes["last_error"] = None if advanced else outcome
@@ -98,6 +109,8 @@ def _finish(conn, job, row, to_state, step, outcome, *, resume=None, **values) -
         f"UPDATE provisioning SET {sets}{bump}, updated_at=now() WHERE clinic_id=%s",  # noqa: S608
         (*changes.values(), job.clinic_id),
     )
+    if stopped:
+        _revoke_unheld(conn, job.clinic_id)
     service.record(conn, job.clinic_id, row["state"], to_state, step, outcome)
     if not mark_done(conn, job):
         conn.rollback()
@@ -105,6 +118,25 @@ def _finish(conn, job, row, to_state, step, outcome, *, resume=None, **values) -
     conn.commit()
     log.info("provision step done id=%s step=%s outcome=%s", job.id, step, outcome)
     return True
+
+
+def _revoke_unheld(conn, clinic_id):
+    """Revoke the clinic's provisioning credentials that no agent holds or may hold (all but
+    tool_credential_id and attempt_credential_id). Runs after the row update, in its
+    transaction."""
+    conn.execute(
+        "UPDATE tenant_credentials SET revoked_at=now() WHERE clinic_id=%(c)s AND label=%(l)s"
+        " AND revoked_at IS NULL"
+        " AND id IS DISTINCT FROM (SELECT tool_credential_id FROM provisioning"
+        " WHERE clinic_id=%(c)s)"
+        " AND id IS DISTINCT FROM (SELECT attempt_credential_id FROM provisioning"
+        " WHERE clinic_id=%(c)s)",
+        {"c": clinic_id, "l": service.CREDENTIAL_LABEL},
+    )
+
+
+def _exhausted(row, step) -> bool:
+    return row[ATTEMPT_COLUMNS[step]] >= service.STEP_MAX_ATTEMPTS
 
 
 def _count_attempt(conn, job, step):
@@ -118,7 +150,11 @@ def _count_attempt(conn, job, step):
     return None if row is None else row["n"]
 
 
-def _provider_error(conn, job, row, step, error: ProviderError) -> bool:
+def _provider_error(conn, job, row, step, error: ProviderError, counted=False) -> bool:
+    """Map a provider error. It counts against the step budget unless the write that failed
+    was already counted (counted=True)."""
+    if not counted and _count_attempt(conn, job, step) is None:
+        return complete(conn, job)  # The row moved on: this job is stale.
     if isinstance(error, ProviderPermanent):
         code = "unauthorized" if error.code == "unauthorized" else "provider_permanent"
         return _finish(conn, job, row, "failed", step, code)
@@ -140,10 +176,7 @@ def step(conn, job, ports) -> bool:
         log.info("provision step stale id=%s", job.id)
         return complete(conn, job)
     name = service.STEPS[row["state"]]
-    attempts = _count_attempt(conn, job, name)
-    if attempts is None:
-        return complete(conn, job)
-    if attempts > service.STEP_MAX_ATTEMPTS:
+    if _exhausted(row, name):
         return _finish(conn, job, row, "manual_review", name, "retries_exhausted")
     port = getattr(ports, "bolna", None)
     if name != "calendar" and port is None:
@@ -216,9 +249,11 @@ def _agent(conn, job, port, row) -> bool:
         conn.rollback()
         return False
     credential_id, token = credentials.issue(conn, clinic_id, service.CREDENTIAL_LABEL)
+    # The write below counts as an attempt whatever its outcome.
     updated = conn.execute(
-        "UPDATE provisioning SET tool_credential_id=%s, agent_name=%s,"
-        " agent_create_pending = agent_create_pending OR %s, updated_at=now()"
+        "UPDATE provisioning SET attempt_credential_id=%s, agent_name=%s,"
+        " agent_create_pending = agent_create_pending OR %s,"
+        " agent_attempts = agent_attempts + 1, updated_at=now()"
         " WHERE clinic_id=%s AND version=%s AND state='calendar_connected' RETURNING clinic_id",
         (credential_id, name, agent_id is None, clinic_id, row["version"]),
     ).fetchone()
@@ -234,7 +269,18 @@ def _agent(conn, job, port, row) -> bool:
             tool_token=token,
         )
     except ValueError:
-        return _finish(conn, job, row, "failed", "agent", "agent_config_invalid")
+        # Nothing was sent: give this attempt's credential up and restore the previous
+        # intent (an earlier timed-out create may still be unresolved).
+        return _finish(
+            conn,
+            job,
+            row,
+            "failed",
+            "agent",
+            "agent_config_invalid",
+            agent_create_pending=row["agent_create_pending"],
+            attempt_credential_id=row["attempt_credential_id"],
+        )
     finally:
         del token
     payload["agent_config"]["agent_name"] = name
@@ -246,12 +292,21 @@ def _agent(conn, job, port, row) -> bool:
         else:
             port.update_agent(agent_id, payload)
     except ProviderPermanent as error:
-        # A 4xx means the write was refused; nothing was created.
-        values = {"agent_create_pending": False} if created else {}
+        # A 4xx means this write was refused: its credential is given up. An earlier
+        # timed-out create, if any, is still unresolved, so its intent and credential stay.
         code = "unauthorized" if error.code == "unauthorized" else "provider_permanent"
-        return _finish(conn, job, row, "failed", "agent", code, **values)
+        return _finish(
+            conn,
+            job,
+            row,
+            "failed",
+            "agent",
+            code,
+            agent_create_pending=row["agent_create_pending"],
+            attempt_credential_id=row["attempt_credential_id"],
+        )
     except ProviderError as error:
-        return _provider_error(conn, job, row, "agent", error)
+        return _provider_error(conn, job, row, "agent", error, counted=True)
     finally:
         del payload
     return _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created)
@@ -275,9 +330,9 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
         return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
     conn.execute(
         "UPDATE provisioning SET agent_id=%s, agent_create_pending=false, state='agent_created',"
-        " resume_state='agent_created', last_error=NULL, version=version + 1, updated_at=now()"
-        " WHERE clinic_id=%s",
-        (agent_id, job.clinic_id),
+        " tool_credential_id=%s, attempt_credential_id=NULL, resume_state='agent_created',"
+        " last_error=NULL, version=version + 1, updated_at=now() WHERE clinic_id=%s",
+        (agent_id, credential_id, job.clinic_id),
     )
     conn.execute("UPDATE clinics SET bolna_agent_id=%s WHERE id=%s", (agent_id, job.clinic_id))
     # The agent now carries the new credential: earlier provisioning credentials (from
@@ -314,10 +369,13 @@ def _number(conn, job, port, row) -> bool:
     if number.agent_id is not None and number.agent_id != row["agent_id"]:
         return _finish(conn, job, row, "agent_created", "number", "number_in_use")
     if number.agent_id != row["agent_id"]:
+        if _count_attempt(conn, job, "number") is None:
+            return complete(conn, job)
+        require_idle(conn)
         try:
             port.assign_phone_number(number_id, row["agent_id"])
         except ProviderError as error:
-            return _provider_error(conn, job, row, "number", error)
+            return _provider_error(conn, job, row, "number", error, counted=True)
     return _finish(conn, job, row, "number_assigned", "number", "ok")
 
 
@@ -393,6 +451,7 @@ def on_dead(conn, job):
         " version=version + 1, updated_at=now() WHERE clinic_id=%s",
         (job.clinic_id,),
     )
+    _revoke_unheld(conn, job.clinic_id)
     service.record(
         conn,
         job.clinic_id,

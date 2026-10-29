@@ -4,6 +4,12 @@ Authentication is the tenant tool credential (`cvt_` token) that the compiled ag
 its tool `api_token` ("Bearer <token>", which Bolna documents as the Authorization header
 value). The credential alone selects the clinic; call-context fields in the body never do.
 Responses are private (no-store) and carry no patient data or caller number.
+
+Line gating (T10, gateway.require_line), before anything is written: booking-changing tools
+(reserve-slot, cancel-booking, reschedule-booking, opt-out) need provisioning state active,
+or verified with the owner's test_calls_enabled; context and read-only tools (check-slots,
+appointment-status, verify-booking) need verified or active. Otherwise 403 with a speakable
+"not accepting bookings yet" sentence.
 """
 
 import json
@@ -85,6 +91,7 @@ def context(
     response.headers.update(NO_STORE)
     crypto = gateway.session_crypto(get_settings()) if call is not None else None
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=False)
         if call is not None:
             gateway.upsert_session(conn, clinic_id, call, crypto)
         return gateway.clinic_context(conn, clinic_id)
@@ -95,6 +102,7 @@ def check_slots(query: BolnaSlotQuery, response: Response, clinic_id=Depends(ten
     response.headers.update(NO_STORE)
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=False)
         gateway.upsert_session(conn, clinic_id, query, crypto)
         return gateway.check_slots(conn, clinic_id, query)
 
@@ -105,6 +113,7 @@ def reserve_slot(request: BolnaReservation, response: Response, clinic_id=Depend
     settings = get_settings()
     crypto = gateway.session_crypto(settings)
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=True)
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
         gateway.refuse_reminder_call(conn, clinic_id, request)
         doctor_id, service_id = gateway.resolve(conn, clinic_id, request.doctor, request.service)
@@ -126,6 +135,7 @@ def appointment_status(query: BolnaStatusQuery, response: Response, clinic_id=De
     response.headers.update(NO_STORE)
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=False)
         gateway.upsert_session(conn, clinic_id, query, crypto)
         return gateway.appointment_status(conn, clinic_id, query)
 
@@ -135,6 +145,7 @@ def verify_booking(query: BolnaVerify, response: Response, clinic_id=Depends(ten
     response.headers.update(NO_STORE)
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=False)
         session_id = gateway.upsert_session(conn, clinic_id, query, crypto)
         gateway.refuse_reminder_call(conn, clinic_id, query)
         return bookings.verify(conn, clinic_id, session_id, query, crypto[1])
@@ -145,6 +156,7 @@ def cancel_booking(request: BolnaCancel, response: Response, clinic_id=Depends(t
     response.headers.update(NO_STORE)
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=True)
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
         gateway.refuse_reminder_call(conn, clinic_id, request)
         return bookings.cancel(conn, clinic_id, session_id, request)
@@ -156,6 +168,7 @@ def reschedule_booking(request: BolnaReschedule, response: Response, clinic_id=D
     settings = get_settings()
     crypto = gateway.session_crypto(settings)
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=True)
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
         gateway.refuse_reminder_call(conn, clinic_id, request)
     return bookings.reschedule(
@@ -174,6 +187,7 @@ def opt_out(request: BolnaOptOut, response: Response, clinic_id=Depends(tenant))
     response.headers.update(NO_STORE)
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
+        gateway.require_line(conn, clinic_id, changes=True)
         session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
         gateway.refuse_reminder_call(conn, clinic_id, request)
         return bookings.opt_out(conn, clinic_id, session_id, request)
