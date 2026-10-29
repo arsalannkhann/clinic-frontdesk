@@ -1,0 +1,88 @@
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --text: #1c2128;
+  --muted: #5b6573;
+  --border: #d5dae1;
+  --accent: #1f5fbf;
+  --ok: #1d7a3a;
+  --warn: #8a5a00;
+  --bad: #b3261e;
+  --info: #285e9e;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14171c;
+    --card: #1c2027;
+    --text: #e6e9ee;
+    --muted: #9aa4b2;
+    --border: #343b46;
+    --accent: #7aa7ff;
+    --ok: #6fd08c;
+    --warn: #f0b84d;
+    --bad: #ff8a80;
+    --info: #8db8ff;
+  }
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); }
+h1 { font-size: 1.4rem; margin: 0 0 1rem; }
+h2 { font-size: 1.1rem; margin: 0 0 0.75rem; }
+h3 { font-size: 1rem; margin: 1rem 0 0.5rem; }
+
+.topbar { display: flex; gap: 1rem; align-items: center; padding: 0.6rem 1rem; background: var(--card); border-bottom: 1px solid var(--border); }
+.topbar .who { margin-left: auto; color: var(--muted); }
+.nav { display: flex; flex-wrap: wrap; gap: 0.25rem; padding: 0.5rem 1rem; border-bottom: 1px solid var(--border); background: var(--card); }
+.nav a { padding: 0.3rem 0.6rem; border-radius: 6px; color: var(--text); text-decoration: none; }
+.nav a.active, .nav a:hover { background: var(--bg); color: var(--accent); }
+.content { padding: 1rem; max-width: 1200px; }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+.login-wrap { display: grid; place-items: center; min-height: 100vh; padding: 1rem; }
+.login { width: min(420px, 100%); }
+
+fieldset { border: 1px solid var(--border); border-radius: 6px; padding: 0.75rem; margin: 0 0 0.75rem; }
+.field { display: flex; flex-direction: column; gap: 0.2rem; margin-bottom: 0.6rem; }
+.field-label { font-weight: 600; font-size: 0.9rem; }
+.hint, .muted { color: var(--muted); font-size: 0.85rem; }
+input, select, textarea { font: inherit; padding: 0.35rem 0.5rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--text); max-width: 100%; }
+textarea { width: 100%; }
+input[type="checkbox"] { width: 1.1rem; height: 1.1rem; }
+.inline-form { display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: flex-end; margin: 0.75rem 0; }
+.inline-form .field { margin-bottom: 0; }
+.actions { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
+.stack > * + * { margin-top: 0.75rem; }
+.editor { border-top: 1px solid var(--border); margin-top: 0.75rem; padding-top: 0.75rem; }
+.hours-row { display: flex; gap: 0.5rem; margin-bottom: 0.4rem; align-items: center; }
+
+.btn { font: inherit; padding: 0.35rem 0.8rem; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; text-decoration: none; display: inline-block; }
+.btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn-danger { border-color: var(--bad); color: var(--bad); }
+.btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.table-wrap { overflow-x: auto; }
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-size: 0.85rem; color: var(--muted); }
+.empty { color: var(--muted); }
+
+.badge { display: inline-block; padding: 0.1rem 0.5rem; border-radius: 999px; font-size: 0.8rem; border: 1px solid currentColor; white-space: nowrap; }
+.badge-ok { color: var(--ok); }
+.badge-warn { color: var(--warn); }
+.badge-bad { color: var(--bad); }
+.badge-info { color: var(--info); }
+.badge-neutral { color: var(--muted); }
+
+.status:empty { display: none; }
+.status-ok { color: var(--ok); }
+.status-error { color: var(--bad); }
+.status-info { color: var(--muted); }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 0.3rem 1rem; margin: 0 0 0.75rem; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; }

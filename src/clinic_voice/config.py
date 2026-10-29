@@ -20,6 +20,31 @@ def _https_or_loopback(value: str | None, name: str) -> str | None:
     raise ValueError(f"{name} must be https (http only for localhost)")
 
 
+def _origin(value: str) -> str:
+    """One browser origin (scheme://host[:port]) in canonical lowercase form, or ValueError.
+    No wildcard, path, query, fragment or credentials: CORS compares origins exactly."""
+    parts = urlsplit(value)
+    try:
+        port = parts.port
+    except ValueError:
+        raise ValueError("dashboard_origins must list origins") from None
+    if (
+        "*" in value
+        or not parts.hostname
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+        or parts.username is not None
+    ):
+        raise ValueError("dashboard_origins must list origins such as https://dash.example")
+    _https_or_loopback(value, "dashboard_origins")
+    host = parts.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"  # IPv6 literal
+    default = {"https": 443, "http": 80}[parts.scheme]
+    return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     database_url: SecretStr
@@ -59,6 +84,21 @@ class Settings(BaseSettings):
     # after each poll, at most 24 h apart), at most this many sessions per housekeeping pass.
     bolna_reconcile_after_minutes: int = Field(default=30, ge=1, le=1440)
     bolna_reconcile_batch: int = Field(default=50, ge=1, le=1000)
+    # Staff dashboard (T11): comma-separated browser origins allowed to call /v1/staff/* and
+    # /v1/admin/* cross-origin (e.g. https://dash.clinic.example). Empty: no CORS headers at
+    # all (serve the dashboard same-origin, or use the Vite dev-server proxy).
+    dashboard_origins: str | None = None
+
+    @field_validator("dashboard_origins")
+    @classmethod
+    def _dashboard_origins(cls, value):
+        if value is None or not value.strip():
+            return None
+        origins = [_origin(part.strip()) for part in value.split(",") if part.strip()]
+        return ",".join(dict.fromkeys(origins))
+
+    def dashboard_origin_list(self) -> list[str]:
+        return self.dashboard_origins.split(",") if self.dashboard_origins else []
 
     @field_validator("google_redirect_uri")
     @classmethod

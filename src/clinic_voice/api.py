@@ -6,6 +6,7 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg import Error as DatabaseError
 
@@ -84,7 +85,45 @@ async def lifespan(app):
     yield
 
 
+DASHBOARD_PATHS = ("/v1/staff/", "/v1/admin/")
+CORS_METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE"]
+CORS_HEADERS = ["Authorization", "Content-Type"]
+
+
+class DashboardCORS:
+    """CORS for the staff dashboard only: the origins in DASHBOARD_ORIGINS (none by default),
+    on the staff and admin paths, without credentials (the dashboard sends a bearer token,
+    never cookies). Settings are read per request so the origin list follows configuration;
+    the Starlette middleware is rebuilt only when the list changes."""
+
+    def __init__(self, app):
+        self.app = app
+        self._origins: tuple[str, ...] = ()
+        self._cors = None
+
+    def _middleware(self, origins: tuple[str, ...]):
+        if origins != self._origins or self._cors is None:
+            self._cors = CORSMiddleware(
+                self.app,
+                allow_origins=list(origins),
+                allow_methods=CORS_METHODS,
+                allow_headers=CORS_HEADERS,
+                allow_credentials=False,
+                max_age=600,
+            )
+            self._origins = origins
+        return self._cors
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope["path"].startswith(DASHBOARD_PATHS):
+            origins = tuple(get_settings().dashboard_origin_list())
+            if origins:
+                return await self._middleware(origins)(scope, receive, send)
+        return await self.app(scope, receive, send)
+
+
 app = FastAPI(title="Clinic Voice AI", version="0.1.0", lifespan=lifespan)
+app.add_middleware(DashboardCORS)
 
 app.include_router(admin_router)
 app.include_router(appointments_router)

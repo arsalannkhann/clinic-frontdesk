@@ -24,7 +24,7 @@ clinic-voice staff create-owner --clinic 00000000-0000-4000-8000-000000000001 --
 uvicorn clinic_voice.api:app --reload --no-access-log
 ```
 
-Open [API docs](http://127.0.0.1:8000/docs) or [readiness](http://127.0.0.1:8000/health/ready). No frontend is implemented yet. Seed IDs: clinic `...0001`, doctor `...0002`, service `...0003` (full UUIDs in `cli.py`). Each credential record belongs to one clinic; a request cannot select its own tenant. Rotate with `clinic-voice credential rotate <id> --grace-minutes 60`, revoke with `clinic-voice credential revoke <id>`, and inspect usage with `clinic-voice credential list --clinic <uuid>`.
+Open [API docs](http://127.0.0.1:8000/docs) or [readiness](http://127.0.0.1:8000/health/ready). The staff dashboard lives in [dashboard/](dashboard/README.md) (`cd dashboard && npm ci && npm run dev`, then sign in with the staff owner). Seed IDs: clinic `...0001`, doctor `...0002`, service `...0003` (full UUIDs in `cli.py`). Each credential record belongs to one clinic; a request cannot select its own tenant. Rotate with `clinic-voice credential rotate <id> --grace-minutes 60`, revoke with `clinic-voice credential revoke <id>`, and inspect usage with `clinic-voice credential list --clinic <uuid>`.
 
 ## Verify
 
@@ -32,6 +32,7 @@ Open [API docs](http://127.0.0.1:8000/docs) or [readiness](http://127.0.0.1:8000
 ruff check .
 ruff format --check .
 pytest -q
+(cd dashboard && npm ci && npm run typecheck && npm run build && npm test)
 # Integration tests MUST use the disposable database below, never production.
 docker compose exec db createdb -U clinic clinic_voice_test
 TEST_DATABASE_URL=postgresql://clinic:clinic_local_only@localhost:55432/clinic_voice_test pytest -q
@@ -53,6 +54,7 @@ Replace `day` with a date within the next 90 days. Use an offered offset-aware t
 ## Repository map
 
 - `src/clinic_voice/`: API, tenant credential records, scheduling domain, transactional reservations, CLI.
+- `dashboard/`: staff dashboard (TypeScript + Vite, no UI framework); typed client generated from `docs/openapi.json`.
 - `migrations/`: versioned PostgreSQL schema, applied atomically with checksums.
 - `agents/`: receptionist/reminder prompts, conversation flow, synthetic evaluation scenarios.
 - `.claude/agents/`: focused reviewer definitions; `AGENTS.md` and `CLAUDE.md` govern agent work.

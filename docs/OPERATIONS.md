@@ -113,3 +113,15 @@ Calendar uncertain (implemented in the worker): keep pending/review state, recon
 Proposed metrics: booking outcome counts, tool latency, pending reservation age, outbox age/retries/dead letters, calendar conflicts, webhook gaps, transfer failures, language task success and provider spend. Use opaque correlation IDs; no patient identifiers as metric labels.
 
 Rollback app versions only if compatible with schema. No automatic down migrations are provided. Restore from backups only under a reviewed recovery plan; keep the reservation ledger and external calendar reconciled.
+
+## Staff dashboard (T11)
+
+Development: run the API on port 8000, then `cd dashboard && npm ci && npm run dev` and open http://127.0.0.1:5173. With `VITE_API_BASE_URL` empty the Vite dev server proxies `/v1` to `DASHBOARD_API_PROXY_TARGET` (default `http://127.0.0.1:8000`), so no CORS is needed. Sign in with a staff user created by `clinic-voice staff create-owner`.
+
+Production build: `cd dashboard && npm ci && VITE_API_BASE_URL=<API origin or empty> npm run build`, then serve `dashboard/dist/` as static files. Two layouts:
+
+- Same origin (preferred): one host serves `dist/` and forwards `/v1/` to the API. Build with `VITE_API_BASE_URL` empty and leave `DASHBOARD_ORIGINS` unset.
+- Separate origins: build with `VITE_API_BASE_URL=https://api.clinic.example` and start the API with `DASHBOARD_ORIGINS=https://dash.clinic.example` (comma-separated for several; exact origins, no wildcards). A malformed value fails startup.
+
+Serve `dist/` over TLS with the headers listed in docs/SECURITY.md (CSP with `frame-ancestors 'none'`, HSTS, nosniff, no-referrer). Users must sign in again after a reload; that is intended (the token is never stored). For the calendar connection, Google's consent page opens in a new tab; after consenting, close it and refresh the Calendar screen.
+
