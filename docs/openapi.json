@@ -950,6 +950,255 @@
         }
       }
     },
+    "/v1/admin/appointments": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Appointments",
+        "operationId": "list_appointments_v1_admin_appointments_get",
+        "parameters": [
+          {
+            "name": "from",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "From"
+            }
+          },
+          {
+            "name": "to",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "date-time"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "To"
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "pending_sync",
+                    "confirmed",
+                    "needs_review",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StaffAppointmentOut"
+                  },
+                  "title": "Response List Appointments V1 Admin Appointments Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/appointments/{appointment_id}/cancel": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Cancel Appointment",
+        "operationId": "cancel_appointment_v1_admin_appointments__appointment_id__cancel_post",
+        "parameters": [
+          {
+            "name": "appointment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Appointment Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StaffAppointmentOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/appointments/{appointment_id}/resolve": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Resolve Appointment",
+        "operationId": "resolve_appointment_v1_admin_appointments__appointment_id__resolve_post",
+        "parameters": [
+          {
+            "name": "appointment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Appointment Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppointmentResolve"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StaffAppointmentOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/admin/calendar/google/start": {
       "post": {
         "tags": [
@@ -1426,6 +1675,183 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BolnaStatusOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/verify-booking": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Verify Booking",
+        "operationId": "verify_booking_v1_bolna_tools_verify_booking_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaVerify"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaVerifyOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/cancel-booking": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Cancel Booking",
+        "operationId": "cancel_booking_v1_bolna_tools_cancel_booking_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaCancel"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaChangeOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/reschedule-booking": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Reschedule Booking",
+        "operationId": "reschedule_booking_v1_bolna_tools_reschedule_booking_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaReschedule"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaChangeOut"
                 }
               }
             }
@@ -2000,6 +2426,24 @@
   },
   "components": {
     "schemas": {
+      "AppointmentResolve": {
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "requeue",
+              "cancel"
+            ],
+            "title": "Action"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "title": "AppointmentResolve"
+      },
       "AppointmentStatusRequest": {
         "properties": {
           "appointment_id": {
@@ -2093,6 +2537,91 @@
         ],
         "title": "BolnaCallContext"
       },
+      "BolnaCancel": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "booking_reference": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Booking Reference"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "booking_reference"
+        ],
+        "title": "BolnaCancel"
+      },
+      "BolnaChangeOut": {
+        "properties": {
+          "changed": {
+            "type": "boolean",
+            "title": "Changed"
+          },
+          "booking_reference": {
+            "type": "string",
+            "title": "Booking Reference"
+          },
+          "previous_booking_reference": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Previous Booking Reference"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "spoken": {
+            "type": "string",
+            "title": "Spoken"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "changed",
+          "booking_reference",
+          "status",
+          "starts_at",
+          "spoken"
+        ],
+        "title": "BolnaChangeOut",
+        "description": "changed=false: nothing was changed (read back and call again with confirmed=true).\nFor a reschedule, booking_reference is the new booking's reference."
+      },
       "BolnaContextOut": {
         "properties": {
           "clinic_name": {
@@ -2172,6 +2701,50 @@
         ],
         "title": "BolnaDoctorOut"
       },
+      "BolnaReschedule": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "booking_reference": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Booking Reference"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "confirmed": {
+            "type": "boolean",
+            "title": "Confirmed",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "booking_reference",
+          "starts_at"
+        ],
+        "title": "BolnaReschedule"
+      },
       "BolnaReservation": {
         "properties": {
           "execution_id": {
@@ -2207,6 +2780,50 @@
             "type": "string",
             "format": "date-time",
             "title": "Starts At"
+          },
+          "patient_name": {
+            "type": "string",
+            "maxLength": 120,
+            "title": "Patient Name",
+            "default": ""
+          },
+          "preferred_language": {
+            "type": "string",
+            "title": "Preferred Language",
+            "default": ""
+          },
+          "consent_booking_confirmation": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consent Booking Confirmation"
+          },
+          "consent_reminder_call": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consent Reminder Call"
+          },
+          "consent_reminder_message": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Consent Reminder Message"
           }
         },
         "additionalProperties": false,
@@ -2226,6 +2843,10 @@
             "format": "uuid",
             "title": "Appointment Id"
           },
+          "booking_reference": {
+            "type": "string",
+            "title": "Booking Reference"
+          },
           "status": {
             "type": "string",
             "title": "Status"
@@ -2244,6 +2865,7 @@
         "type": "object",
         "required": [
           "appointment_id",
+          "booking_reference",
           "status",
           "starts_at",
           "spoken"
@@ -2377,6 +2999,80 @@
           "appointment_id"
         ],
         "title": "BolnaStatusQuery"
+      },
+      "BolnaVerify": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "booking_reference": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Booking Reference"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "booking_reference"
+        ],
+        "title": "BolnaVerify"
+      },
+      "BolnaVerifyOut": {
+        "properties": {
+          "booking_reference": {
+            "type": "string",
+            "title": "Booking Reference"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "doctor": {
+            "type": "string",
+            "title": "Doctor"
+          },
+          "service": {
+            "type": "string",
+            "title": "Service"
+          },
+          "spoken": {
+            "type": "string",
+            "title": "Spoken"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "booking_reference",
+          "status",
+          "starts_at",
+          "doctor",
+          "service",
+          "spoken"
+        ],
+        "title": "BolnaVerifyOut",
+        "description": "A verified booking: no patient data, only what the caller needs read back."
       },
       "CalendarAccountOut": {
         "properties": {
@@ -3059,6 +3755,10 @@
             "format": "uuid",
             "title": "Appointment Id"
           },
+          "booking_reference": {
+            "type": "string",
+            "title": "Booking Reference"
+          },
           "status": {
             "type": "string",
             "title": "Status"
@@ -3082,6 +3782,7 @@
         "type": "object",
         "required": [
           "appointment_id",
+          "booking_reference",
           "status",
           "starts_at",
           "ends_at",
@@ -3293,6 +3994,99 @@
         "additionalProperties": false,
         "type": "object",
         "title": "SlotResponse"
+      },
+      "StaffAppointmentOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "booking_reference": {
+            "type": "string",
+            "title": "Booking Reference"
+          },
+          "doctor_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Doctor Id"
+          },
+          "service_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Service Id"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "ends_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Ends At"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "rescheduled_from": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "uuid"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rescheduled From"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "patient_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Patient Name"
+          },
+          "phone_last2": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Phone Last2"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "booking_reference",
+          "doctor_id",
+          "service_id",
+          "starts_at",
+          "ends_at",
+          "status",
+          "rescheduled_from",
+          "created_at",
+          "patient_name",
+          "phone_last2"
+        ],
+        "title": "StaffAppointmentOut",
+        "description": "Minimal fields. patient_name and phone_last2 are filled for owner/admin only (null for\nviewer, and when the patient record is missing or cannot be decrypted)."
       },
       "StaffUser": {
         "properties": {

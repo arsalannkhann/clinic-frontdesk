@@ -10,18 +10,23 @@ import json
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response
 
-from clinic_voice.bolna import gateway
+from clinic_voice.bolna import bookings, gateway
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, tenant
 from clinic_voice.schemas import (
     BolnaCallContext,
+    BolnaCancel,
+    BolnaChangeOut,
     BolnaContextOut,
+    BolnaReschedule,
     BolnaReservation,
     BolnaReservationOut,
     BolnaSlotQuery,
     BolnaSlotsOut,
     BolnaStatusOut,
     BolnaStatusQuery,
+    BolnaVerify,
+    BolnaVerifyOut,
 )
 
 DUPLICATE_KEYS = "Duplicate JSON keys are not allowed"
@@ -57,8 +62,12 @@ async def reject_duplicate_keys(request: Request):
         return
 
 
+# Authentication runs first (an unauthenticated request gets 401 before any body check); the
+# endpoints' own Depends(tenant) reuses this result (FastAPI caches it per request).
 router = APIRouter(
-    prefix="/v1/bolna", tags=["bolna"], dependencies=[Depends(reject_duplicate_keys)]
+    prefix="/v1/bolna",
+    tags=["bolna"],
+    dependencies=[Depends(tenant), Depends(reject_duplicate_keys)],
 )
 NO_STORE = {"Cache-Control": "no-store"}
 
@@ -104,6 +113,8 @@ def reserve_slot(request: BolnaReservation, response: Response, clinic_id=Depend
         request,
         doctor_id,
         service_id,
+        crypto,
+        settings.patient_retention_days,
     )
 
 
@@ -114,3 +125,37 @@ def appointment_status(query: BolnaStatusQuery, response: Response, clinic_id=De
     with database() as conn:
         gateway.upsert_session(conn, clinic_id, query, crypto)
         return gateway.appointment_status(conn, clinic_id, query)
+
+
+@router.post("/tools/verify-booking", response_model=BolnaVerifyOut)
+def verify_booking(query: BolnaVerify, response: Response, clinic_id=Depends(tenant)):
+    response.headers.update(NO_STORE)
+    crypto = gateway.session_crypto(get_settings())
+    with database() as conn:
+        session_id = gateway.upsert_session(conn, clinic_id, query, crypto)
+        return bookings.verify(conn, clinic_id, session_id, query, crypto[1])
+
+
+@router.post("/tools/cancel-booking", response_model=BolnaChangeOut)
+def cancel_booking(request: BolnaCancel, response: Response, clinic_id=Depends(tenant)):
+    response.headers.update(NO_STORE)
+    crypto = gateway.session_crypto(get_settings())
+    with database() as conn:
+        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        return bookings.cancel(conn, clinic_id, session_id, request)
+
+
+@router.post("/tools/reschedule-booking", response_model=BolnaChangeOut)
+def reschedule_booking(request: BolnaReschedule, response: Response, clinic_id=Depends(tenant)):
+    response.headers.update(NO_STORE)
+    settings = get_settings()
+    crypto = gateway.session_crypto(settings)
+    with database() as conn:
+        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+    return bookings.reschedule(
+        settings.database_url.get_secret_value(),
+        clinic_id,
+        session_id,
+        request,
+        settings.patient_retention_days,
+    )

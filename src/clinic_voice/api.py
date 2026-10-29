@@ -14,6 +14,7 @@ from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tenant
 from clinic_voice.errors import NotFound
 from clinic_voice.routes_admin import router as admin_router
+from clinic_voice.routes_appointments import router as appointments_router
 from clinic_voice.routes_bolna import router as bolna_router
 from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
@@ -68,6 +69,7 @@ async def lifespan(app):
 app = FastAPI(title="Clinic Voice AI", version="0.1.0", lifespan=lifespan)
 
 app.include_router(admin_router)
+app.include_router(appointments_router)
 app.include_router(calendar_admin_router)
 app.include_router(oauth_router)
 app.include_router(bolna_router)
@@ -96,7 +98,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "011_call_sessions.sql"
+REQUIRED_MIGRATION = "012_patients.sql"
 
 
 @app.get("/health/live")

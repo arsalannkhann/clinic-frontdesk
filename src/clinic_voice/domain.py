@@ -1,8 +1,35 @@
+import re
+import secrets
 from datetime import UTC, datetime, time, timedelta
 
 # Appointment statuses that hold a doctor's time. Migration 005's exclusion constraint
 # repeats this list in SQL; keep them in step.
 ACTIVE_STATUSES = ("pending_sync", "confirmed", "needs_review")
+
+# Booking references: 8 Crockford base32 characters (no I, L, O, U), 40 random bits.
+# Migration 012 repeats the alphabet and format in SQL; keep them in step.
+REFERENCE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+REFERENCE_LENGTH = 8
+REFERENCE_PATTERN = re.compile(r"[0-9A-HJKMNP-TV-Z]{8}")
+_CROCKFORD_ALIASES = str.maketrans({"O": "0", "I": "1", "L": "1"})
+
+
+def new_booking_reference() -> str:
+    """A fresh reference from the CSPRNG. Uniqueness per clinic is enforced by the database;
+    callers retry on collision."""
+    return "".join(secrets.choice(REFERENCE_ALPHABET) for _ in range(REFERENCE_LENGTH))
+
+
+def normalize_reference(value: str) -> str | None:
+    """Canonical form of a spoken or typed reference, or None if it cannot be one.
+    Case, spaces and hyphens are ignored; O reads as 0 and I/L as 1 (Crockford)."""
+    compact = re.sub(r"[\s-]", "", value).upper().translate(_CROCKFORD_ALIASES)
+    return compact if REFERENCE_PATTERN.fullmatch(compact) else None
+
+
+def spoken_reference(reference: str) -> str:
+    """Characters separated by spaces so text-to-speech reads them one by one."""
+    return " ".join(reference)
 
 
 def candidate_slots(day, hours, duration, zone, busy, now, buffer=0, earliest=None):

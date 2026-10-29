@@ -17,14 +17,16 @@ import hashlib
 import json
 import logging
 import re
-from datetime import UTC
+from datetime import UTC, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from clinic_voice import service
+from clinic_voice import patients, service
 from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key, phone_hash
+from clinic_voice.domain import spoken_reference
+from clinic_voice.patients import session_aad
 from clinic_voice.schemas import ReservationRequest
 
 log = logging.getLogger("clinic_voice.bolna")
@@ -60,10 +62,6 @@ def session_crypto(settings) -> tuple[Keyring, bytes]:
     except CryptoError:
         log.error("call session keyring or phone hash key is invalid")
         raise HTTPException(503, NOT_CONFIGURED) from None
-
-
-def session_aad(clinic_id: UUID, session_id: UUID) -> bytes:
-    return b"call_session:" + clinic_id.bytes + session_id.bytes
 
 
 def caller_number(value: str) -> str | None:
@@ -195,15 +193,43 @@ def check_slots(conn, clinic_id, query):
     return {"slots": available, "spoken": spoken_slots(available, zone, query.day)}
 
 
-def reserve(url, clinic_id, session_id, request, doctor_id, service_id):
+def patient_details(request) -> patients.PatientDetails:
+    consents = {
+        purpose: value
+        for purpose, value in (
+            ("booking_confirmation", request.consent_booking_confirmation),
+            ("reminder_call", request.consent_reminder_call),
+            ("reminder_message", request.consent_reminder_message),
+        )
+        if value is not None
+    }
+    return patients.PatientDetails(
+        name=request.patient_name or None,
+        language=request.preferred_language or None,
+        consents=consents,
+    )
+
+
+def reserve(url, clinic_id, session_id, request, doctor_id, service_id, crypto, retention_days):
     """Reserve through service.reserve with the derived key. The caller resolves the names
-    and releases its own connection first, so one reservation holds one connection."""
+    and releases its own connection first, so one reservation holds one connection.
+
+    The key covers the slot only (never the name or consent flags, so no patient data is
+    hashed into keys): a repeated call for the same slot in the same execution replays the
+    first reservation, including its patient and booking reference."""
     args = {
         "doctor_id": str(doctor_id),
         "service_id": str(service_id),
         "starts_at": request.starts_at.astimezone(UTC).isoformat(),
     }
     key = derive_key(request.execution_id, "reserve-slot", args)
+    keyring = crypto[0]
+    details = patient_details(request)
+
+    def attach(conn, starts_at):
+        retention_until = starts_at + timedelta(days=retention_days)
+        return patients.attach(conn, keyring, clinic_id, session_id, details, retention_until)
+
     result = service.reserve(
         url,
         clinic_id,
@@ -211,24 +237,31 @@ def reserve(url, clinic_id, session_id, request, doctor_id, service_id):
         key,
         call_session_id=session_id,
         max_session_active=MAX_SESSION_ACTIVE,
+        attach_patient=attach,
     )
     # A replay returns the appointment's current status (it may since have been confirmed,
     # cancelled or sent for review): speak that, never a fixed "reserved".
+    reference = result["booking_reference"]
     return {
         "appointment_id": result["appointment_id"],
+        "booking_reference": reference,
         "status": result["status"],
         "starts_at": result["starts_at"],
-        "spoken": service.spoken_status(result["status"]),
+        "spoken": service.spoken_status(result["status"])
+        + f" Your booking reference is {spoken_reference(reference)}.",
     }
 
 
 def appointment_status(conn, clinic_id, query):
-    """Only appointments created in this same call session (clinic + execution id)."""
+    """Only appointments created in, or verified by, this same call session (clinic +
+    execution id)."""
     row = conn.execute(
         """SELECT a.id, a.status FROM appointments a
-        JOIN call_sessions s ON s.clinic_id=a.clinic_id AND s.id=a.call_session_id
-        WHERE a.clinic_id=%s AND a.id=%s AND s.execution_id=%s""",
-        (clinic_id, query.appointment_id, str(query.execution_id)),
+        JOIN call_sessions s ON s.clinic_id=a.clinic_id AND s.execution_id=%s
+        WHERE a.clinic_id=%s AND a.id=%s AND (a.call_session_id=s.id OR EXISTS (
+            SELECT 1 FROM call_session_verifications v WHERE v.clinic_id=a.clinic_id
+            AND v.call_session_id=s.id AND v.appointment_id=a.id))""",
+        (str(query.execution_id), clinic_id, query.appointment_id),
     ).fetchone()
     if not row:
         raise HTTPException(404, "I cannot find that request in this call.")

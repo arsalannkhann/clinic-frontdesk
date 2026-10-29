@@ -1,12 +1,22 @@
 """Scheduling lock order. Every writer that changes what a doctor can be booked for takes
 locks in this global order, and never in reverse, so the paths cannot deadlock:
 
-1. Action advisory lock: reserve() serializes one idempotency key ("<clinic>:<key>").
-1a. Call session row FOR NO KEY UPDATE (Bolna gateway reservations only): serializes the
-   per-session appointment cap check in reserve().
+1. Action advisory lock: reserve(), and the gateway's cancel and reschedule, serialize one
+   idempotency key ("<clinic>:<key>").
+1a. Call session row FOR NO KEY UPDATE (Bolna gateway only): serializes the per-session
+   appointment cap check in reserve(), and verification failure counting in
+   bolna.bookings.verify (which takes no other lock).
 2. Doctor-set advisory lock ("doctors:<clinic>"): shared by create_doctor, exclusive for a
    clinic-wide schedule exception, so no doctor appears mid-way through that exception.
 3. Doctor rows FOR UPDATE in ascending id order.
+4. Patient advisory lock ("patient:<clinic>:<phone hash>"): patients.attach inside reserve(),
+   after the doctor rows, so concurrent bookings from one phone attach consistently.
+5. Appointment rows FOR UPDATE: cancel and reschedule (appointments.py, bolna/bookings.py).
+   A reschedule locks the doctor row (3) first; the slot check of the new time runs under it.
+6. Outbox rows FOR UPDATE: staff resolve(requeue) after the appointment row. (The worker
+   updates an appointment row before its own outbox row, the same direction. The older
+   requeue_outbox route locks a dead job before its appointment; no other path locks a dead
+   job, so that cannot cycle.)
 
 No provider or network I/O may run while these are held.
 

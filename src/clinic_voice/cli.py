@@ -199,6 +199,16 @@ def bolna_command(url, args, settings):
     print(json.dumps(agent_config.redact(payload), indent=2, ensure_ascii=False))
 
 
+def retention_command(url, args, settings):
+    """Purge expired patient records and old call sessions. Prints counts only."""
+    from clinic_voice.retention import purge
+
+    with connect(url) as conn:
+        counts = purge(conn, settings.call_session_retention_days, dry_run=args.dry_run)
+    line = " ".join(f"{key}={value}" for key, value in counts.items())
+    print(f"{line} dry_run={str(args.dry_run).lower()}")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="clinic-voice")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -241,6 +251,12 @@ def main(argv=None):
     )
     compile_agent.add_argument("--clinic", type=UUID, required=True)
     compile_agent.add_argument("--gateway-url", help="Public base URL (default from settings)")
+    retention = commands.add_parser("retention", help="Data retention (operator-run only)")
+    retention_actions = retention.add_subparsers(dest="action", required=True)
+    purge = retention_actions.add_parser(
+        "purge", help="Delete expired patient records and old call sessions"
+    )
+    purge.add_argument("--dry-run", action="store_true", help="Count only; change nothing")
     args = parser.parse_args(argv)
     if args.command == "worker" and not 0.1 <= args.interval <= 300:
         parser.error("--interval must be between 0.1 and 300 seconds")
@@ -276,5 +292,7 @@ def main(argv=None):
         worker_command(url, args, settings)
     elif args.command == "bolna":
         bolna_command(url, args, settings)
+    elif args.command == "retention":
+        retention_command(url, args, settings)
     else:
         credential_command(url, args)

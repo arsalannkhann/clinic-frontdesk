@@ -44,7 +44,7 @@ from clinic_voice.providers.calendar import (
     ProviderTimeout,
     merge_intervals,
 )
-from clinic_voice.providers.http import MAX_RETRY_AFTER, retry_after  # noqa: F401 (re-export)
+from clinic_voice.providers.http import retry_after
 
 log = logging.getLogger("clinic_voice.google")
 

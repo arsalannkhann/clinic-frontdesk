@@ -100,7 +100,7 @@
               },
               {
                 "name": "reserve_slot",
-                "description": "Reserve one open time returned by check_slots, only after the caller confirmed the doctor, date and time. The result is not a confirmed appointment.",
+                "description": "Reserve one open time returned by check_slots, only after the caller confirmed the doctor, date and time. The result is not a confirmed appointment. Read the booking reference back to the caller; never ask for their phone number.",
                 "parameters": {
                   "type": "object",
                   "properties": {
@@ -115,6 +115,26 @@
                     "starts_at": {
                       "type": "string",
                       "description": "The exact slot time returned by check_slots (ISO 8601 with offset)."
+                    },
+                    "patient_name": {
+                      "type": "string",
+                      "description": "The patient's name as the caller gave it, or empty."
+                    },
+                    "preferred_language": {
+                      "type": "string",
+                      "description": "en or hi if the caller has a preference, else empty."
+                    },
+                    "consent_booking_confirmation": {
+                      "type": "string",
+                      "description": "true or false if asked whether the clinic may confirm this booking, else empty."
+                    },
+                    "consent_reminder_call": {
+                      "type": "string",
+                      "description": "true or false if asked whether the clinic may call with a reminder, else empty."
+                    },
+                    "consent_reminder_message": {
+                      "type": "string",
+                      "description": "true or false if asked whether the clinic may send a reminder message, else empty."
                     },
                     "execution_id": {
                       "type": "string",
@@ -133,6 +153,11 @@
                     "doctor",
                     "service",
                     "starts_at",
+                    "patient_name",
+                    "preferred_language",
+                    "consent_booking_confirmation",
+                    "consent_reminder_call",
+                    "consent_reminder_message",
                     "execution_id",
                     "from_number",
                     "agent_id"
@@ -175,6 +200,118 @@
                 "pre_call_message": "Let me check on that."
               },
               {
+                "name": "verify_booking",
+                "description": "Verify an existing booking before discussing or changing it. Ask the caller for their booking reference. Never guess references and never look bookings up by phone. After repeated failures the tool asks you to hand off to clinic staff.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "booking_reference": {
+                      "type": "string",
+                      "description": "The booking reference exactly as the caller said it."
+                    },
+                    "execution_id": {
+                      "type": "string",
+                      "description": "Call reference supplied by the platform. Never ask the caller for it."
+                    },
+                    "from_number": {
+                      "type": "string",
+                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
+                    },
+                    "agent_id": {
+                      "type": "string",
+                      "description": "Agent id supplied by the platform. Never ask the caller for it."
+                    }
+                  },
+                  "required": [
+                    "booking_reference",
+                    "execution_id",
+                    "from_number",
+                    "agent_id"
+                  ]
+                },
+                "key": "custom_task",
+                "pre_call_message": "Let me look that up."
+              },
+              {
+                "name": "cancel_booking",
+                "description": "Cancel a booking verified earlier in this call. First call with confirmed false and read the returned text back; call again with confirmed true only after the caller clearly agrees. Say cancelled only if the tool says so.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "booking_reference": {
+                      "type": "string",
+                      "description": "The verified booking reference."
+                    },
+                    "confirmed": {
+                      "type": "string",
+                      "description": "true only after the caller confirmed the read-back, else false."
+                    },
+                    "execution_id": {
+                      "type": "string",
+                      "description": "Call reference supplied by the platform. Never ask the caller for it."
+                    },
+                    "from_number": {
+                      "type": "string",
+                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
+                    },
+                    "agent_id": {
+                      "type": "string",
+                      "description": "Agent id supplied by the platform. Never ask the caller for it."
+                    }
+                  },
+                  "required": [
+                    "booking_reference",
+                    "confirmed",
+                    "execution_id",
+                    "from_number",
+                    "agent_id"
+                  ]
+                },
+                "key": "custom_task"
+              },
+              {
+                "name": "reschedule_booking",
+                "description": "Move a booking verified earlier in this call to a new time from check_slots for the same doctor and service. First call with confirmed false and read the returned text back; call again with confirmed true only after the caller agrees. If it fails, the original appointment is unchanged.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "booking_reference": {
+                      "type": "string",
+                      "description": "The verified booking reference."
+                    },
+                    "starts_at": {
+                      "type": "string",
+                      "description": "The new slot time returned by check_slots (ISO 8601 with offset)."
+                    },
+                    "confirmed": {
+                      "type": "string",
+                      "description": "true only after the caller confirmed the read-back, else false."
+                    },
+                    "execution_id": {
+                      "type": "string",
+                      "description": "Call reference supplied by the platform. Never ask the caller for it."
+                    },
+                    "from_number": {
+                      "type": "string",
+                      "description": "Calling line supplied by the platform. Never ask for it or read it aloud."
+                    },
+                    "agent_id": {
+                      "type": "string",
+                      "description": "Agent id supplied by the platform. Never ask the caller for it."
+                    }
+                  },
+                  "required": [
+                    "booking_reference",
+                    "starts_at",
+                    "confirmed",
+                    "execution_id",
+                    "from_number",
+                    "agent_id"
+                  ]
+                },
+                "key": "custom_task"
+              },
+              {
                 "name": "clinic_context",
                 "description": "Get the clinic's name, timezone, today's date, doctors, services and supported languages. Call once at the start of the call.",
                 "parameters": {
@@ -213,13 +350,31 @@
                 "method": "POST",
                 "url": "https://voice.example.test/v1/bolna/tools/reserve-slot",
                 "api_token": "Bearer <redacted>",
-                "param": "{\"doctor\": \"%(doctor)s\", \"service\": \"%(service)s\", \"starts_at\": \"%(starts_at)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
+                "param": "{\"doctor\": \"%(doctor)s\", \"service\": \"%(service)s\", \"starts_at\": \"%(starts_at)s\", \"patient_name\": \"%(patient_name)s\", \"preferred_language\": \"%(preferred_language)s\", \"consent_booking_confirmation\": \"%(consent_booking_confirmation)s\", \"consent_reminder_call\": \"%(consent_reminder_call)s\", \"consent_reminder_message\": \"%(consent_reminder_message)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
               },
               "appointment_status": {
                 "method": "POST",
                 "url": "https://voice.example.test/v1/bolna/tools/appointment-status",
                 "api_token": "Bearer <redacted>",
                 "param": "{\"appointment_id\": \"%(appointment_id)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
+              },
+              "verify_booking": {
+                "method": "POST",
+                "url": "https://voice.example.test/v1/bolna/tools/verify-booking",
+                "api_token": "Bearer <redacted>",
+                "param": "{\"booking_reference\": \"%(booking_reference)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
+              },
+              "cancel_booking": {
+                "method": "POST",
+                "url": "https://voice.example.test/v1/bolna/tools/cancel-booking",
+                "api_token": "Bearer <redacted>",
+                "param": "{\"booking_reference\": \"%(booking_reference)s\", \"confirmed\": \"%(confirmed)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
+              },
+              "reschedule_booking": {
+                "method": "POST",
+                "url": "https://voice.example.test/v1/bolna/tools/reschedule-booking",
+                "api_token": "Bearer <redacted>",
+                "param": "{\"booking_reference\": \"%(booking_reference)s\", \"starts_at\": \"%(starts_at)s\", \"confirmed\": \"%(confirmed)s\", \"execution_id\": \"%(execution_id)s\", \"from_number\": \"%(from_number)s\", \"agent_id\": \"%(agent_id)s\"}"
               },
               "clinic_context": {
                 "method": "POST",

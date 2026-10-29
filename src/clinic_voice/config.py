@@ -1,7 +1,7 @@
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
@@ -29,6 +29,11 @@ class Settings(BaseSettings):
     # base64 32 bytes; HMAC key for crypto.phone_hash. Required by the Bolna gateway, which
     # hashes the provider-asserted caller number of each call session (503 when unset).
     phone_hash_key: SecretStr | None = None
+    # Retention (T7, `clinic-voice retention purge`; nothing runs it automatically). A patient
+    # record is kept until its latest appointment start plus this many days.
+    patient_retention_days: int = Field(default=365, ge=1, le=3650)
+    # Call sessions (encrypted caller number, verification state) older than this many days.
+    call_session_retention_days: int = Field(default=90, ge=1, le=3650)
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
     google_redirect_uri: str | None = None

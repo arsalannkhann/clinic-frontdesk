@@ -94,13 +94,25 @@ TOOLS = (
         "path": "/v1/bolna/tools/reserve-slot",
         "description": (
             "Reserve one open time returned by check_slots, only after the caller confirmed"
-            " the doctor, date and time. The result is not a confirmed appointment."
+            " the doctor, date and time. The result is not a confirmed appointment. Read the"
+            " booking reference back to the caller; never ask for their phone number."
         ),
         "pre_call_message": "One moment while I hold that time.",
         "params": {
             "doctor": "Doctor name exactly as listed in the clinic context.",
             "service": "Service name exactly as listed for that doctor.",
             "starts_at": "The exact slot time returned by check_slots (ISO 8601 with offset).",
+            "patient_name": "The patient's name as the caller gave it, or empty.",
+            "preferred_language": "en or hi if the caller has a preference, else empty.",
+            "consent_booking_confirmation": (
+                "true or false if asked whether the clinic may confirm this booking, else empty."
+            ),
+            "consent_reminder_call": (
+                "true or false if asked whether the clinic may call with a reminder, else empty."
+            ),
+            "consent_reminder_message": (
+                "true or false if asked whether the clinic may send a reminder message, else empty."
+            ),
         },
     },
     {
@@ -112,6 +124,47 @@ TOOLS = (
         ),
         "pre_call_message": "Let me check on that.",
         "params": {"appointment_id": "The appointment_id returned by reserve_slot in this call."},
+    },
+    {
+        "name": "verify_booking",
+        "path": "/v1/bolna/tools/verify-booking",
+        "description": (
+            "Verify an existing booking before discussing or changing it. Ask the caller for"
+            " their booking reference. Never guess references and never look bookings up by"
+            " phone. After repeated failures the tool asks you to hand off to clinic staff."
+        ),
+        "pre_call_message": "Let me look that up.",
+        "params": {"booking_reference": "The booking reference exactly as the caller said it."},
+    },
+    {
+        "name": "cancel_booking",
+        "path": "/v1/bolna/tools/cancel-booking",
+        "description": (
+            "Cancel a booking verified earlier in this call. First call with confirmed false"
+            " and read the returned text back; call again with confirmed true only after the"
+            " caller clearly agrees. Say cancelled only if the tool says so."
+        ),
+        "pre_call_message": None,
+        "params": {
+            "booking_reference": "The verified booking reference.",
+            "confirmed": "true only after the caller confirmed the read-back, else false.",
+        },
+    },
+    {
+        "name": "reschedule_booking",
+        "path": "/v1/bolna/tools/reschedule-booking",
+        "description": (
+            "Move a booking verified earlier in this call to a new time from check_slots for"
+            " the same doctor and service. First call with confirmed false and read the"
+            " returned text back; call again with confirmed true only after the caller agrees."
+            " If it fails, the original appointment is unchanged."
+        ),
+        "pre_call_message": None,
+        "params": {
+            "booking_reference": "The verified booking reference.",
+            "starts_at": "The new slot time returned by check_slots (ISO 8601 with offset).",
+            "confirmed": "true only after the caller confirmed the read-back, else false.",
+        },
     },
     {
         "name": "clinic_context",

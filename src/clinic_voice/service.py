@@ -8,7 +8,12 @@ from fastapi import HTTPException
 from psycopg.errors import ExclusionViolation, UniqueViolation
 
 from clinic_voice.db import connect
-from clinic_voice.domain import ACTIVE_STATUSES, candidate_slots, utc_now
+from clinic_voice.domain import (
+    ACTIVE_STATUSES,
+    candidate_slots,
+    new_booking_reference,
+    utc_now,
+)
 from clinic_voice.locks import lock_doctors
 
 
@@ -97,6 +102,7 @@ def slots(conn, clinic_id, doctor_id, service_id, day, extra_busy=(), context=No
 def response(row):
     return {
         "appointment_id": row["id"],
+        "booking_reference": row["booking_reference"],
         "status": row["status"],
         "starts_at": row["starts_at"],
         "ends_at": row["ends_at"],
@@ -156,22 +162,109 @@ SESSION_LIMIT_MESSAGE = (
 )
 
 
-def reserve(url, clinic_id, request, key, call_session_id=None, max_session_active=None):
+def fingerprint(canonical: dict) -> str:
+    return hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+
+
+REFERENCE_CONSTRAINT = "appointments_booking_reference_key"
+REFERENCE_ATTEMPTS = 5
+INSERT_APPOINTMENT = """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,
+    ends_at,blocks_until,status,idempotency_key,request_hash,call_session_id,patient_id,
+    rescheduled_from,booking_reference)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s,%s,%s,%s) RETURNING *"""
+
+
+def _insert_appointment(conn, values):
+    """Insert with a fresh CSPRNG booking reference, retrying a reference collision inside a
+    savepoint. Any other constraint violation propagates (the caller's transaction fails)."""
+    for _ in range(REFERENCE_ATTEMPTS):
+        try:
+            with conn.transaction():
+                return conn.execute(
+                    INSERT_APPOINTMENT, (*values, new_booking_reference())
+                ).fetchone()
+        except UniqueViolation as error:
+            if error.diag.constraint_name != REFERENCE_CONSTRAINT:
+                raise
+    raise HTTPException(503, "Could not allocate a booking reference; retry the same action")
+
+
+def insert_reservation(
+    conn,
+    clinic_id,
+    doctor_id,
+    service_id,
+    starts_at,
+    key,
+    request_hash,
+    *,
+    call_session_id=None,
+    patient_id=None,
+    rescheduled_from=None,
+    attach_patient=None,
+):
+    """Check the slot and insert a pending_sync appointment plus its calendar.create job in
+    the caller's transaction. The caller must hold the doctor row lock (locks.py, level 3).
+    attach_patient(conn, starts_at) -> patient id | None runs after the slot check."""
+    context = get_context(conn, clinic_id, doctor_id, service_id)
+    day = starts_at.astimezone(ZoneInfo(context["timezone"])).date()
+    available = slots(conn, clinic_id, doctor_id, service_id, day, context=context)
+    # Compare instants, never zone-local wall times.
+    if starts_at.astimezone(UTC) not in {s.astimezone(UTC) for s in available}:
+        raise HTTPException(409, "Slot unavailable or outside working hours")
+    if attach_patient is not None:
+        patient_id = attach_patient(conn, starts_at)
+    appointment_id = uuid4()
+    ends_at = starts_at + timedelta(minutes=context["duration_minutes"])
+    row = _insert_appointment(
+        conn,
+        (
+            appointment_id,
+            clinic_id,
+            doctor_id,
+            service_id,
+            starts_at,
+            ends_at,
+            ends_at + timedelta(minutes=context["buffer_after_minutes"]),
+            key,
+            request_hash,
+            call_session_id,
+            patient_id,
+            rescheduled_from,
+        ),
+    )
+    conn.execute(
+        "INSERT INTO outbox (id,clinic_id,appointment_id,kind) VALUES (%s,%s,%s,'calendar.create')",
+        (uuid4(), clinic_id, appointment_id),
+    )
+    return row
+
+
+def reserve(
+    url,
+    clinic_id,
+    request,
+    key,
+    call_session_id=None,
+    max_session_active=None,
+    attach_patient=None,
+):
     """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
     session that created it (the gateway derives `key` from that session's execution id).
     max_session_active caps that session's pending_sync/confirmed appointments (409 beyond
-    it); replays are never capped."""
+    it); replays are never capped. attach_patient (gateway only) creates or attaches the
+    patient record inside the reservation transaction; a replay never calls it."""
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
-    fingerprint = hashlib.sha256(json.dumps(canonical, sort_keys=True).encode()).hexdigest()
+    request_hash = fingerprint(canonical)
     try:
         with connect(url) as conn:
             # Serialize the same logical action even if the winner commits between reads.
             conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{clinic_id}:{key}",)
             )
-            previous = replay(conn, clinic_id, key, fingerprint)
+            previous = replay(conn, clinic_id, key, request_hash)
             if previous:
                 return previous
             if call_session_id is not None and max_session_active is not None:
@@ -191,43 +284,23 @@ def reserve(url, clinic_id, request, key, call_session_id=None, max_session_acti
             # Short DB-only lock orders competing writes for the same doctor (see locks.py).
             # GiST exclusion alone can deadlock simultaneous overlapping inserts.
             lock_doctors(conn, clinic_id, [request.doctor_id])
-            context = get_context(conn, clinic_id, request.doctor_id, request.service_id)
-            day = request.starts_at.astimezone(ZoneInfo(context["timezone"])).date()
-            available = slots(
-                conn, clinic_id, request.doctor_id, request.service_id, day, context=context
-            )
-            # Compare instants, never zone-local wall times.
-            if request.starts_at.astimezone(UTC) not in {s.astimezone(UTC) for s in available}:
-                raise HTTPException(409, "Slot unavailable or outside working hours")
-            appointment_id = uuid4()
-            ends_at = request.starts_at + timedelta(minutes=context["duration_minutes"])
-            row = conn.execute(
-                """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,
-                blocks_until,status,idempotency_key,request_hash,call_session_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s) RETURNING *""",
-                (
-                    appointment_id,
-                    clinic_id,
-                    request.doctor_id,
-                    request.service_id,
-                    request.starts_at,
-                    ends_at,
-                    ends_at + timedelta(minutes=context["buffer_after_minutes"]),
-                    key,
-                    fingerprint,
-                    call_session_id,
-                ),
-            ).fetchone()
-            conn.execute(
-                "INSERT INTO outbox (id,clinic_id,appointment_id,kind) VALUES (%s,%s,%s,'calendar.create')",
-                (uuid4(), clinic_id, appointment_id),
+            row = insert_reservation(
+                conn,
+                clinic_id,
+                request.doctor_id,
+                request.service_id,
+                request.starts_at,
+                key,
+                request_hash,
+                call_session_id=call_session_id,
+                attach_patient=attach_patient,
             )
             result = response(row)
         return result
     except (ExclusionViolation, UniqueViolation):
         # A competing retry may have won either constraint. Read its committed result.
         with connect(url) as conn:
-            previous = replay(conn, clinic_id, key, fingerprint)
+            previous = replay(conn, clinic_id, key, request_hash)
             if previous:
                 return previous
         raise HTTPException(409, "Slot unavailable") from None

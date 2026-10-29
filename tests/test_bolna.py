@@ -341,7 +341,7 @@ def test_reserve_replays_identical_args(env):
     body = first.json()
     assert body["status"] == "pending_sync"
     assert "not yet confirmed" in body["spoken"]
-    assert set(body) == {"appointment_id", "status", "starts_at", "spoken"}
+    assert set(body) == {"appointment_id", "booking_reference", "status", "starts_at", "spoken"}
     args = {
         "doctor_id": str(DOCTOR_ID),
         "service_id": str(SERVICE_ID),
@@ -965,15 +965,19 @@ def test_quote_injected_duplicate_key_rejected(env):
 
 def test_replay_speaks_current_status(env):
     first = post(env, "/v1/bolna/tools/reserve-slot", reserve_body()).json()
-    assert first["spoken"] == service.spoken_status("pending_sync")
+    reference = " ".join(first["booking_reference"])
+    assert first["spoken"] == (
+        service.spoken_status("pending_sync") + f" Your booking reference is {reference}."
+    )
     for status in ("cancelled", "needs_review", "confirmed"):
         with connect(env["url"]) as conn:
             conn.execute("UPDATE appointments SET status=%s", (status,))
         again = post(env, "/v1/bolna/tools/reserve-slot", reserve_body())
         assert again.status_code == 202
         assert again.json()["status"] == status
-        assert again.json()["spoken"] == service.spoken_status(status)
+        assert again.json()["spoken"].startswith(service.spoken_status(status))
         assert again.json()["appointment_id"] == first["appointment_id"]
+        assert again.json()["booking_reference"] == first["booking_reference"]
 
 
 def test_session_cap(env):

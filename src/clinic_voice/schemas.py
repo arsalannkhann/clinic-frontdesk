@@ -35,6 +35,7 @@ class ReservationRequest(StrictModel):
 
 class ReservationResponse(StrictModel):
     appointment_id: UUID
+    booking_reference: str
     status: str
     starts_at: AwareDatetime
     ends_at: AwareDatetime
@@ -376,10 +377,77 @@ class BolnaSlotQuery(BolnaCallContext):
     day: date
 
 
+def _consent_flag(value):
+    """Tri-state consent from a rendered template value: "true" grants, "false" declines
+    (revokes an active grant), anything else ("" included) means the caller was not asked."""
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, str):
+        return {"true": True, "false": False}.get(value.strip().casefold())
+    raise ValueError("consent must be true, false or empty")
+
+
+def _read_back(value):
+    """Only an explicit true (JSON true or the string "true") confirms a change; any other
+    string means not confirmed."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().casefold() == "true"
+    raise ValueError("confirmed must be true or false")
+
+
+def _language(value):
+    # The LLM fills this from the conversation; anything unsupported is ignored.
+    if isinstance(value, str) and value.strip().casefold() in ("en", "hi"):
+        return value.strip().casefold()
+    if isinstance(value, str):
+        return ""
+    raise ValueError("language must be a string")
+
+
+ConsentFlag = Annotated[bool | None, BeforeValidator(_consent_flag)]
+ReadBack = Annotated[bool, BeforeValidator(_read_back)]
+PatientName = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(strip_whitespace=True, max_length=120),
+]
+# Free-form spoken reference; normalized and checked by the gateway, where a malformed
+# value counts as a failed verification exactly like a wrong one.
+SpokenReference = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(strip_whitespace=True, max_length=32),
+]
+
+
 class BolnaReservation(BolnaCallContext):
     doctor: CatalogName
     service: CatalogName
     starts_at: AwareDatetime
+    # Optional patient details. The phone is never a parameter: it comes from the call
+    # session. Empty strings mean "not given".
+    patient_name: PatientName = ""
+    preferred_language: Annotated[str, BeforeValidator(_language)] = ""
+    consent_booking_confirmation: ConsentFlag = None
+    consent_reminder_call: ConsentFlag = None
+    consent_reminder_message: ConsentFlag = None
+
+
+class BolnaVerify(BolnaCallContext):
+    booking_reference: SpokenReference
+
+
+class BolnaCancel(BolnaCallContext):
+    booking_reference: SpokenReference
+    confirmed: ReadBack = False
+
+
+class BolnaReschedule(BolnaCallContext):
+    booking_reference: SpokenReference
+    starts_at: AwareDatetime
+    confirmed: ReadBack = False
 
 
 class BolnaStatusQuery(BolnaCallContext):
@@ -393,6 +461,7 @@ class BolnaSlotsOut(StrictModel):
 
 class BolnaReservationOut(StrictModel):
     appointment_id: UUID
+    booking_reference: str
     status: str
     starts_at: AwareDatetime
     spoken: str
@@ -401,6 +470,29 @@ class BolnaReservationOut(StrictModel):
 class BolnaStatusOut(StrictModel):
     appointment_id: UUID
     status: str
+    spoken: str
+
+
+class BolnaVerifyOut(StrictModel):
+    """A verified booking: no patient data, only what the caller needs read back."""
+
+    booking_reference: str
+    status: str
+    starts_at: AwareDatetime
+    doctor: str
+    service: str
+    spoken: str
+
+
+class BolnaChangeOut(StrictModel):
+    """changed=false: nothing was changed (read back and call again with confirmed=true).
+    For a reschedule, booking_reference is the new booking's reference."""
+
+    changed: bool
+    booking_reference: str
+    previous_booking_reference: str | None = None
+    status: str
+    starts_at: AwareDatetime
     spoken: str
 
 
@@ -420,3 +512,28 @@ class BolnaContextOut(StrictModel):
     faq_text: str
     emergency_text: str
     approved_text: bool  # False: the two texts above are placeholders, not clinic-approved.
+
+
+# Staff appointment views (routes_appointments.py)
+AppointmentState = Literal["pending_sync", "confirmed", "needs_review", "cancelled"]
+
+
+class StaffAppointmentOut(StrictModel):
+    """Minimal fields. patient_name and phone_last2 are filled for owner/admin only (null for
+    viewer, and when the patient record is missing or cannot be decrypted)."""
+
+    id: UUID
+    booking_reference: str
+    doctor_id: UUID
+    service_id: UUID
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    status: str
+    rescheduled_from: UUID | None
+    created_at: AwareDatetime
+    patient_name: str | None
+    phone_last2: str | None
+
+
+class AppointmentResolve(StrictModel):
+    action: Literal["requeue", "cancel"]

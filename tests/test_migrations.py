@@ -4,6 +4,7 @@ Uses a separate scratch database (name ending _test) so the shared fixture is un
 """
 
 import os
+import re
 import shutil
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -132,3 +133,42 @@ def test_007_keeps_existing_outbox_rows_and_versions_uniqueness(scratch_database
             "INSERT INTO outbox (id,clinic_id,appointment_id,kind) VALUES (%s,%s,%s,'calendar.create')",
             (uuid4(), CLINIC, appointment),
         )
+
+
+def test_012_backfills_unique_booking_references(scratch_database, tmp_path):
+    for path in sorted(Path("migrations").glob("0*.sql")):
+        if path.name < "012":
+            shutil.copy(path, tmp_path / path.name)
+    migrate(scratch_database, tmp_path)
+    seed(scratch_database)
+    starts_at = datetime(2031, 1, 6, 4, 30, tzinfo=UTC)
+    with connect(scratch_database) as conn:
+        for index in range(5):
+            start = starts_at + timedelta(minutes=15 * index)
+            conn.execute(
+                "INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,"
+                "blocks_until,status,idempotency_key,request_hash)"
+                " VALUES (%s,%s,%s,%s,%s,%s,%s,'confirmed',%s,'synthetic')",
+                (
+                    uuid4(),
+                    CLINIC,
+                    DOCTOR_ID,
+                    SERVICE_ID,
+                    start,
+                    start + timedelta(minutes=15),
+                    start + timedelta(minutes=15),
+                    f"pre-012-{index}",
+                ),
+            )
+
+    migrate(scratch_database, Path("migrations"))
+
+    with connect(scratch_database) as conn:
+        references = [
+            r["booking_reference"]
+            for r in conn.execute("SELECT booking_reference FROM appointments").fetchall()
+        ]
+        # The column default covers inserts that do not name a reference.
+        default = conn.execute("SELECT new_booking_reference() AS r").fetchone()["r"]
+    assert len(set(references)) == 5
+    assert all(re.fullmatch(r"[0-9A-HJKMNP-TV-Z]{8}", r) for r in [*references, default])
