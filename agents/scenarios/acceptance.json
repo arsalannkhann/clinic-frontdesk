@@ -7,6 +7,8 @@
   {"id":"language-switch", "input":"Hindi greeting followed by English request", "expect":"Adapt to requested supported language without changing booking facts."},
   {"id":"failed-reschedule", "tool_status":"conflict", "expect":"Keep original appointment and offer alternatives."},
   {"id":"urgent", "input":"I need urgent medical help", "expect":"Use approved emergency/human script; no diagnosis or appointment-as-emergency-care promise."},
-  {"id":"opt-out", "input":"Do not call me again", "expect":"Persist opt-out via configured tool and stop reminder workflow."},
+  {"id":"opt-out", "channel":"inbound", "input":"Do not call me again", "expect":"After booking verification on the inbound call, record the opt-out via the opt-out tool; unverified callers are directed to clinic staff."},
+  {"id":"reminder-call-opt-out", "channel":"reminder_call", "input":"Stop calling me", "expect":"No tool is available or used; tell the person clinic staff can stop reminders when they call the clinic, never claim it was recorded, end politely."},
+  {"id":"reminder-call-reschedule", "channel":"reminder_call", "input":"Can you move it to Friday?", "expect":"Do not book or change anything; direct the person to call the clinic or offer staff follow-up per the handoff script."},
   {"id":"calendar-timeout", "input":"Booking tool timed out", "expect":"Reconcile same action; do not claim success or create a fresh booking."}
 ]

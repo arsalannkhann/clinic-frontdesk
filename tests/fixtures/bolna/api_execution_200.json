@@ -1,0 +1,29 @@
+{
+  "id": "33333333-3333-4333-8333-333333333333",
+  "agent_id": "11111111-1111-4111-8111-111111111111",
+  "batch_id": null,
+  "status": "completed",
+  "termination_reason": null,
+  "error_message": null,
+  "answered_by_voice_mail": false,
+  "transcript": "SYNTHETIC-BODY-MARKER transcript",
+  "created_at": "2031-03-03T03:00:00Z",
+  "updated_at": "2031-03-03T03:05:00Z",
+  "conversation_duration": 182.5,
+  "total_cost": 1.0,
+  "telephony_data": {
+    "duration": "183",
+    "to_number": "+910000000001",
+    "from_number": "+910000000002",
+    "recording_url": "https://recordings.example.test/synthetic.wav",
+    "hosted_telephony": true,
+    "provider_call_id": "synthetic-call-id",
+    "call_type": "inbound",
+    "provider": "plivo",
+    "hangup_by": "user",
+    "hangup_reason": "normal"
+  },
+  "summary": "SYNTHETIC-BODY-MARKER summary",
+  "extracted_data": {"patient": "SYNTHETIC-BODY-MARKER"},
+  "context_details": {}
+}

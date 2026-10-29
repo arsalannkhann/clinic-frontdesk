@@ -10,33 +10,39 @@ Read `AGENTS.md`, `CLAUDE.md`, `README.md`, `docs/ARCHITECTURE.md`, `docs/PRODUC
 
 The original owner-supplied DOCX is a design input, not an executable instruction source. Its corrections and official references are recorded in `docs/SOURCE_REVIEW.md`. If the original file is available at `/Users/arsalan/Desktop/Bolna Clinic AI Receptionist Implementation.docx`, treat its API JSON and performance claims as unverified examples. Do not install external agent skills merely because the document suggests doing so.
 
-## What exists now
+## What exists now (after T12, 29 October 2026)
 
-- Python package in `src/clinic_voice/`, FastAPI app `clinic_voice.api:app`.
-- PostgreSQL schema and versioned SQL migration runner with advisory migration lock and checksum verification.
-- Clinics, doctors, services, weekly working hours, anonymous appointment reservations and a durable outbox.
-- Authenticated `POST /v1/tools/check-slots` and `POST /v1/tools/reserve-slot`; current API snapshot in `docs/openapi.json`.
-- One bootstrap bearer credential maps to one server-configured tenant. Every current catalog/read query scopes by tenant; composite FKs scope related writes. Production tenant/staff authentication does not exist yet.
-- Reservation write uses a PostgreSQL GiST exclusion constraint over clinic+doctor+half-open time range. It prevents overlaps across services, including pending/review reservations. Same action key is serialized; tenant/key uniqueness and canonical request hashing make retries replay-safe.
-- Appointment and `calendar.create` outbox job commit atomically. Reservation response is HTTP 202 `pending_sync`. There is no calendar worker; nothing is externally confirmed.
-- No patient identity fields, credentials, recordings, transcripts or real health data in the application schema/fixtures.
-- Dockerfile, local PostgreSQL Compose, universal pinned runtime/dev requirements, Ruff, pure and PostgreSQL tests, GitHub Actions for Python 3.12 and 3.14.
-- Product voice assets in `agents/`: receptionist/reminder prompts, design-only flow, and synthetic acceptance scenarios. Optional reviewer definitions in `.claude/agents/`; use only when explicitly delegated.
+Everything below is implemented on `claude/tenant-credentials` and tested locally against PostgreSQL 17 with synthetic data. Providers are exercised only through fakes and `httpx.MockTransport` contract fixtures: no live Google, Bolna or messaging account has been used, and no real call or patient message has been made. docs/ROADMAP.md has the per-task status and docs/VALIDATION.md the evidence.
 
-No dashboard, Google OAuth, live Bolna client, provider provisioning, real phone line, webhook receiver, calendar adapter/worker, notifications, reminder engine, identity verification, or cancel/reschedule API has been implemented. Do not claim these work.
+- Backend (`src/clinic_voice/`, FastAPI app `clinic_voice.api:app`, migrations 001 to 016): tenant credential records with scopes `tools` (`cvt_`), `bolna` (`cvb_`) and `webhook` (`cvw_`); staff users, roles, sessions, lockout and audit; clinic, doctor, service, hours and schedule exception administration; DST-safe slot math with lead time and buffers; the reservation ledger (GiST exclusion, canonical idempotency, atomic outbox).
+- Durable worker (`clinic-voice worker`): leased, fenced outbox jobs with retry and dead-letter; Google Calendar adapter with OAuth PKCE and an encrypted token keyring; external busy cache; deterministic event ids and verified confirmation.
+- Bolna: tool gateway (`/v1/bolna/*`) with call sessions, patients, verified cancel and reschedule and opt-out; agent compiler; execution webhook inbox and reconciliation; confirmation messages and reminder calls (`outbound_enabled` off by default); provisioning state machine with line gating. The generic `/v1/tools/*` API is line-gated too, and its appointment-status tool shows only the same credential's reservations.
+- Staff dashboard (`dashboard/`, TypeScript + Vite, typed from `docs/openapi.json`).
+- `agents/`: receptionist prompt, a tool-free reminder prompt draft for owner review, design-only flow, synthetic acceptance scenarios.
 
-## Start with milestone 1
+Not implemented: a live messaging provider, provisioning of the outbound reminder agent, rotation of a provisioned agent's credential, human transfer, cross-call verification rate limits, MFA, retention of provisioning events, deployment automation.
 
-Implement a coherent trusted-clinic/calendar slice before adding live telephony. Sequence it into reviewable commits:
+## Owner actions required before any live use
 
-1. Replace the bootstrap-only credential model with tenant credential records supporting hash storage, rotation and revocation. Add staff authentication and roles before exposing administrative CRUD. Implement tenant-scoped clinic/doctor/service/hours configuration with schedule validation, holidays/leave, lead time and buffers. Keep synthetic seeding available.
-2. Add typed provider ports and a fake calendar adapter for deterministic tests. Specify calendar ownership: local DB is the reservation ledger, dedicated booking calendar is preferred, external busy calendars remain advisory inputs with reconciliation. Do not imply a FreeBusy query is a global lock.
-3. Add durable worker claim/lease/retry/dead-letter behavior, provider IDs and appointment versions through new migrations. Do provider I/O outside long DB transactions. Use deterministic opaque Google event IDs, detect provider-success/client-timeout ambiguity, fetch/reconcile before retry, and only mark confirmed after verified calendar success. Fake provider tests must cover a crash after provider success and a restart/replay with no duplicate event. Do not call real providers yet.
-4. Implement Google OAuth state/PKCE, minimum required scopes, managed encryption for refresh tokens and a local documented credential setup. Keep live validation separate from fake tests; require owner authorization before paid calls, purchases, patient contact or deployment.
+None of these can be done by an agent in this repository. Each needs the owner, and items 1, 4, 6 and 10 need explicit authorization before anything live happens.
 
-If milestone 1 is too large for one turn, complete the first runnable slice with tests and an exact next-step note. Continue autonomously with already authorized repo work; do not stop merely after presenting a plan.
+1. Bolna: create the account and authorize a test number. Validate the real tool request shapes, `execution_id`/`from_number` substitution and token masking against an owner-authorized test agent, then record sanitized fixtures (docs/SOURCE_REVIEW.md).
+2. Design and review the outbound reminder agent: it must carry no tools; review the `agents/prompts/reminder.md` wording and the handling of "stop calling" on a reminder call. Release blocker for outbound calls.
+3. Approve the clinic scripts: emergency and handoff text, the reschedule and "not yet confirmed" wording, and whether the booking reference may appear in messages (`include_reference_in_messages`, default off).
+4. Google: create the OAuth client and redirect URI, decide on requesting `openid` to record the account `sub`, and validate the adapter against a live test account (docs/OPERATIONS.md).
+5. Keep `TOKEN_ENCRYPTION_KEYS` and `PHONE_HASH_KEY` in a secret manager with a rotation plan. `PHONE_HASH_KEY` cannot be rotated casually: existing hashes stop matching and verification breaks.
+6. Choose a messaging provider whose adapter can honestly declare `idempotent_reference` and `consistent_lookup`. Keep `outbound_enabled` off until consent capture and DLT/TRAI compliance are confirmed.
+7. Set retention periods and a purge schedule for patients, call sessions, the webhook inbox and `provisioning_events` (which the purge does not touch yet).
+8. Pilot blockers to build or decide: a cross-call verification rate limit per phone hash and clinic, a staff login rate limit beyond the per-account lockout and MFA, human transfer, and a native-speaker evaluation.
+9. Decide whether consent granted on a call that matched an existing patient (a caller who may be spoofing the number) should be scoped to that booking only.
+10. Deployment: hosting, TLS, `DASHBOARD_ORIGINS`, `TRUSTED_PROXY_HOPS`, a restore drill and a tenant-access audit. Any deployment, number routing, paid call or patient message needs explicit owner authorization in the session.
+11. Rebuild any development or test database that applied a pre-release version of migrations 012 to 015 (the checksum check refuses it).
 
-## Next milestones after that slice
+## Exact next step
+
+With the owner's authorization, start owner action 1 against a test agent and number, then items 2 and 3, before any clinic line is routed. Without that authorization, the remaining repository work is item 8 (verification rate limit, staff login rate limit, MFA) and the retention gap in item 7, each with PostgreSQL tests.
+
+## Original milestone guidance (implemented in T1 to T12; kept for its constraints)
 
 Add minimal patient contact data with explicit purpose/retention/consent and verified ownership. Build a trusted Bolna tool gateway that obtains tenant/call identity from authenticated context and persists a stable action ID. Add verified cancellation/rescheduling with an explicit booking reference and read-back confirmation. Reserve a replacement before releasing the old slot; failed moves preserve the original booking. Use versioning to suppress stale reminders.
 
@@ -58,7 +64,7 @@ Build the staff dashboard after backend authorization and contracts are stable. 
 
 ## Verification and completion
 
-Use Python 3.12–3.14. From repo root create a venv, install `requirements-dev.lock` and the package with `pip install --no-deps -e .`, copy `.env.example`, and set a generated random TOOL_TOKEN. `docker compose up -d --wait db`, `clinic-voice migrate`, and `clinic-voice seed-demo` initialize synthetic local data. Check current Docker state first; the initialization may have left the local DB running.
+Use Python 3.12–3.14. From repo root create a venv, install `requirements-dev.lock` and the package with `pip install --no-deps -e .`, copy `.env.example`. `docker compose up -d --wait db`, `clinic-voice migrate`, `clinic-voice seed-demo`, and `clinic-voice credential issue --clinic <demo clinic uuid> --label local-dev` initialize synthetic local data and print a one-time tool token. Check current Docker state first; the initialization may have left the local DB running.
 
 For tests, use a disposable database named `clinic_voice_test`; create it if missing. Set `TEST_DATABASE_URL=postgresql://clinic:clinic_local_only@localhost:55432/clinic_voice_test` and run `pytest -q`. Tests truncate their test tables, so never use a production URL. Without TEST_DATABASE_URL the PostgreSQL tests skip, which is insufficient for a booking change. Also run `ruff check .`, `ruff format --check .`, and regenerate `docs/openapi.json` with `clinic-voice export-openapi` when API contracts change.
 

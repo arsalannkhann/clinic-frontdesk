@@ -39,3 +39,28 @@ jobs:
         run: |
           clinic-voice export-openapi > /tmp/openapi.json
           diff -u docs/openapi.json /tmp/openapi.json
+  # Actions are pinned by major tag, matching the verify job above; pin both jobs by commit
+  # SHA together if the repository adopts SHA pinning.
+  dashboard:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      # No install scripts: none of the pinned dev dependencies needs one to build or test.
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test
+      # The contract test compares the generated body only; this checks the whole committed
+      # file matches a fresh generation from docs/openapi.json.
+      - name: Verify generated API types
+        run: |
+          npm run gen:api
+          git diff --exit-code -- src/api/schema.ts

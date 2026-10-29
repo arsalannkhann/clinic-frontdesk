@@ -14,10 +14,14 @@ certifi==2026.10.23
     # via
     #   httpcore
     #   httpx
+cffi==2.1.1 ; platform_python_implementation != 'PyPy'
+    # via cryptography
 click==8.5.0
     # via uvicorn
 colorama==0.4.6 ; sys_platform == 'win32'
     # via pytest
+cryptography==50.0.2
+    # via clinic-voice-ai (pyproject.toml)
 fastapi==0.162.0
     # via clinic-voice-ai (pyproject.toml)
 h11==0.16.0
@@ -54,6 +58,8 @@ psycopg==3.3.6
     # via clinic-voice-ai (pyproject.toml)
 psycopg-binary==3.3.6 ; implementation_name != 'pypy'
     # via psycopg
+pycparser==3.12 ; implementation_name != 'PyPy' and platform_python_implementation != 'PyPy'
+    # via cffi
 pydantic==2.14.1
     # via
     #   fastapi

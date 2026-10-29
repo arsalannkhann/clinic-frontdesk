@@ -16,3 +16,6 @@ dist/
 recordings/
 transcripts/
 secrets/
+dashboard/node_modules/
+dashboard/dist/
+node_modules/

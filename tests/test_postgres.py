@@ -1,38 +1,21 @@
-import os
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from threading import Barrier
-from uuid import UUID, uuid4
+from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import activate_lines
 from fastapi import HTTPException
-from psycopg.conninfo import conninfo_to_dict
 from psycopg.errors import ForeignKeyViolation
 
-from clinic_voice.cli import DOCTOR_ID, SERVICE_ID, seed
+from clinic_voice import credentials
+from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
+from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
 from clinic_voice.db import connect, migrate
 from clinic_voice.schemas import ReservationRequest
 from clinic_voice.service import reserve, slots
-
-CLINIC = UUID("00000000-0000-4000-8000-000000000001")
-
-
-@pytest.fixture
-def database():
-    url = os.getenv("TEST_DATABASE_URL")
-    if not url:
-        pytest.skip("TEST_DATABASE_URL not configured; PostgreSQL required")
-    if not conninfo_to_dict(url).get("dbname", "").endswith("_test"):
-        pytest.fail("Refusing destructive integration tests against a database not ending _test")
-    migrate(url, Path("migrations"))
-    with connect(url) as conn:
-        conn.execute(
-            "TRUNCATE outbox, appointments, working_hours, services, doctors, clinics CASCADE"
-        )
-    seed(url, CLINIC)
-    yield url
 
 
 @pytest.fixture
@@ -152,14 +135,16 @@ def test_database_constraint_blocks_overlap_across_services(database, request_bo
         )
     with pytest.raises(ExclusionViolation), connect(database) as conn:
         conn.execute(
-            """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,status,idempotency_key,request_hash)
-            VALUES (%s,%s,%s,%s,%s,%s,'pending_sync','raw-overlap-01','synthetic')""",
+            """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,
+            blocks_until,status,idempotency_key,request_hash)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync','raw-overlap-01','synthetic')""",
             (
                 uuid4(),
                 CLINIC,
                 DOCTOR_ID,
                 other_service,
                 request_body.starts_at + timedelta(minutes=5),
+                request_body.starts_at + timedelta(minutes=35),
                 request_body.starts_at + timedelta(minutes=35),
             ),
         )
@@ -188,10 +173,10 @@ def test_http_reservation_flow(database, request_body, monkeypatch):
     from clinic_voice.api import app
     from clinic_voice.config import get_settings
 
-    token = "synthetic-http-test-" + "x" * 32
+    with connect(database) as conn:
+        _, token = credentials.issue(conn, CLINIC, "http-test")
+        activate_lines(conn, CLINIC)
     monkeypatch.setenv("DATABASE_URL", database)
-    monkeypatch.setenv("TOOL_TOKEN", token)
-    monkeypatch.setenv("CLINIC_ID", str(CLINIC))
     get_settings.cache_clear()
     try:
         with TestClient(app) as client:
