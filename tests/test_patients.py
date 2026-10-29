@@ -19,7 +19,7 @@ from fastapi.testclient import TestClient
 
 from clinic_voice import appointments, cli, credentials, service, staff
 from clinic_voice.api import app
-from clinic_voice.bolna import bookings
+from clinic_voice.bolna import bookings, gateway
 from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
 from clinic_voice.config import get_settings
@@ -263,18 +263,38 @@ def test_unverified_caller_fills_missing_language(env):
     assert patient["preferred_language"] == "en"
 
 
-def test_verified_session_decline_revokes_and_changes_language(env):
+def test_verified_session_decline_is_scoped_to_the_new_booking(env):
+    """Verifying a booking proves that booking, not who the matched patient is (a spoofed
+    caller ID plus a name can attach and verify a booking on another patient's record), so
+    a decline never revokes a matched patient's consent or changes their language; it opts
+    the new booking out instead (ADR 0006, ADR 0008)."""
     first = book(env, consent_reminder_call="true", preferred_language="hi")
     call = execution()
     assert verify(env, call, first["booking_reference"]).status_code == 200
-    book(
+    second = book(
         env,
         execution_id=call,
         starts_at=SLOT + timedelta(hours=1),
         consent_reminder_call="no",
         preferred_language="en",
     )
+    assert active_consents(env) == [{"purpose": "reminder_call"}]
+    assert gateway.PREFERENCE_KEPT in second["spoken"]
+    [patient] = rows(env["url"], "SELECT preferred_language FROM patients")
+    assert patient["preferred_language"] == "hi"
+    [preference] = rows(env["url"], "SELECT * FROM contact_preferences")
+    assert (
+        preference["appointment_id"],
+        preference["purpose"],
+        preference["channel"],
+        preference["source"],
+    ) == (UUID(second["appointment_id"]), "reminder", "call", "tool")
+
+
+def test_new_patient_takes_declines_and_language_as_given(env):
+    book(env, consent_reminder_call="no", preferred_language="en")
     assert active_consents(env) == []
+    assert rows(env["url"], "SELECT * FROM contact_preferences") == []
     [patient] = rows(env["url"], "SELECT preferred_language FROM patients")
     assert patient["preferred_language"] == "en"
 

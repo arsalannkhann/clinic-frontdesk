@@ -78,7 +78,20 @@ def agent_refused(configured, named) -> bool:
 
 
 def agent_mismatch(conn, clinic_id, minimized) -> bool:
-    return agent_refused(clinic_agent(conn, clinic_id), minimized.get("agent_id"))
+    """Intake check: the event must name the clinic's inbound agent, or its outbound
+    reminder agent (bolna_outbound_agent_id). Outbound reminder executions have no call
+    session, so their events are stored and then ignored in processing
+    ('unknown_execution'); an outbound-agent event naming an inbound session's execution id
+    fails the processing agent check and changes nothing."""
+    row = conn.execute(
+        "SELECT bolna_agent_id, bolna_outbound_agent_id FROM clinics WHERE id=%s", (clinic_id,)
+    ).fetchone()
+    if row is None:
+        return True
+    named = minimized.get("agent_id")
+    if row["bolna_outbound_agent_id"] is not None and named == row["bolna_outbound_agent_id"]:
+        return False
+    return agent_refused(row["bolna_agent_id"], named)
 
 
 def record(conn, clinic_id, minimized) -> bool:

@@ -291,6 +291,8 @@ def reschedule(url, clinic_id, session_id, request, retention_days: int):
                 if error.status_code == 409:
                     raise HTTPException(409, UNAVAILABLE) from None
                 raise
+            # Opt-outs of the moved booking follow it to its successor.
+            reminders.carry_opt_outs(conn, clinic_id, locked["id"], new_row["id"])
             if locked["patient_id"] is not None:
                 patients.extend_retention(
                     conn,

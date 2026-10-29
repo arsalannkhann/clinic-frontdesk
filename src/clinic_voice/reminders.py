@@ -509,6 +509,21 @@ def opt_out(
     return suppressed
 
 
+def carry_opt_outs(conn, clinic_id, old_appointment_id, new_appointment_id) -> int:
+    """Copy the appointment-scoped opt-outs of a rescheduled booking to its successor, in
+    the rescheduling transaction (before the successor is confirmed and planned), so moving
+    a booking never re-enables contacts its patient stopped. Returns how many were copied."""
+    return conn.execute(
+        """INSERT INTO contact_preferences (id,clinic_id,patient_id,appointment_id,purpose,
+        channel,source,staff_user_id)
+        SELECT gen_random_uuid(), clinic_id, patient_id, %s, purpose, channel, source,
+            staff_user_id
+        FROM contact_preferences WHERE clinic_id=%s AND appointment_id=%s
+        ON CONFLICT DO NOTHING""",
+        (new_appointment_id, clinic_id, old_appointment_id),
+    ).rowcount
+
+
 def remove_opt_out(conn, clinic_id, patient_id, appointment_id, purpose, channel) -> int:
     """Delete the opt-outs of exactly (purpose, channel) that cover this appointment: the
     patient-wide one and the one for this appointment. Contacts already suppressed stay
@@ -529,7 +544,7 @@ LOST_BATCH = 500
 
 
 def sweep_lost(conn, limit=LOST_BATCH) -> int:
-    """Housekeeping across tenants: a contact still scheduled or sending whose job is done,
+    """Housekeeping across tenants: a contact still scheduled, sending or unknown whose job is done,
     dead or missing will never be attempted or settled by a worker (for example a dead job
     whose on_dead hook skipped the row because it was locked). It goes to needs_review
     ('job_lost') for staff instead of staying open forever. Rows changed within LOST_GRACE
@@ -537,7 +552,8 @@ def sweep_lost(conn, limit=LOST_BATCH) -> int:
     moved = conn.execute(
         """UPDATE reminders SET status='needs_review', last_error='job_lost', updated_at=now()
         WHERE id IN (SELECT r.id FROM reminders r
-            WHERE r.status IN ('scheduled', 'sending') AND r.updated_at < now() - %s
+            WHERE r.status IN ('scheduled', 'sending', 'unknown')
+            AND r.updated_at < now() - %s
             AND NOT EXISTS (SELECT 1 FROM outbox o WHERE o.clinic_id = r.clinic_id
                 AND o.kind IN ('notification.send', 'reminder.call')
                 AND o.payload->>'reminder_id' = r.id::text

@@ -5,7 +5,7 @@ every status change. The docs describe no signature, secret or API-settable webh
 so the clinic's webhook credential (cvw_<id>.<secret>, scope 'webhook') is the last path
 segment; access logs redact it (api.StripQuery). Order of checks, each refusing with nothing
 stored: optional source IP allowlist (403), credential (401), body size (413), JSON shape
-(422), configured agent id (403). The minimized event and its webhook.process job commit
+(422), configured agent id: inbound or outbound reminder agent (403). The minimized event and its webhook.process job commit
 together before the 2xx; a duplicate delivery also gets 2xx and creates nothing.
 """
 

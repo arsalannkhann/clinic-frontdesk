@@ -429,6 +429,28 @@ def test_configured_agent_id_is_cross_checked(env):
     assert session(env["url"])["provider_status"] == "ringing"
 
 
+def test_outbound_reminder_agent_events_are_accepted_and_ignored(env):
+    outbound = "33333333-3333-4333-8333-333333333333"
+    with connect(env["url"]) as conn:
+        conn.execute(
+            "UPDATE clinics SET bolna_agent_id=%s, bolna_outbound_agent_id=%s WHERE id=%s",
+            (AGENT, outbound, CLINIC),
+        )
+    add_session(env["url"])
+    reminder_call = str(uuid4())
+    # A reminder call's execution (no call session): accepted, then ignored.
+    assert (
+        deliver(env, event("completed", execution=reminder_call, agent=outbound)).status_code == 200
+    )
+    # The outbound agent naming an inbound session's execution: accepted, changes nothing.
+    assert deliver(env, event("completed", agent=outbound)).status_code == 200
+    # Any other agent is still refused.
+    assert deliver(env, event("completed", agent=OTHER_AGENT)).status_code == 403
+    work(env["url"])
+    assert [r["outcome"] for r in inbox(env["url"])] == ["unknown_execution", "agent_mismatch"]
+    assert session(env["url"])["provider_status"] is None
+
+
 def test_agent_configured_after_intake_is_enforced_by_processor(env):
     add_session(env["url"], agent=None)
     without = completed()

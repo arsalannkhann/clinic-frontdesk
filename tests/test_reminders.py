@@ -856,7 +856,7 @@ def test_staff_can_remove_an_opt_out(env):
     assert {c["status"] for c in contacts(env, later["appointment_id"])} == {"scheduled"}
 
 
-def test_unverified_decline_speaks_that_preference_needs_verification(env):
+def test_decline_on_a_matched_patient_speaks_that_staff_change_preferences(env):
     first = book(env, consents={"consent_reminder_call": "true"})
     assert gateway.PREFERENCE_KEPT not in first["spoken"]
     again = book(
@@ -1470,3 +1470,81 @@ def test_outcome_write_is_fenced_on_the_attempt(env):
     assert (
         contact(env, made["appointment_id"], "booking_confirmation", "message")["status"] == "sent"
     )
+
+
+def test_spoofed_decline_cannot_revoke_the_victims_consent(env):
+    """R1: a spoofer attaches a booking to the victim's record (caller ID + name), verifies
+    it, then declines reminders on another reservation in the same call. The decline only
+    opts that reservation out; the victim's consent and other bookings are untouched."""
+    victim = book(env)
+    confirm(env)
+    call = str(uuid4())
+    spoofed = book(env, starts_at=SLOT + timedelta(hours=2), execution_id=call)
+    assert verify(env, call, spoofed["booking_reference"]).status_code == 200
+    declined = book(
+        env,
+        consents={key: "false" for key in ALL_CONSENTS},
+        starts_at=SLOT + timedelta(hours=3),
+        execution_id=call,
+    )
+    assert gateway.PREFERENCE_KEPT in declined["spoken"]
+    confirm(env)
+    assert rows(env["url"], "SELECT revoked_at FROM consents WHERE revoked_at IS NOT NULL") == []
+    assert {c["status"] for c in contacts(env, victim["appointment_id"])} == {"scheduled"}
+    assert {c["status"] for c in contacts(env, spoofed["appointment_id"])} == {"scheduled"}
+    assert {(c["status"], c["last_error"]) for c in contacts(env, declined["appointment_id"])} == {
+        ("suppressed", "opted_out")
+    }
+    preferences = rows(env["url"], "SELECT appointment_id FROM contact_preferences")
+    assert {p["appointment_id"] for p in preferences} == {UUID(declined["appointment_id"])}
+
+
+def test_reschedule_carries_booking_opt_outs_to_the_new_booking(env):
+    made = book(env)
+    confirm(env)
+    session = str(uuid4())
+    assert verify(env, session, made["booking_reference"]).status_code == 200
+    assert opt_out(env, session, made["booking_reference"], scope="calls").status_code == 200
+    moved = SLOT + timedelta(days=1)
+    r = post(
+        env,
+        RESCHEDULE,
+        body(
+            session,
+            booking_reference=made["booking_reference"],
+            starts_at=moved.isoformat(),
+            confirmed="true",
+        ),
+    )
+    assert r.status_code == 200, r.text
+    [new] = rows(
+        env["url"],
+        "SELECT id FROM appointments WHERE rescheduled_from=%s",
+        (made["appointment_id"],),
+    )
+    confirm(env)
+    call = contact(env, new["id"], "reminder", "call")
+    assert (call["status"], call["last_error"]) == ("suppressed", "opted_out")
+    assert contact(env, new["id"], "reminder", "message")["status"] == "scheduled"
+    scoped = rows(
+        env["url"],
+        "SELECT channel FROM contact_preferences WHERE appointment_id=%s",
+        (new["id"],),
+    )
+    assert scoped == [{"channel": "call"}]
+
+
+def test_housekeeping_moves_unknown_contacts_without_a_job_to_review(env):
+    made = book(env, consents={"consent_booking_confirmation": "true"})
+    confirm(env)
+    row = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    execute(
+        env["url"],
+        "UPDATE reminders SET status='unknown', updated_at = now() - interval '1 hour' WHERE id=%s",
+        (row["id"],),
+    )
+    execute(env["url"], "UPDATE outbox SET status='dead' WHERE kind='notification.send'")
+    with connect(env["url"]) as conn:
+        assert reminders.sweep_lost(conn) == 1
+    swept = contact(env, made["appointment_id"], "booking_confirmation", "message")
+    assert (swept["status"], swept["last_error"]) == ("needs_review", "job_lost")

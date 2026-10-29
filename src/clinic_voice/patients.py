@@ -159,27 +159,14 @@ def _lock_existing(conn, clinic_id, patient_id) -> bool:
     )
 
 
-def verified_in_session(conn, clinic_id, session_id, patient_id) -> bool:
-    """True if this call session verified (reference + caller number) an appointment of
-    this patient."""
-    return (
-        conn.execute(
-            """SELECT 1 FROM call_session_verifications v
-            JOIN appointments a ON a.clinic_id=v.clinic_id AND a.id=v.appointment_id
-            WHERE v.clinic_id=%s AND v.call_session_id=%s AND a.patient_id=%s LIMIT 1""",
-            (clinic_id, session_id, patient_id),
-        ).fetchone()
-        is not None
-    )
-
-
 def record_consents(
     conn, clinic_id, patient_id, consents: dict[str, bool], source, allow_revoke: bool
 ) -> list[str]:
     """Grants are always recorded. A decline revokes an active grant only with
-    allow_revoke; without it the decline is ignored (nothing is stored). Returns the purposes
-    whose active grant was kept although the caller declined (so the agent can say that
-    changing an existing preference needs verification or staff)."""
+    allow_revoke; without it the decline is not applied to the patient (the gateway records
+    it as an opt-out of the new booking only). Returns the purposes whose active grant was
+    kept although the caller declined (so the agent can say that patient-wide changes go
+    through clinic staff)."""
     kept = []
     for purpose, granted in consents.items():
         if purpose not in PURPOSES:
@@ -215,12 +202,22 @@ def attach(
     details: PatientDetails,
     retention_until: datetime,
     kept_grants: list[str] | None = None,
+    declined: list[str] | None = None,
 ) -> UUID | None:
     """Create or attach the patient for a gateway reservation inside its transaction and
     record consent. Returns None (no patient row) when neither a caller number nor a name is
-    known. kept_grants, if given, receives the purposes whose declines could not be applied
-    (record_consents). Lock order 4 (locks.py): a per-(clinic, phone hash) advisory lock, after the
-    doctor rows, so concurrent bookings from one phone attach consistently."""
+    known.
+
+    Only a patient row created in this transaction takes the caller's declines (revocations)
+    and language as given. A matched existing patient (same caller number hash and name)
+    only gains grants and a missing language: matching is by provider-asserted caller ID and
+    a name, so the caller may not be that patient, and verifying a booking in this session
+    proves only that booking (a spoofer can attach and verify a booking of their own on the
+    victim's record, ADR 0006/0008). declined, if given, receives every purpose declined for
+    such an existing patient; the gateway records them as opt-outs of the new booking only.
+    kept_grants, if given, receives the declined purposes whose active grant was kept
+    (record_consents). Lock order 4 (locks.py): a per-(clinic, phone hash) advisory lock,
+    after the doctor rows, so concurrent bookings from one phone attach consistently."""
     phone = caller_number(conn, keyring, clinic_id, session_id)
     if phone is None and not details.name:
         return None
@@ -233,23 +230,23 @@ def attach(
         matches = _matching(conn, keyring, clinic_id, phone[1], details.name)
         if len(matches) == 1 and _lock_existing(conn, clinic_id, matches[0]):
             patient_id = matches[0]
-    if patient_id is None:
+    created = patient_id is None
+    if created:
         patient_id = _create(conn, keyring, clinic_id, details, phone, retention_until)
-        authorized = True  # Created in this transaction.
     else:
         extend_retention(conn, clinic_id, patient_id, retention_until)
-        authorized = verified_in_session(conn, clinic_id, session_id, patient_id)
         if details.language:
-            # Unverified callers may only fill a missing language, never change one.
+            # A matched patient's language may be filled when missing, never changed.
             conn.execute(
-                "UPDATE patients SET preferred_language ="
-                " CASE WHEN %s THEN %s ELSE COALESCE(preferred_language, %s) END"
+                "UPDATE patients SET preferred_language = COALESCE(preferred_language, %s)"
                 " WHERE clinic_id=%s AND id=%s",
-                (authorized, details.language, details.language, clinic_id, patient_id),
+                (details.language, clinic_id, patient_id),
             )
     kept = record_consents(
-        conn, clinic_id, patient_id, details.consents, "voice_call", allow_revoke=authorized
+        conn, clinic_id, patient_id, details.consents, "voice_call", allow_revoke=created
     )
     if kept_grants is not None:
         kept_grants.extend(kept)
+    if declined is not None and not created:
+        declined.extend(purpose for purpose, granted in details.consents.items() if not granted)
     return patient_id

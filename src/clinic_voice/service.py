@@ -202,10 +202,12 @@ def insert_reservation(
     patient_id=None,
     rescheduled_from=None,
     attach_patient=None,
+    after_insert=None,
 ):
     """Check the slot and insert a pending_sync appointment plus its calendar.create job in
     the caller's transaction. The caller must hold the doctor row lock (locks.py, level 3).
-    attach_patient(conn, starts_at) -> patient id | None runs after the slot check."""
+    attach_patient(conn, starts_at) -> patient id | None runs after the slot check;
+    after_insert(conn, appointment_id, patient_id) runs after the appointment insert."""
     context = get_context(conn, clinic_id, doctor_id, service_id)
     day = starts_at.astimezone(ZoneInfo(context["timezone"])).date()
     available = slots(conn, clinic_id, doctor_id, service_id, day, context=context)
@@ -237,6 +239,8 @@ def insert_reservation(
         "INSERT INTO outbox (id,clinic_id,appointment_id,kind) VALUES (%s,%s,%s,'calendar.create')",
         (uuid4(), clinic_id, appointment_id),
     )
+    if after_insert is not None:
+        after_insert(conn, row["id"], patient_id)
     return row
 
 
@@ -248,6 +252,7 @@ def reserve(
     call_session_id=None,
     max_session_active=None,
     attach_patient=None,
+    after_insert=None,
 ):
     """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
     session that created it (the gateway derives `key` from that session's execution id).
@@ -302,6 +307,7 @@ def reserve(
                 request_hash,
                 call_session_id=call_session_id,
                 attach_patient=attach_patient,
+                after_insert=after_insert,
             )
             result = response(row)
         return result

@@ -23,7 +23,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
-from clinic_voice import patients, service
+from clinic_voice import patients, reminders, service
 from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key, phone_hash
 from clinic_voice.domain import spoken_reference
 from clinic_voice.patients import session_aad
@@ -221,9 +221,15 @@ def check_slots(conn, clinic_id, query):
 
 # Said when a decline could not revoke an existing grant (unverified caller, ADR 0006).
 PREFERENCE_KEPT = (
-    "Your existing contact preferences were not changed: changing them needs your booking"
-    " reference verified on this call, or clinic staff can help."
+    "This booking will not get the contacts you declined, but your other contact"
+    " preferences were not changed. Clinic staff can change them for all your bookings."
 )
+# A decline on a matched existing patient becomes an opt-out of the new booking only.
+DECLINE_SCOPE = {
+    "booking_confirmation": ("booking_confirmation", "message"),
+    "reminder_call": ("reminder", "call"),
+    "reminder_message": ("reminder", "message"),
+}
 
 CONSENT_WORDS = {
     "booking_confirmation": "confirming this booking",
@@ -271,13 +277,37 @@ def reserve(url, clinic_id, session_id, request, doctor_id, service_id, crypto, 
     keyring = crypto[0]
     details = patient_details(request)
     kept: list[str] = []
+    declined: list[str] = []
 
     def attach(conn, starts_at):
         kept.clear()  # Only the attempt that commits counts.
+        declined.clear()
         retention_until = starts_at + timedelta(days=retention_days)
         return patients.attach(
-            conn, keyring, clinic_id, session_id, details, retention_until, kept_grants=kept
+            conn,
+            keyring,
+            clinic_id,
+            session_id,
+            details,
+            retention_until,
+            kept_grants=kept,
+            declined=declined,
         )
+
+    def scope_declines(conn, appointment_id, patient_id):
+        # Matched existing patient: the decline applies to this booking only (never revokes
+        # the patient's consent, which a spoofed caller ID plus a name could otherwise do).
+        for purpose in declined:
+            opt_purpose, channel = DECLINE_SCOPE[purpose]
+            reminders.opt_out(
+                conn,
+                clinic_id,
+                patient_id,
+                opt_purpose,
+                channel,
+                "tool",
+                appointment_id=appointment_id,
+            )
 
     result = service.reserve(
         url,
@@ -287,6 +317,7 @@ def reserve(url, clinic_id, session_id, request, doctor_id, service_id, crypto, 
         call_session_id=session_id,
         max_session_active=MAX_SESSION_ACTIVE,
         attach_patient=attach,
+        after_insert=scope_declines,
     )
     # A replay returns the appointment's current status (it may since have been confirmed,
     # cancelled or sent for review): speak that, never a fixed "reserved".
