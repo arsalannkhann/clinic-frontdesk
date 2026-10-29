@@ -2798,6 +2798,10 @@
                 "type": "boolean"
               },
               {
+                "type": "string",
+                "const": "unclear"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -2809,6 +2813,10 @@
                 "type": "boolean"
               },
               {
+                "type": "string",
+                "const": "unclear"
+              },
+              {
                 "type": "null"
               }
             ],
@@ -2818,6 +2826,10 @@
             "anyOf": [
               {
                 "type": "boolean"
+              },
+              {
+                "type": "string",
+                "const": "unclear"
               },
               {
                 "type": "null"

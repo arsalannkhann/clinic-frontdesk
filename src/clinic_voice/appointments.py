@@ -18,7 +18,6 @@ Lock order (locks.py): reschedule takes the doctor row (3) before the appointmen
 cancel takes only the appointment row (5); staff resolve then takes the outbox row (6).
 """
 
-import logging
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -27,8 +26,6 @@ from psycopg.types.json import Jsonb
 from clinic_voice.audit import audit
 from clinic_voice.domain import ACTIVE_STATUSES
 from clinic_voice.patients import decrypt_field
-
-log = logging.getLogger("clinic_voice.appointments")
 
 NOT_FOUND = "Not found"
 
@@ -139,8 +136,9 @@ def _out(row, keyring=None, with_patient=False):
 
 def list_appointments(conn, staff, keyring, starts, ends, status, limit):
     """Appointments overlapping the optional [starts, ends) range, by start. Names and the
-    last two phone digits only for owner/admin (and only with a keyring); such a listing is
-    audited as 'appointments.patient_details_viewed'."""
+    last two phone digits only for owner/admin (and only with a keyring). Every appointment
+    whose patient details were decrypted is audited as 'appointment.patient_details_viewed'
+    with its id as target."""
     clinic_id = staff["clinic_id"]
     with_patient = staff["role"] in ("owner", "admin")
     rows = conn.execute(
@@ -156,8 +154,10 @@ def list_appointments(conn, staff, keyring, starts, ends, status, limit):
         {"clinic": clinic_id, "starts": starts, "ends": ends, "status": status, "limit": limit},
     ).fetchall()
     result = [_out(row, keyring, with_patient) for row in rows]
-    if with_patient and keyring is not None and any(r["patient_id"] for r in rows):
-        audit(conn, clinic_id, staff["id"], "appointments.patient_details_viewed")
+    if with_patient and keyring is not None:
+        for row in rows:
+            if row["patient_id"] is not None:
+                audit(conn, clinic_id, staff["id"], "appointment.patient_details_viewed", row["id"])
     return result
 
 

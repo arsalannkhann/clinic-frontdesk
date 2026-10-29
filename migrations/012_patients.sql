@@ -42,6 +42,7 @@ CREATE TABLE consents (
 );
 CREATE UNIQUE INDEX consents_one_active ON consents (clinic_id, patient_id, purpose)
     WHERE revoked_at IS NULL;
+CREATE INDEX consents_patient ON consents (clinic_id, patient_id);
 
 -- Speakable booking reference: 8 Crockford base32 characters (40 random bits). The
 -- application generates it with a CSPRNG (secrets) and retries on collision; this default
@@ -67,21 +68,23 @@ ALTER TABLE appointments
     ADD CONSTRAINT appointments_rescheduled_from_check
         CHECK (rescheduled_from IS NULL OR rescheduled_from <> id);
 
+-- Unique first (NULLs do not collide), then one set-based backfill; a collision aborts the
+-- UPDATE inside its subtransaction and it is retried with fresh references.
+ALTER TABLE appointments
+    ADD CONSTRAINT appointments_booking_reference_key UNIQUE (clinic_id, booking_reference);
+
 DO $$
-DECLARE
-    item record;
-    candidate text;
 BEGIN
-    FOR item IN SELECT id, clinic_id FROM appointments ORDER BY created_at, id LOOP
-        LOOP
-            candidate := new_booking_reference();
-            EXIT WHEN NOT EXISTS (
-                SELECT 1 FROM appointments
-                WHERE clinic_id = item.clinic_id AND booking_reference = candidate
-            );
-        END LOOP;
-        UPDATE appointments SET booking_reference = candidate WHERE id = item.id;
+    FOR attempt IN 1..20 LOOP
+        BEGIN
+            UPDATE appointments SET booking_reference = new_booking_reference()
+            WHERE booking_reference IS NULL;
+            RETURN;
+        EXCEPTION WHEN unique_violation THEN
+            NULL;  -- Retry.
+        END;
     END LOOP;
+    RAISE EXCEPTION 'could not backfill unique booking references';
 END
 $$;
 
@@ -89,8 +92,7 @@ ALTER TABLE appointments
     ALTER COLUMN booking_reference SET DEFAULT new_booking_reference(),
     ALTER COLUMN booking_reference SET NOT NULL,
     ADD CONSTRAINT appointments_booking_reference_format
-        CHECK (booking_reference ~ '^[0-9A-HJKMNP-TV-Z]{8}$'),
-    ADD CONSTRAINT appointments_booking_reference_key UNIQUE (clinic_id, booking_reference);
+        CHECK (booking_reference ~ '^[0-9A-HJKMNP-TV-Z]{8}$');
 -- An appointment is rescheduled at most once (its successor may be rescheduled in turn).
 CREATE UNIQUE INDEX appointments_rescheduled_once ON appointments (clinic_id, rescheduled_from)
     WHERE rescheduled_from IS NOT NULL;
@@ -109,6 +111,8 @@ CREATE TABLE call_session_verifications (
         ON DELETE CASCADE,
     FOREIGN KEY (clinic_id, appointment_id) REFERENCES appointments(clinic_id, id)
 );
+CREATE INDEX call_session_verifications_appointment
+    ON call_session_verifications (clinic_id, appointment_id);
 
 -- Distinct failed verification attempts of a session, keyed by an HMAC (PHONE_HASH_KEY) of
 -- the normalized reference, so a provider retry of the same attempt is not counted twice.
@@ -150,3 +154,5 @@ CREATE TABLE appointment_changes (
 );
 CREATE INDEX appointment_changes_session ON appointment_changes (clinic_id, call_session_id)
     WHERE call_session_id IS NOT NULL;
+CREATE INDEX appointment_changes_new_appointment ON appointment_changes (clinic_id, new_appointment_id)
+    WHERE new_appointment_id IS NOT NULL;

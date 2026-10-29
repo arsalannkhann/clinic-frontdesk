@@ -32,6 +32,10 @@ No Bolna account, agent, number or call has been used by this repository. The ga
 
 `clinic-voice retention purge --dry-run` prints how many patients, consents, appointment links and call sessions a purge would remove, then rolls back; without `--dry-run` it deletes them in one transaction. Patients whose `retention_until` (latest appointment start + `PATIENT_RETENTION_DAYS`, default 365) has passed are deleted with their consents unless they still hold an active appointment that has not ended; their appointments stay with `patient_id` cleared. Call sessions older than `CALL_SESSION_RETENTION_DAYS` (default 90) are deleted with their verification records after `appointments.call_session_id` and `appointment_changes.call_session_id` are cleared. Output is counts only. Nothing runs it automatically; schedule it only after the owner approves a retention policy. Back up first: deletion is permanent.
 
+Reschedules release the original slot before the new booking's calendar sync completes. Watch `needs_review` appointments with a `rescheduled_from` and call those patients; the clinic must approve that spoken wording (ADR 0006) before pilot traffic.
+
+Migration 012 was revised before release (backfill and indexes). Databases that applied the earlier branch-only version of `012_patients.sql` fail the checksum check: recreate them (`docker compose down -v` for local data, or drop the `_test` database's schema). Released databases are unaffected (012 has never been on `main`).
+
 Staff can review appointments at `GET /v1/admin/appointments` and settle `needs_review` ones with `POST /v1/admin/appointments/{id}/resolve` (`requeue` after fixing the cause, or `cancel`). Callers who hit the verification handoff (3 failed booking references in one call) must be helped by staff.
 
 ## Dead-letter review

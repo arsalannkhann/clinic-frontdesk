@@ -210,6 +210,19 @@ def requeue_outbox(conn, staff, job_id):
     from clinic_voice.outbox import DEFAULT_MAX_ATTEMPTS
 
     clinic_id = staff["clinic_id"]
+    # Lock order (locks.py): appointment row (5) before outbox row (6), as in the worker and
+    # appointments.resolve. The appointment id of a job never changes, so read it unlocked,
+    # lock the appointment, then lock the job and re-check its state.
+    peek = conn.execute(
+        "SELECT appointment_id FROM outbox WHERE clinic_id=%s AND id=%s", (clinic_id, job_id)
+    ).fetchone()
+    if not peek:
+        raise HTTPException(404, NOT_FOUND)
+    if peek["appointment_id"] is not None:
+        conn.execute(
+            "SELECT id FROM appointments WHERE clinic_id=%s AND id=%s FOR UPDATE",
+            (clinic_id, peek["appointment_id"]),
+        )
     job = conn.execute(
         "SELECT o.status, o.kind, o.last_error, o.appointment_id, o.appointment_version,"
         " a.starts_at <= now() AS past FROM outbox o"

@@ -7,6 +7,7 @@ credentials. Calendar behaviour comes from FakeCalendar; nothing reaches the net
 
 import base64
 import logging
+import time as pytime
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, time, timedelta
 from threading import Barrier
@@ -225,13 +226,133 @@ def test_attach_policy(env):
     assert patient["retention_until"] == SLOT + timedelta(hours=1, days=365)
 
 
-def test_consent_grant_then_decline_revokes(env):
+def active_consents(env):
+    return rows(env["url"], "SELECT purpose FROM consents WHERE revoked_at IS NULL")
+
+
+def test_consent_grants_are_additive_for_unverified_callers(env):
     book(env, consent_reminder_call="true")
-    book(env, starts_at=SLOT + timedelta(hours=1), consent_reminder_call="true")
-    assert len(rows(env["url"], "SELECT id FROM consents WHERE revoked_at IS NULL")) == 1
-    book(env, starts_at=SLOT + timedelta(hours=2), consent_reminder_call="false")
-    [row] = rows(env["url"], "SELECT revoked_at FROM consents")
-    assert row["revoked_at"] is not None
+    book(env, starts_at=SLOT + timedelta(hours=1), consent_reminder_call="yes")
+    assert active_consents(env) == [{"purpose": "reminder_call"}]
+    # Same phone + name on a later call, not verified: a grant adds, a decline is ignored.
+    book(
+        env,
+        starts_at=SLOT + timedelta(hours=2),
+        consent_reminder_call="false",
+        consent_reminder_message="true",
+    )
+    assert sorted(r["purpose"] for r in active_consents(env)) == [
+        "reminder_call",
+        "reminder_message",
+    ]
+    assert rows(env["url"], "SELECT id FROM consents WHERE revoked_at IS NOT NULL") == []
+    assert len(rows(env["url"], "SELECT id FROM patients")) == 1
+
+
+def test_unverified_caller_cannot_change_language(env):
+    book(env, preferred_language="hi")
+    book(env, starts_at=SLOT + timedelta(hours=1), preferred_language="en")
+    [patient] = rows(env["url"], "SELECT preferred_language FROM patients")
+    assert patient["preferred_language"] == "hi"
+
+
+def test_unverified_caller_fills_missing_language(env):
+    book(env)
+    book(env, starts_at=SLOT + timedelta(hours=1), preferred_language="en")
+    [patient] = rows(env["url"], "SELECT preferred_language FROM patients")
+    assert patient["preferred_language"] == "en"
+
+
+def test_verified_session_decline_revokes_and_changes_language(env):
+    first = book(env, consent_reminder_call="true", preferred_language="hi")
+    call = execution()
+    assert verify(env, call, first["booking_reference"]).status_code == 200
+    book(
+        env,
+        execution_id=call,
+        starts_at=SLOT + timedelta(hours=1),
+        consent_reminder_call="no",
+        preferred_language="en",
+    )
+    assert active_consents(env) == []
+    [patient] = rows(env["url"], "SELECT preferred_language FROM patients")
+    assert patient["preferred_language"] == "en"
+
+
+@pytest.mark.parametrize("value", ["maybe", "TRUE please", "1"])
+def test_unclear_consent_is_refused_before_booking(env, value):
+    r = post(
+        env,
+        RESERVE,
+        body(
+            execution(),
+            doctor="Demo Doctor",
+            service="Consultation",
+            starts_at=SLOT.isoformat(),
+            consent_reminder_call=value,
+        ),
+    )
+    assert r.status_code == 422
+    assert "yes or no about reminder calls" in r.json()["detail"]
+    assert value not in r.json()["detail"]
+    assert rows(env["url"], "SELECT id FROM appointments") == []
+    assert rows(env["url"], "SELECT id FROM patients") == []
+
+
+def test_reschedule_does_not_use_a_session_place(env):
+    earlier = book(env)  # Booked on an earlier call.
+    call = execution()
+    for hour in (1, 2):
+        book(env, execution_id=call, starts_at=SLOT + timedelta(hours=hour))
+    verify(env, call, earlier["booking_reference"])
+    assert (
+        reschedule(env, call, earlier["booking_reference"], SLOT + timedelta(hours=3)).status_code
+        == 200
+    )
+    # Two own bookings plus a moved one from another call: the third own booking fits.
+    book(env, execution_id=call, starts_at=SLOT + timedelta(hours=4))
+    # Moving one of this call's bookings keeps its place, so a fourth is still refused.
+    own = rows(
+        env["url"],
+        "SELECT booking_reference FROM appointments a JOIN call_sessions s ON s.id=a.call_session_id"
+        " WHERE s.execution_id=%s AND a.rescheduled_from IS NULL ORDER BY a.starts_at LIMIT 1",
+        (call,),
+    )[0]["booking_reference"]
+    verify(env, call, own)
+    assert reschedule(env, call, own, SLOT + timedelta(hours=5)).status_code == 200
+    r = post(
+        env,
+        RESERVE,
+        body(
+            call,
+            doctor="Demo Doctor",
+            service="Consultation",
+            starts_at=(SLOT + timedelta(hours=6)).isoformat(),
+        ),
+    )
+    assert r.status_code == 409 and r.json() == {"detail": service.SESSION_LIMIT_MESSAGE}
+
+
+def test_attach_after_concurrent_purge_creates_new_patient(env):
+    first = book(env)
+    patient_id = appointment(env["url"], first["appointment_id"])["patient_id"]
+    purge = connect(env["url"])
+    try:
+        # A purge in flight: it holds the patient row and deletes it, not yet committed.
+        purge.execute("SELECT id FROM patients WHERE id=%s FOR UPDATE", (patient_id,))
+        purge.execute("UPDATE appointments SET patient_id=NULL WHERE patient_id=%s", (patient_id,))
+        purge.execute("DELETE FROM patients WHERE id=%s", (patient_id,))
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pending = pool.submit(book, env, starts_at=SLOT + timedelta(hours=1))
+            pytime.sleep(0.5)
+            assert not pending.done()  # Waiting on the matched patient's row lock.
+            purge.commit()
+            made = pending.result(timeout=10)
+    finally:
+        purge.close()
+    new_patient = appointment(env["url"], made["appointment_id"])["patient_id"]
+    assert new_patient is not None and new_patient != patient_id
+    assert [r["id"] for r in rows(env["url"], "SELECT id FROM patients")] == [new_patient]
 
 
 def test_no_patient_without_number_or_name(env):
@@ -674,13 +795,13 @@ def test_staff_list_roles_and_filters(env):
     assert listed[0]["booking_reference"] == made["booking_reference"]
     assert "phone" not in str(set(listed[0]) - {"phone_last2"})
     assert CALLER not in r.text and "0000000123" not in r.text
-    actions = [
-        a["action"]
-        for a in rows(
-            env["url"], "SELECT action FROM audit_events WHERE left(action, 6) <> 'staff.'"
-        )
-    ]
-    assert actions == ["appointments.patient_details_viewed"]
+    audits = rows(
+        env["url"],
+        "SELECT action, target_id FROM audit_events WHERE left(action, 6) <> 'staff.'",
+    )
+    # One row per appointment whose patient details were shown, targeting that appointment.
+    assert sorted(str(a["target_id"]) for a in audits) == sorted(a["id"] for a in listed)
+    assert {a["action"] for a in audits} == {"appointment.patient_details_viewed"}
     seen = client.get("/v1/admin/appointments", headers=viewer).json()
     assert [a["patient_name"] for a in seen] == [None, None]
     assert {a["phone_last2"] for a in seen} == {None}
@@ -774,6 +895,25 @@ def test_resolve_requeue_and_cancel(env):
         "appointment.resolved_requeue",
         "appointment.resolved_cancel",
     ]
+
+
+def test_concurrent_resolve_and_requeue_do_not_deadlock(env):
+    owner = staff_headers(env, "owner")
+    client = env["client"]
+    for hour in range(4):
+        made = book(env, starts_at=SLOT + timedelta(hours=hour))
+        make_needs_review(env, made["appointment_id"])
+        [job] = rows(
+            env["url"], "SELECT id FROM outbox WHERE appointment_id=%s", (made["appointment_id"],)
+        )
+        results = run_parallel(
+            lambda a=made["appointment_id"]: client.post(
+                f"/v1/admin/appointments/{a}/resolve", json={"action": "requeue"}, headers=owner
+            ),
+            lambda j=job["id"]: client.post(f"/v1/admin/outbox/{j}/requeue", headers=owner),
+        )
+        assert sorted(r.status_code for r in results) == [200, 409], [r.text for r in results]
+        assert appointment(env["url"], made["appointment_id"])["status"] == "pending_sync"
 
 
 # No patient data where it does not belong

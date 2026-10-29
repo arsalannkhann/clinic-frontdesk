@@ -274,9 +274,17 @@ def reserve(
                     "SELECT id FROM call_sessions WHERE clinic_id=%s AND id=%s FOR NO KEY UPDATE",
                     (clinic_id, call_session_id),
                 )
+                # Counts this session's own reservations: those still active, plus those
+                # moved by a reschedule (the move continues the booking). Appointments a
+                # reschedule created (rescheduled_from set) are not counted, so moving a
+                # booking from an earlier call costs no place here. Conservative: a moved
+                # booking keeps its place even if its successor was later cancelled.
                 held = conn.execute(
-                    """SELECT count(*) AS n FROM appointments WHERE clinic_id=%s
-                    AND call_session_id=%s AND status IN ('pending_sync', 'confirmed')""",
+                    """SELECT count(*) AS n FROM appointments a WHERE a.clinic_id=%s
+                    AND a.call_session_id=%s AND a.rescheduled_from IS NULL
+                    AND (a.status IN ('pending_sync', 'confirmed') OR EXISTS (
+                        SELECT 1 FROM appointment_changes c WHERE c.clinic_id=a.clinic_id
+                        AND c.appointment_id=a.id AND c.action='reschedule'))""",
                     (clinic_id, call_session_id),
                 ).fetchone()["n"]
                 if held >= max_session_active:

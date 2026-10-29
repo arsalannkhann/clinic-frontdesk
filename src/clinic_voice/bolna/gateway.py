@@ -27,7 +27,7 @@ from clinic_voice import patients, service
 from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key, phone_hash
 from clinic_voice.domain import spoken_reference
 from clinic_voice.patients import session_aad
-from clinic_voice.schemas import ReservationRequest
+from clinic_voice.schemas import CONSENT_UNCLEAR, ReservationRequest
 
 log = logging.getLogger("clinic_voice.bolna")
 
@@ -193,20 +193,33 @@ def check_slots(conn, clinic_id, query):
     return {"slots": available, "spoken": spoken_slots(available, zone, query.day)}
 
 
+CONSENT_WORDS = {
+    "booking_confirmation": "confirming this booking",
+    "reminder_call": "reminder calls",
+    "reminder_message": "reminder messages",
+}
+
+
 def patient_details(request) -> patients.PatientDetails:
-    consents = {
-        purpose: value
-        for purpose, value in (
-            ("booking_confirmation", request.consent_booking_confirmation),
-            ("reminder_call", request.consent_reminder_call),
-            ("reminder_message", request.consent_reminder_message),
-        )
-        if value is not None
+    """Patient details of a reservation, or 422 with speakable text if a consent answer was
+    neither yes nor no (checked before anything is written)."""
+    flags = {
+        "booking_confirmation": request.consent_booking_confirmation,
+        "reminder_call": request.consent_reminder_call,
+        "reminder_message": request.consent_reminder_message,
     }
+    unclear = [CONSENT_WORDS[p] for p, value in flags.items() if value == CONSENT_UNCLEAR]
+    if unclear:
+        raise HTTPException(
+            422,
+            "I did not catch a clear yes or no about "
+            + " and ".join(unclear)
+            + ". Please ask the caller to answer yes or no, then try again. Nothing was booked.",
+        )
     return patients.PatientDetails(
         name=request.patient_name or None,
         language=request.preferred_language or None,
-        consents=consents,
+        consents={p: value for p, value in flags.items() if value is not None},
     )
 
 

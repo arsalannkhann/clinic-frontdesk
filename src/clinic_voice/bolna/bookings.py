@@ -208,7 +208,7 @@ def cancel(conn, clinic_id, session_id, request):
     }
 
 
-def _rescheduled(conn, clinic_id, new_row, previous_reference, zone):
+def _rescheduled(new_row, previous_reference, zone):
     return {
         "changed": True,
         "booking_reference": new_row["booking_reference"],
@@ -302,7 +302,7 @@ def reschedule(url, clinic_id, session_id, request, retention_days: int):
                 (clinic_id,call_session_id,appointment_id) VALUES (%s,%s,%s)""",
                 (clinic_id, session_id, new_row["id"]),
             )
-            result = _rescheduled(conn, clinic_id, new_row, locked["booking_reference"], zone)
+            result = _rescheduled(new_row, locked["booking_reference"], zone)
         return result
     except (ExclusionViolation, UniqueViolation):
         # A concurrent change or retry won a constraint; report its committed outcome.
@@ -321,4 +321,4 @@ def _replayed(conn, clinic_id, key, request_hash, row, zone):
         return None
     if new_row["request_hash"] != request_hash:
         raise HTTPException(409, "Idempotency key reused with different request")
-    return _rescheduled(conn, clinic_id, new_row, row["booking_reference"], zone)
+    return _rescheduled(new_row, row["booking_reference"], zone)

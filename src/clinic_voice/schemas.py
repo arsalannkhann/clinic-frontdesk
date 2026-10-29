@@ -377,13 +377,19 @@ class BolnaSlotQuery(BolnaCallContext):
     day: date
 
 
+CONSENT_UNCLEAR = "unclear"
+CONSENT_VALUES = {"true": True, "yes": True, "false": False, "no": False, "": None}
+
+
 def _consent_flag(value):
-    """Tri-state consent from a rendered template value: "true" grants, "false" declines
-    (revokes an active grant), anything else ("" included) means the caller was not asked."""
+    """Tri-state consent from a rendered template value: "true"/"yes" grants, "false"/"no"
+    declines, empty means the caller was not asked. Anything else becomes CONSENT_UNCLEAR,
+    which the gateway refuses with a speakable "please answer yes or no" before booking
+    (never silently dropped, never guessed)."""
     if isinstance(value, bool) or value is None:
         return value
     if isinstance(value, str):
-        return {"true": True, "false": False}.get(value.strip().casefold())
+        return CONSENT_VALUES.get(value.strip().casefold(), CONSENT_UNCLEAR)
     raise ValueError("consent must be true, false or empty")
 
 
@@ -406,7 +412,7 @@ def _language(value):
     raise ValueError("language must be a string")
 
 
-ConsentFlag = Annotated[bool | None, BeforeValidator(_consent_flag)]
+ConsentFlag = Annotated[bool | Literal["unclear"] | None, BeforeValidator(_consent_flag)]
 ReadBack = Annotated[bool, BeforeValidator(_read_back)]
 PatientName = Annotated[
     str,

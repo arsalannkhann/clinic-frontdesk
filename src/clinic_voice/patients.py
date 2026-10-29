@@ -11,6 +11,13 @@ that name (case and whitespace folded). Otherwise, including every reservation w
 name, it creates a new patient row. Shared family phones therefore never merge people by
 number alone, and a duplicate row is the worst case of an ambiguous match.
 
+Authority over an existing patient (ADR 0006): matching phone + name is not verification,
+so an attach may only add. Consent grants are applied; a decline revokes an active grant only
+when the patient row was created in this transaction or the call session has verified an
+appointment of that patient. Otherwise the decline is recorded nowhere (it is neither applied
+nor turned into a grant). The preferred language likewise only fills a NULL unless the patient
+is new or verified in this session.
+
 Nothing here logs or returns names or numbers.
 """
 
@@ -40,7 +47,7 @@ def field_aad(clinic_id: UUID, patient_id: UUID, name: str) -> bytes:
 
 
 def session_aad(clinic_id: UUID, session_id: UUID) -> bytes:
-    # Must match bolna.gateway.session_aad (kept here to avoid an import cycle).
+    # Associated data of call_sessions.caller_number_ciphertext; bolna.gateway imports it.
     return b"call_session:" + clinic_id.bytes + session_id.bytes
 
 
@@ -140,7 +147,37 @@ def extend_retention(conn, clinic_id, patient_id, retention_until: datetime) -> 
     )
 
 
-def record_consents(conn, clinic_id, patient_id, consents: dict[str, bool], source) -> None:
+def _lock_existing(conn, clinic_id, patient_id) -> bool:
+    """Lock a matched patient row; False if it is gone (e.g. deleted by a concurrent
+    retention purge, which locks the same row before deleting it)."""
+    return (
+        conn.execute(
+            "SELECT id FROM patients WHERE clinic_id=%s AND id=%s FOR UPDATE",
+            (clinic_id, patient_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def verified_in_session(conn, clinic_id, session_id, patient_id) -> bool:
+    """True if this call session verified (reference + caller number) an appointment of
+    this patient."""
+    return (
+        conn.execute(
+            """SELECT 1 FROM call_session_verifications v
+            JOIN appointments a ON a.clinic_id=v.clinic_id AND a.id=v.appointment_id
+            WHERE v.clinic_id=%s AND v.call_session_id=%s AND a.patient_id=%s LIMIT 1""",
+            (clinic_id, session_id, patient_id),
+        ).fetchone()
+        is not None
+    )
+
+
+def record_consents(
+    conn, clinic_id, patient_id, consents: dict[str, bool], source, allow_revoke: bool
+) -> None:
+    """Grants are always recorded. A decline revokes an active grant only with
+    allow_revoke; without it the decline is ignored (nothing is stored)."""
     for purpose, granted in consents.items():
         if purpose not in PURPOSES:
             raise ValueError("unknown consent purpose")
@@ -152,7 +189,7 @@ def record_consents(conn, clinic_id, patient_id, consents: dict[str, bool], sour
                 DO NOTHING""",
                 (uuid4(), clinic_id, patient_id, purpose, source),
             )
-        else:
+        elif allow_revoke:
             conn.execute(
                 "UPDATE consents SET revoked_at=now() WHERE clinic_id=%s AND patient_id=%s"
                 " AND purpose=%s AND revoked_at IS NULL",
@@ -182,16 +219,23 @@ def attach(
             (f"patient:{clinic_id}:{phone[1].hex()}",),
         )
         matches = _matching(conn, keyring, clinic_id, phone[1], details.name)
-        if len(matches) == 1:
+        if len(matches) == 1 and _lock_existing(conn, clinic_id, matches[0]):
             patient_id = matches[0]
     if patient_id is None:
         patient_id = _create(conn, keyring, clinic_id, details, phone, retention_until)
+        authorized = True  # Created in this transaction.
     else:
         extend_retention(conn, clinic_id, patient_id, retention_until)
+        authorized = verified_in_session(conn, clinic_id, session_id, patient_id)
         if details.language:
+            # Unverified callers may only fill a missing language, never change one.
             conn.execute(
-                "UPDATE patients SET preferred_language=%s WHERE clinic_id=%s AND id=%s",
-                (details.language, clinic_id, patient_id),
+                "UPDATE patients SET preferred_language ="
+                " CASE WHEN %s THEN %s ELSE COALESCE(preferred_language, %s) END"
+                " WHERE clinic_id=%s AND id=%s",
+                (authorized, details.language, details.language, clinic_id, patient_id),
             )
-    record_consents(conn, clinic_id, patient_id, details.consents, "voice_call")
+    record_consents(
+        conn, clinic_id, patient_id, details.consents, "voice_call", allow_revoke=authorized
+    )
     return patient_id
