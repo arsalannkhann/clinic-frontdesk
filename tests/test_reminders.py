@@ -299,6 +299,43 @@ def test_outbound_disabled_no_contact(env):
     assert contacts(env, made["appointment_id"]) == []
 
 
+def test_booking_reference_in_messages_is_an_owner_choice(env):
+    """M4: include_reference_in_messages is owner-only (403 for admin), audited, off by
+    default; when on, confirmation and reminder messages carry the reference."""
+    owner, admin = staff_headers(env), staff_headers(env, role="admin")
+    clinic = env["client"].get("/v1/admin/clinic", headers=owner).json()
+    assert clinic["include_reference_in_messages"] is False
+    patch = {"include_reference_in_messages": True}
+    assert env["client"].patch("/v1/admin/clinic", json=patch, headers=admin).status_code == 403
+    r = env["client"].patch("/v1/admin/clinic", json=patch, headers=owner)
+    assert r.status_code == 200 and r.json()["include_reference_in_messages"] is True
+    actions = [row["action"] for row in rows(env["url"], "SELECT action FROM audit_events")]
+    assert "clinic.reference_in_messages_enabled" in actions
+    made = book(env)
+    confirm(env)
+    at(env, NOW.replace(hour=9, minute=0))
+    work(env)
+    [(_, text, _)] = env["ports"].messaging.sent
+    assert f"Booking reference {made['booking_reference']}." in text
+    r = env["client"].patch(
+        "/v1/admin/clinic", json={"include_reference_in_messages": False}, headers=owner
+    )
+    assert r.json()["include_reference_in_messages"] is False
+    actions = [row["action"] for row in rows(env["url"], "SELECT action FROM audit_events")]
+    assert "clinic.reference_in_messages_disabled" in actions
+
+
+def test_message_body_leaves_the_reference_out_unless_given():
+    zone = ZoneInfo("Asia/Kolkata")
+    starts = datetime(2030, 3, 6, 10, 0, tzinfo=zone)
+    for purpose in ("booking_confirmation", "reminder"):
+        plain = reminders.message_body(purpose, "Synthetic Clinic", starts, zone, None)
+        assert "reference" not in plain.lower()
+        assert plain.endswith(".")
+        given = reminders.message_body(purpose, "Synthetic Clinic", starts, zone, "ABC123")
+        assert given == plain + " Booking reference ABC123."
+
+
 def test_confirmation_and_reminders_are_sent_once(env, caplog):
     caplog.set_level(logging.DEBUG)
     made = book(env)
@@ -328,7 +365,9 @@ def test_confirmation_and_reminders_are_sent_once(env, caplog):
     work(env)
     [(to, text, reference)] = env["ports"].messaging.sent
     assert to == CALLER and reference == confirmation["provider_reference"]
-    assert "Synthetic Demo Clinic" in text and made["booking_reference"] in text
+    assert "Synthetic Demo Clinic" in text
+    # M4: no booking reference by default (it verifies callers on inbound calls).
+    assert made["booking_reference"] not in text and "reference" not in text.lower()
     assert "is confirmed" in text and "Wednesday 5 March at 10:00 AM" in text
     assert NAME not in text and "Consultation" not in text and "Demo Doctor" not in text
     sent = contact(env, appointment_id, "booking_confirmation", "message")
@@ -1015,6 +1054,7 @@ def test_worker_without_a_port_leaves_its_kinds(env):
     assert set(excluded_kinds(calendar_only)) == {
         "bolna.reconcile",
         "reminder.call",
+        "reminder.stop",
         "provision.step",
         "notification.send",
     }
@@ -1022,6 +1062,17 @@ def test_worker_without_a_port_leaves_its_kinds(env):
     work(env, ports=calendar_only)
     assert {c["status"] for c in contacts(env, made["appointment_id"])} == {"scheduled"}
     assert {j["status"] for j in jobs(env, "reminder.call")} == {"pending"}
+    # M1: a reminder.stop is left to a worker with a Bolna port (no attempt spent, no dead
+    # letter that would send placed calls to review).
+    execute(
+        env["url"],
+        "INSERT INTO outbox (id,clinic_id,appointment_id,appointment_version,kind,payload)"
+        " SELECT %s,clinic_id,id,version,'reminder.stop','{}' FROM appointments WHERE id=%s",
+        (uuid4(), made["appointment_id"]),
+    )
+    work(env, ports=calendar_only)
+    [stop_job] = jobs(env, "reminder.stop")
+    assert (stop_job["status"], stop_job["attempts"]) == ("pending", 0)
 
     class Slow:
         def send_message(self, to, body, reference):
@@ -1290,6 +1341,38 @@ def test_dead_stop_job_sends_unstopped_calls_to_review(env):
     row = contact(env, made["appointment_id"], "reminder", "call")
     assert (row["status"], row["last_error"]) == ("needs_review", "stop_failed")
     assert row["sent_at"] is not None and row["stop_outcome"] is None
+
+
+def test_dead_contact_jobs_cannot_be_requeued(env):
+    """M2: a dead notification.send, reminder.call or reminder.stop may already have contacted
+    the patient; admin requeue refuses it (409) like provision.step and changes nothing."""
+    made, placed = place_call(env, consents=ALL_CONSENTS)
+    headers = staff_headers(env)
+    env["client"].post(f"/v1/admin/appointments/{made['appointment_id']}/cancel", headers=headers)
+    execute(
+        env["url"],
+        "UPDATE outbox SET status='dead', last_error='timeout'"
+        " WHERE kind IN ('notification.send','reminder.call','reminder.stop')",
+    )
+    dead = rows(
+        env["url"],
+        "SELECT id, kind, max_attempts FROM outbox"
+        " WHERE kind IN ('notification.send','reminder.call','reminder.stop')",
+    )
+    assert {job["kind"] for job in dead} == {"notification.send", "reminder.call", "reminder.stop"}
+    for job in dead:
+        r = env["client"].post(f"/v1/admin/outbox/{job['id']}/requeue", headers=headers)
+        assert r.status_code == 409, job["kind"]
+        assert r.json() == {"detail": "Patient contact jobs are not requeued; review the contact"}
+    after = rows(
+        env["url"],
+        "SELECT id, kind, status, max_attempts FROM outbox"
+        " WHERE kind IN ('notification.send','reminder.call','reminder.stop')",
+    )
+    assert {job["status"] for job in after} == {"dead"}
+    assert sorted(j["max_attempts"] for j in after) == sorted(j["max_attempts"] for j in dead)
+    actions = [row["action"] for row in rows(env["url"], "SELECT action FROM audit_events")]
+    assert "outbox.requeued" not in actions
 
 
 def test_opt_out_stops_a_placed_call_and_keeps_other_contacts(env):

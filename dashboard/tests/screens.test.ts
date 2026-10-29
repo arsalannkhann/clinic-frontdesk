@@ -27,6 +27,7 @@ const CLINIC: Clinic = {
   handoff_text: "Connecting you.",
   scripts_approved: true,
   test_calls_enabled: false,
+  include_reference_in_messages: false,
 };
 
 interface Seen {

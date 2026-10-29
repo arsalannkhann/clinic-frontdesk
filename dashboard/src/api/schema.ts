@@ -711,7 +711,11 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Get Appointment Status */
+        /**
+         * Get Appointment Status
+         * @description Only appointments this same credential reserved through /v1/tools/reserve-slot (ADR
+         *     0005): never Bolna-gateway, staff or other-credential bookings, whatever the UUID.
+         */
         post: operations["get_appointment_status_v1_tools_appointment_status_post"];
         delete?: never;
         options?: never;
@@ -1282,6 +1286,8 @@ export interface components {
             scripts_approved: boolean;
             /** Test Calls Enabled */
             test_calls_enabled: boolean;
+            /** Include Reference In Messages */
+            include_reference_in_messages: boolean;
         };
         /** ClinicUpdate */
         ClinicUpdate: {
@@ -1311,6 +1317,8 @@ export interface components {
             scripts_approved?: boolean | null;
             /** Test Calls Enabled */
             test_calls_enabled?: boolean | null;
+            /** Include Reference In Messages */
+            include_reference_in_messages?: boolean | null;
         };
         /** DoctorCreate */
         DoctorCreate: {

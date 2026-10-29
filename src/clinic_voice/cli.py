@@ -111,9 +111,11 @@ def staff_command(url, args):
 FAKE_DATABASE_SUFFIXES = ("_test", "_dev")
 
 
-def fake_calendar_allowed(url, settings):
-    """The fake calendar confirms appointments without any real calendar, so it may only run
-    against a development or test database, or with APP_ENV=development set explicitly."""
+def fakes_allowed(url, settings):
+    """Whether the worker may use fake ports (--calendar, --bolna or --messaging fake). The
+    fakes confirm appointments, reconcile calls and mark messages sent without any real
+    provider, so they may only run against a development or test database (name ending _test
+    or _dev), or with APP_ENV=development set explicitly."""
     from psycopg.conninfo import conninfo_to_dict
 
     name = conninfo_to_dict(url).get("dbname") or ""
@@ -125,7 +127,7 @@ def build_ports(calendar, url, settings):
         from clinic_voice.outbox import Ports
         from clinic_voice.providers.calendar import FakeCalendar
 
-        if not fake_calendar_allowed(url, settings):
+        if not fakes_allowed(url, settings):
             raise SystemExit(
                 "Refusing --calendar fake: it would confirm appointments without a real calendar."
                 " Use a database whose name ends in _test or _dev, or set APP_ENV=development."
@@ -166,7 +168,7 @@ def build_bolna(choice, url, settings):
     if choice == "fake":
         from clinic_voice.providers.bolna import FakeBolna
 
-        if not fake_calendar_allowed(url, settings):
+        if not fakes_allowed(url, settings):
             raise SystemExit(
                 "Refusing --bolna fake: it would reconcile call sessions against a fake"
                 " provider. Use a database whose name ends in _test or _dev, or set"
@@ -196,7 +198,7 @@ def build_messaging(choice, url, settings):
         return None
     from clinic_voice.providers.messaging import FakeMessaging
 
-    if not fake_calendar_allowed(url, settings):
+    if not fakes_allowed(url, settings):
         raise SystemExit(
             "Refusing --messaging fake: it would mark confirmations and reminders as sent"
             " without sending anything. Use a database whose name ends in _test or _dev, or set"
@@ -330,9 +332,11 @@ def main(argv=None):
     issue.add_argument("--label", required=True)
     issue.add_argument(
         "--scope",
-        choices=["tools", "webhook"],
+        choices=["tools", "bolna", "webhook"],
         default="tools",
-        help="tools: Bolna tool/API bearer token; webhook: Bolna webhook URL credential",
+        help="tools: generic /v1/tools/* bearer token (also accepted by /v1/bolna/*);"
+        " bolna: Bolna gateway /v1/bolna/* bearer token only (use for a hand-configured agent);"
+        " webhook: Bolna webhook URL credential",
     )
     rotate = actions.add_parser("rotate")
     rotate.add_argument("credential", type=UUID)

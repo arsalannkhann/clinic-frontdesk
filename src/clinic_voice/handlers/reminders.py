@@ -364,7 +364,7 @@ def _send(conn, job, port, channel, ctx, reminder, attempts, phone, zone) -> boo
                 ctx["clinic_name"],
                 ctx["starts_at"],
                 zone,
-                ctx["booking_reference"],
+                ctx["booking_reference"] if ctx["include_reference_in_messages"] else None,
             )
             provider_id = port.send_message(phone, body, reference)
         else:

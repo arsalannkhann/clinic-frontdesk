@@ -12,8 +12,9 @@ from psycopg import Error as DatabaseError
 
 from clinic_voice import staff as staff_service
 from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
+from clinic_voice.bolna.gateway import require_line
 from clinic_voice.config import get_settings
-from clinic_voice.deps import database, require_role, staff_session, tenant
+from clinic_voice.deps import database, require_role, staff_session, tool_caller
 from clinic_voice.errors import NotFound
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.routes_appointments import router as appointments_router
@@ -40,10 +41,10 @@ from clinic_voice.schemas import (
 from clinic_voice.service import appointment_status, reserve, slots
 
 # Credentials that can appear in a request path: any token of the credential shape (tool
-# cvt_, webhook cvw_, staff session cvs_) anywhere in it, and any segment after
+# cvt_, Bolna gateway cvb_, webhook cvw_, staff session cvs_) anywhere in it, and any segment after
 # /webhooks/<provider>/. Neither pattern is anchored, so root_path prefixes, repeated
 # slashes and unknown (404) paths are redacted too.
-TOKEN_SHAPE = re.compile(r"cv[tws]_[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{43}")
+TOKEN_SHAPE = re.compile(r"cv[tbws]_[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{43}")
 WEBHOOK_SEGMENT = re.compile(r"(/webhooks/+[^/?#]+/+)[^/?#]+")
 REDACTED_SEGMENT = "<redacted>"
 
@@ -210,7 +211,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "015_provisioning.sql"
+REQUIRED_MIGRATION = "016_tool_scopes.sql"
 
 
 @app.get("/health/live")
@@ -230,10 +231,17 @@ def ready():
     return {"status": "ready", "integrations": "not_configured"}
 
 
+# Generic tool API. Authenticated by a tools-scope credential only (a bolna-scope credential,
+# which provisioning hands to the clinic's agent, gets 401). Line-gated like the Bolna gateway
+# (T12): reads need provisioning verified or active; reserve needs active, or verified with
+# test_calls_enabled, re-checked inside its write transaction.
+
+
 @app.post("/v1/tools/check-slots", response_model=SlotResponse)
-def check_slots(query: SlotQuery, clinic_id=Depends(tenant)):
+def check_slots(query: SlotQuery, caller=Depends(tool_caller)):
     with database() as conn:
-        available = slots(conn, clinic_id, query.doctor_id, query.service_id, query.day)
+        require_line(conn, caller.clinic_id, changes=False)
+        available = slots(conn, caller.clinic_id, query.doctor_id, query.service_id, query.day)
     return {"slots": available[:3], "source": SLOT_SOURCE}
 
 
@@ -243,20 +251,33 @@ def reserve_slot(
     idempotency_key: Annotated[
         str, Header(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._:-]+$")
     ],
-    clinic_id=Depends(tenant),
+    caller=Depends(tool_caller),
 ):
     if idempotency_key.startswith(BOLNA_KEY_PREFIX):
         # Reserved for keys the Bolna gateway derives, which bind appointments to a call session.
         raise HTTPException(422, "Idempotency key prefix is reserved")
+    clinic_id = caller.clinic_id
+    with database() as conn:
+        require_line(conn, clinic_id, changes=True)  # Early refusal; re-checked under lock.
     return reserve(
-        get_settings().database_url.get_secret_value(), clinic_id, request, idempotency_key
+        get_settings().database_url.get_secret_value(),
+        clinic_id,
+        request,
+        idempotency_key,
+        gate=lambda conn: require_line(conn, clinic_id, True, lock=True),
+        tool_credential_id=caller.credential_id,
     )
 
 
 @app.post("/v1/tools/appointment-status", response_model=AppointmentStatusResponse)
-def get_appointment_status(request: AppointmentStatusRequest, clinic_id=Depends(tenant)):
+def get_appointment_status(request: AppointmentStatusRequest, caller=Depends(tool_caller)):
+    """Only appointments this same credential reserved through /v1/tools/reserve-slot (ADR
+    0005): never Bolna-gateway, staff or other-credential bookings, whatever the UUID."""
     with database() as conn:
-        return appointment_status(conn, clinic_id, request.appointment_id)
+        require_line(conn, caller.clinic_id, changes=False)
+        return appointment_status(
+            conn, caller.clinic_id, request.appointment_id, caller.credential_id
+        )
 
 
 @app.post("/v1/staff/login", response_model=SessionResponse)

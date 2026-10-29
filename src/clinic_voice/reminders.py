@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 
 from psycopg.types.json import Jsonb
 
-from clinic_voice import service
+from clinic_voice import locks, service
 
 log = logging.getLogger("clinic_voice.reminders")
 
@@ -133,14 +133,17 @@ def spoken_when(moment: datetime, zone: ZoneInfo) -> str:
     )
 
 
-def message_body(purpose: str, clinic_name: str, starts_at, zone, reference: str) -> str:
-    """The only message templates. Clinic name, appointment date/time and booking reference;
-    never the patient's name, the doctor, the service or any other detail. Composed at send
-    time and never stored."""
+def message_body(purpose: str, clinic_name: str, starts_at, zone, reference: str | None) -> str:
+    """The only message templates. Clinic name and appointment date/time; the booking
+    reference only when the caller passes one (the clinic's owner-only
+    include_reference_in_messages, off by default: the reference is a verification factor on
+    inbound calls, ADR 0008). Never the patient's name, the doctor, the service or any other
+    detail. Composed at send time and never stored."""
     when = spoken_when(starts_at, zone)
+    suffix = f" Booking reference {reference}." if reference else ""
     if purpose == "booking_confirmation":
-        return f"{clinic_name}: your appointment on {when} is confirmed. Booking reference {reference}."
-    return f"{clinic_name}: reminder of your appointment on {when}. Booking reference {reference}."
+        return f"{clinic_name}: your appointment on {when} is confirmed.{suffix}"
+    return f"{clinic_name}: reminder of your appointment on {when}.{suffix}"
 
 
 def call_context(purpose: str, clinic_name: str, starts_at, zone, contact_reference):
@@ -162,7 +165,7 @@ def call_context(purpose: str, clinic_name: str, starts_at, zone, contact_refere
 CONTEXT_SQL = """SELECT a.id, a.clinic_id, a.status, a.version, a.starts_at, a.patient_id,
     a.booking_reference, c.name AS clinic_name, c.timezone, c.outbound_enabled,
     c.quiet_hours_start, c.quiet_hours_end, c.reminder_lead_minutes, c.daily_contact_budget,
-    c.bolna_outbound_agent_id
+    c.bolna_outbound_agent_id, c.include_reference_in_messages
     FROM appointments a JOIN clinics c ON c.id = a.clinic_id
     WHERE a.clinic_id=%s AND a.id=%s"""
 LOCKS = {None: "", "share": " FOR SHARE OF a", "settings": " FOR SHARE OF a, c"}
@@ -205,10 +208,7 @@ def refusal(conn, clinic_id, patient_id, appointment_id, purpose, channel) -> st
 
 
 def lock_budget_day(conn, clinic_id, day: date) -> None:
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-        (f"contact-budget:{clinic_id}:{day.isoformat()}",),
-    )
+    locks.lock_contact_budget(conn, clinic_id, day)
 
 
 def budget_used(conn, clinic_id, day: date, statuses, exclude=None) -> int:
@@ -313,10 +313,7 @@ def lock_planning(conn, clinic_id, appointment_id) -> None:
     """Serialize contact planning of one appointment (after its row lock, before any budget
     day): backfills hold the appointment row only FOR SHARE, so without this two planners
     with different lead times (an edit in between) could both plan a reminder."""
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-        (f"contact-plan:{clinic_id}:{appointment_id}",),
-    )
+    locks.lock_contact_plan(conn, clinic_id, appointment_id)
 
 
 def plan_reminders(conn, ctx, now) -> int:

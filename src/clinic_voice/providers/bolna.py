@@ -282,7 +282,9 @@ def _credential_id(api_token) -> str | None:
     if MASKED_TOKEN.fullmatch(api_token):
         return None
     scheme, _, token = api_token.partition(" ")
-    parsed = credentials.parse(token if scheme == "Bearer" else api_token)
+    parsed = credentials.parse_any(
+        token if scheme == "Bearer" else api_token, credentials.GATEWAY_SCOPES
+    )
     return UNREADABLE if parsed is None else parsed[0].hex
 
 

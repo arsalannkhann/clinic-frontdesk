@@ -6,6 +6,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import activate_lines
 from fastapi import HTTPException
 from psycopg.errors import ForeignKeyViolation
 
@@ -174,6 +175,7 @@ def test_http_reservation_flow(database, request_body, monkeypatch):
 
     with connect(database) as conn:
         _, token = credentials.issue(conn, CLINIC, "http-test")
+        activate_lines(conn, CLINIC)
     monkeypatch.setenv("DATABASE_URL", database)
     get_settings.cache_clear()
     try:

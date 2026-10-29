@@ -11,6 +11,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import activate_lines
 from fastapi.testclient import TestClient
 from psycopg.types.json import Jsonb
 
@@ -942,10 +943,20 @@ def test_require_idle_guard(database):
 # Appointment status tool
 
 
-def tool_headers(database, clinic=CLINIC):
+def tool_credential(database, clinic=CLINIC):
+    """A tools credential on an open line: (headers, credential id)."""
     with connect(database) as conn:
-        _, token = credentials.issue(conn, clinic, "synthetic")
-    return {"Authorization": "Bearer " + token}
+        credential_id, token = credentials.issue(conn, clinic, "synthetic")
+        activate_lines(conn, clinic)
+    return {"Authorization": "Bearer " + token}, credential_id
+
+
+def tool_book(database, credential_id, hour=10):
+    """Reserve as /v1/tools/reserve-slot does: recorded under the tool credential."""
+    request = ReservationRequest(doctor_id=DOCTOR_ID, service_id=SERVICE_ID, starts_at=at(hour))
+    return service.reserve(
+        database, CLINIC, request, f"key-{uuid4().hex}", tool_credential_id=credential_id
+    )["appointment_id"]
 
 
 def test_only_persisted_confirmed_is_spoken_as_confirmed():
@@ -960,8 +971,8 @@ def test_only_persisted_confirmed_is_spoken_as_confirmed():
 
 
 def test_status_tool_follows_worker_outcome(client, mapped):
-    h = tool_headers(mapped)
-    appointment_id = book(mapped)
+    h, credential_id = tool_credential(mapped)
+    appointment_id = tool_book(mapped, credential_id)
 
     def status():
         r = client.post(
@@ -985,21 +996,44 @@ def test_status_tool_follows_worker_outcome(client, mapped):
 
 
 def test_status_tool_needs_review_and_tenant_scope(client, mapped):
-    appointment_id = book(mapped)
+    h, credential_id = tool_credential(mapped)
+    appointment_id = tool_book(mapped, credential_id)
     with connect(mapped) as conn:
         conn.execute("UPDATE appointments SET status='needs_review' WHERE id=%s", (appointment_id,))
     body = {"appointment_id": str(appointment_id)}
-    r = client.post("/v1/tools/appointment-status", headers=tool_headers(mapped), json=body)
+    r = client.post("/v1/tools/appointment-status", headers=h, json=body)
     assert "not yet confirmed" in r.json()["spoken_status"]
-    other = tool_headers(mapped, foreign_clinic(mapped))
+    other, _ = tool_credential(mapped, foreign_clinic(mapped))
     assert client.post("/v1/tools/appointment-status", headers=other, json=body).status_code == 404
     missing = {"appointment_id": str(uuid4())}
-    r = client.post("/v1/tools/appointment-status", headers=tool_headers(mapped), json=missing)
+    r = client.post("/v1/tools/appointment-status", headers=h, json=missing)
     assert r.status_code == 404
     assert client.post("/v1/tools/appointment-status", json=body).status_code == 401
     extra = {**body, "clinic_id": str(CLINIC)}
-    r = client.post("/v1/tools/appointment-status", headers=tool_headers(mapped), json=extra)
+    r = client.post("/v1/tools/appointment-status", headers=h, json=extra)
     assert r.status_code == 422
+
+
+def test_status_tool_reads_only_its_own_credentials_reservations(client, mapped):
+    """T12: a tools credential cannot read an appointment of its own clinic by UUID unless it
+    reserved it: not another credential's, not a Bolna-gateway or staff booking (no
+    tool_credential_id), and not after rotation (fails closed)."""
+    h, credential_id = tool_credential(mapped)
+    own = tool_book(mapped, credential_id, hour=10)
+    sibling, _ = tool_credential(mapped)
+    untracked = book(mapped, hour=11)  # Like a Bolna-gateway or staff booking.
+    status = "/v1/tools/appointment-status"
+    assert client.post(status, headers=h, json={"appointment_id": str(own)}).status_code == 200
+    for headers, target in ((sibling, own), (h, untracked)):
+        r = client.post(status, headers=headers, json={"appointment_id": str(target)})
+        assert r.status_code == 404
+        assert r.json() == {"detail": "Appointment not found"}
+    with connect(mapped) as conn:
+        _, rotated = credentials.rotate(conn, credential_id, timedelta(0))
+    r = client.post(
+        status, headers={"Authorization": "Bearer " + rotated}, json={"appointment_id": str(own)}
+    )
+    assert r.status_code == 404
 
 
 # CLI
@@ -1045,7 +1079,7 @@ def test_cli_fake_calendar_refused_outside_dev_databases(monkeypatch):
         get_settings.cache_clear()
 
 
-def test_cli_fake_calendar_allowed_with_app_env_development(monkeypatch):
+def test_cli_fakes_allowed_with_app_env_development(monkeypatch):
     from psycopg import OperationalError
 
     monkeypatch.setenv("DATABASE_URL", PRODUCTION_LIKE_URL)

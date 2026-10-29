@@ -203,8 +203,21 @@ def test_full_provisioning_advances_one_step_per_job(env):
     # The agent carries a fresh tool credential of this clinic; only its id is recorded.
     token = agent_token(env["fake"], agent_id)
     with connect(env["url"]) as conn:
-        assert credentials.authenticate(conn, token) == CLINIC
-    assert credentials.parse(token)[0] == UUID(created["tool_credential_id"])
+        assert credentials.authenticate(conn, token, "bolna") == CLINIC
+    assert credentials.parse(token, "bolna")[0] == UUID(created["tool_credential_id"])
+    # T12: the agent's (bolna-scope) credential never reaches the generic tool API.
+    for path in (
+        "/v1/tools/check-slots",
+        "/v1/tools/reserve-slot",
+        "/v1/tools/appointment-status",
+    ):
+        r = env["client"].post(
+            path,
+            headers={"Authorization": "Bearer " + token, "Idempotency-Key": "t12-agent-0001"},
+            json={},
+        )
+        assert r.status_code == 401, path
+        assert r.json() == {"detail": "Invalid credentials"}
     assert env["fake"].agents[agent_id]["agent_config"]["agent_name"] == created["agent_name"]
 
     assert select(env, owner).status_code == 200
@@ -272,7 +285,7 @@ def test_timeout_after_create_reconciles_to_exactly_one_agent(env):
     )[0]["revoked_at"]
     assert revoked is not None
     with connect(env["url"]) as conn:
-        assert credentials.authenticate(conn, agent_token(env["fake"], agent_id)) == CLINIC
+        assert credentials.authenticate(conn, agent_token(env["fake"], agent_id), "bolna") == CLINIC
     assert (
         rows(env["url"], "SELECT agent_create_pending FROM provisioning")[0]["agent_create_pending"]
         is False
@@ -438,6 +451,59 @@ def test_created_agent_claimed_elsewhere_is_reviewed_and_its_credential_revoked(
     ]
 
 
+def test_agent_id_recorded_concurrently_elsewhere_is_an_agent_conflict(env, monkeypatch):
+    """The agent_taken check passed, then another clinic's provisioning recorded the same agent
+    id before this step's write: the unique index refuses it inside a savepoint and the step
+    reports agent_conflict (not a crashed job), revoking the attempt's credential."""
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    fake = env["fake"]
+    original = fake.create_agent
+
+    def create_then_recorded_elsewhere(payload):
+        agent_id = original(payload)
+        execute(
+            env["url"],
+            "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
+            " VALUES (%s,'active','verified',%s)",
+            (OTHER_CLINIC, agent_id),
+        )
+        return agent_id
+
+    fake.create_agent = create_then_recorded_elsewhere
+    monkeypatch.setattr(service, "agent_taken", lambda conn, clinic, agent: False)
+    review = step(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "agent_conflict")
+    assert review["agent_id"] is None and review["tool_credential_id"] is None
+    assert provisioning_row(env)["attempt_credential_id"] is None
+    assert all(c["revoked_at"] is not None for c in provisioning_credentials(env))
+    assert rows(env["url"], "SELECT bolna_agent_id FROM clinics WHERE id=%s", (CLINIC,)) == [
+        {"bolna_agent_id": None}
+    ]
+    [job] = jobs(env)[-1:]
+    assert job["status"] == "done"
+
+
+def test_plain_reset_keeps_a_possibly_held_attempt_credential(env):
+    """A plain reset neither clears nor revokes attempt_credential_id (an agent update whose
+    outcome is unknown may hold it); only the confirmed reset revokes and clears it."""
+    owner = headers(env)
+    with connect(env["url"]) as conn:
+        held, _ = credentials.issue(conn, CLINIC, service.CREDENTIAL_LABEL, scope="bolna")
+        conn.execute(
+            "INSERT INTO provisioning (clinic_id,state,resume_state,attempt_credential_id,"
+            "last_error) VALUES (%s,'manual_review','calendar_connected',%s,'retries_exhausted')",
+            (CLINIC, held),
+        )
+    r = env["client"].post(f"{BASE}/reset", headers=h(owner))
+    assert r.status_code == 200 and r.json()["state"] == "calendar_connected"
+    assert provisioning_row(env)["attempt_credential_id"] == held
+    assert rows(env["url"], "SELECT revoked_at FROM tenant_credentials WHERE id=%s", (held,)) == [
+        {"revoked_at": None}
+    ]
+
+
 def test_concurrent_set_agent_is_not_overwritten(env):
     owner = headers(env)
     connect_calendar(env)
@@ -560,7 +626,7 @@ def test_possibly_held_credential_survives_review_until_reconciled(env):
     assert held["revoked_at"] is None  # The created agent may hold it.
     [agent_id] = env["fake"].agents
     with connect(env["url"]) as conn:
-        assert credentials.authenticate(conn, agent_token(env["fake"], agent_id)) == CLINIC
+        assert credentials.authenticate(conn, agent_token(env["fake"], agent_id), "bolna") == CLINIC
     # Reset, then the lookup succeeds: the agent is updated with a new credential and the
     # held one is revoked.
     env["fake"]._failures["list_agents"] = []  # noqa: SLF001

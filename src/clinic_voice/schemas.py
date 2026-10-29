@@ -180,6 +180,9 @@ class ClinicConfig(StrictModel):
     scripts_approved: bool
     # While provisioning is verified, also allow booking-changing tools (owner test calls).
     test_calls_enabled: bool
+    # Owner decision (T12, ADR 0008): booking reference in confirmation/reminder messages.
+    # Off by default: the reference is a verification factor on inbound calls.
+    include_reference_in_messages: bool
 
 
 class ClinicUpdate(PatchModel):
@@ -196,6 +199,7 @@ class ClinicUpdate(PatchModel):
     handoff_text: ScriptText | None = None
     scripts_approved: bool | None = None  # Owner only.
     test_calls_enabled: bool | None = None  # Owner only.
+    include_reference_in_messages: bool | None = None  # Owner only.
 
     @model_validator(mode="after")
     def _quiet_window(self):

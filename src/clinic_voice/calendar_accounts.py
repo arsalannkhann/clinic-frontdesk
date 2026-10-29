@@ -23,6 +23,7 @@ from psycopg.types.json import Jsonb
 
 from clinic_voice.audit import audit
 from clinic_voice.crypto import CryptoError, Keyring
+from clinic_voice.locks import lock_calendar_accounts
 from clinic_voice.providers import google_calendar as google
 from clinic_voice.providers.calendar import ProviderPermanent, ProviderRetryable
 
@@ -171,9 +172,7 @@ ALREADY_CONNECTED = "The clinic already has an active calendar account"
 
 
 def _lock_accounts(conn, clinic_id):
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"calendar_accounts:{clinic_id}",)
-    )
+    lock_calendar_accounts(conn, clinic_id)
 
 
 def _cancel_pending_revocations(conn, clinic_id, actor_id):

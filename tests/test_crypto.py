@@ -72,13 +72,13 @@ def test_repr_hides_keys():
 
 def test_phone_hash():
     key = os.urandom(32)
-    assert phone_hash(key, "+919800000001") == phone_hash(key, "+919800000001")
-    assert phone_hash(key, "+919800000001") != phone_hash(os.urandom(32), "+919800000001")
-    assert len(phone_hash(key, "+919800000001")) == 32
+    assert phone_hash(key, "+910000000001") == phone_hash(key, "+910000000001")
+    assert phone_hash(key, "+910000000001") != phone_hash(os.urandom(32), "+910000000001")
+    assert len(phone_hash(key, "+910000000001")) == 32
     with pytest.raises(ValueError):
-        phone_hash(key, "9800000001")
+        phone_hash(key, "910000000001")
     with pytest.raises(CryptoError):
-        phone_hash(b"short", "+919800000001")
+        phone_hash(b"short", "+910000000001")
 
 
 def test_generate_key_cli(capsys):

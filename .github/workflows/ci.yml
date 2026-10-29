@@ -58,3 +58,9 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+      # The contract test compares the generated body only; this checks the whole committed
+      # file matches a fresh generation from docs/openapi.json.
+      - name: Verify generated API types
+        run: |
+          npm run gen:api
+          git diff --exit-code -- src/api/schema.ts

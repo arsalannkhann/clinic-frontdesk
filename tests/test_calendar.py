@@ -10,6 +10,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import activate_lines
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -472,6 +473,7 @@ def test_cached_busy_applies_through_check_slots_route(client, database):
 
     with connect(database) as conn:
         _, token = credentials.issue(conn, CLINIC, "calendar-test")
+        activate_lines(conn, CLINIC)
     body = {"doctor_id": str(DOCTOR_ID), "service_id": str(SERVICE_ID), "day": DAY.isoformat()}
     auth = {"Authorization": f"Bearer {token}"}
     first = client.post("/v1/tools/check-slots", headers=auth, json=body).json()["slots"]
@@ -702,6 +704,7 @@ def test_check_slots_reports_slot_source(client, database):
 
     with connect(database) as conn:
         _, token = credentials.issue(conn, CLINIC, "source-test")
+        activate_lines(conn, CLINIC)
     body = {"doctor_id": str(DOCTOR_ID), "service_id": str(SERVICE_ID), "day": DAY.isoformat()}
     r = client.post(
         "/v1/tools/check-slots", headers={"Authorization": f"Bearer {token}"}, json=body

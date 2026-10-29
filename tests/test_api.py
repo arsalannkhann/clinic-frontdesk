@@ -3,9 +3,10 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 
-from clinic_voice.api import app, tenant
+from clinic_voice.api import app, tool_caller
 from clinic_voice.config import get_settings
 from clinic_voice.credentials import parse
+from clinic_voice.deps import ToolCaller
 
 CLINIC = UUID("00000000-0000-4000-8000-000000000001")
 WELL_FORMED = "cvt_" + "0" * 32 + "." + "A" * 43
@@ -24,7 +25,7 @@ def client(monkeypatch):
 
 @pytest.fixture
 def authorized(client):
-    app.dependency_overrides[tenant] = lambda: CLINIC
+    app.dependency_overrides[tool_caller] = lambda: ToolCaller(CLINIC, UUID(int=0))
     return client
 
 

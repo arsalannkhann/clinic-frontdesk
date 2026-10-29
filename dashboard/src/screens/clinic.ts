@@ -158,6 +158,31 @@ function form(ctx: Context, clinic: Clinic): HTMLElement {
     { disabled: !owner, title: owner ? undefined : "Owner only" },
   );
 
+  const reference = button(
+    clinic.include_reference_in_messages
+      ? "Leave booking reference out of messages"
+      : "Include booking reference in messages",
+    () => {
+      const include = !clinic.include_reference_in_messages;
+      const message = include
+        ? "Include the booking reference in confirmation and reminder messages? It is also what" +
+          " verifies a caller on the phone, so anyone who sees the message could use it."
+        : "Leave the booking reference out of confirmation and reminder messages?";
+      if (!confirmAction(message)) return;
+      void run(
+        status,
+        async () => {
+          await ctx.api.request("patch", "/v1/admin/clinic", {
+            body: { include_reference_in_messages: include },
+          });
+          ctx.refresh();
+        },
+        { control: reference },
+      );
+    },
+    { disabled: !owner, title: owner ? undefined : "Owner only" },
+  );
+
   const fields = h(
     "fieldset",
     { attrs: { disabled: !writer } },
@@ -186,7 +211,12 @@ function form(ctx: Context, clinic: Clinic): HTMLElement {
       "Approvals (owner)",
       h("p", {}, `Scripts approved: ${yesNo(clinic.scripts_approved)}`),
       h("p", {}, `Test calls enabled: ${yesNo(clinic.test_calls_enabled)}`),
-      h("div", { class: "actions" }, approve, testCalls),
+      h(
+        "p",
+        {},
+        `Booking reference in messages: ${yesNo(clinic.include_reference_in_messages)}`,
+      ),
+      h("div", { class: "actions" }, approve, testCalls, reference),
       owner ? null : h("p", { class: "muted" }, "Only the clinic owner can approve or enable these."),
     ),
   );

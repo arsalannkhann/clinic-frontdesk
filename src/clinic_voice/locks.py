@@ -71,6 +71,17 @@ The CLI's activate-manual follows the same order: the provisioning row (when it 
 then the clinic row FOR UPDATE, then inserts or updates the provisioning row.
 Gateway line checks take only the clinic row FOR SHARE (level 1b), never provisioning.
 
+Clinic row invariant: every lock on a clinics row taken while the transaction already holds
+other locks is FOR SHARE (gateway.require_line(lock=True) at level 1b, a contact send's
+settings re-read, provisioning.activate and the manual-setup check). Shared locks never
+conflict with each other, so these paths cannot deadlock on the clinic row. Every writer of
+the clinics row (admin.update_clinic, the CLI's set-agent, provision.step's agent
+compare-and-set) takes that row lock either alone or after only its own provisioning/outbox
+rows, never while holding a scheduling lock, so it simply waits for the shared holders. The
+one exception, activate_manual's clinic row FOR UPDATE, runs after only the provisioning row
+in an operator CLI transaction that takes no other lock. A new path must keep this: never
+take the clinic row FOR UPDATE (or update it) while holding a scheduling or contact lock.
+
 No provider or network I/O may run while these are held.
 
 Separate namespace: calendar_sync takes "busy:<clinic>:<doctor>" (advisory, per doctor) while
@@ -79,13 +90,52 @@ above, so it imposes no ordering.
 """
 
 
+def _advisory(conn, key: str, shared: bool = False) -> None:
+    """Transaction-scoped advisory lock on a text key (hashtextextended, seed 0). Every key
+    starts with a namespace prefix (or is "<clinic uuid>:<idempotency key>", which no prefix
+    can collide with), so the helpers below never share a key by accident."""
+    function = "pg_advisory_xact_lock_shared" if shared else "pg_advisory_xact_lock"
+    conn.execute(f"SELECT {function}(hashtextextended(%s, 0))", (key,))  # noqa: S608
+
+
+def lock_action(conn, clinic_id, key) -> None:
+    """Level 1: serialize one idempotency key of a clinic (reserve, and the gateway's cancel
+    and reschedule)."""
+    _advisory(conn, f"{clinic_id}:{key}")
+
+
 def lock_doctor_set(conn, clinic_id, exclusive):
-    function = "pg_advisory_xact_lock" if exclusive else "pg_advisory_xact_lock_shared"
+    """Level 2: shared by create_doctor, exclusive for a clinic-wide schedule exception."""
     # The "doctors:" prefix keeps this key apart from "<clinic>:<idempotency key>" locks.
-    conn.execute(
-        f"SELECT {function}(hashtextextended(%s, 0))",  # noqa: S608
-        (f"doctors:{clinic_id}",),
-    )
+    _advisory(conn, f"doctors:{clinic_id}", shared=not exclusive)
+
+
+def lock_patient_phone(conn, clinic_id, phone_hash: bytes) -> None:
+    """Level 4: one (clinic, caller phone hash) while a booking attaches its patient."""
+    _advisory(conn, f"patient:{clinic_id}:{phone_hash.hex()}")
+
+
+def lock_contact_plan(conn, clinic_id, appointment_id) -> None:
+    """Level 5 (contacts): contact planning of one appointment, after its row lock."""
+    _advisory(conn, f"contact-plan:{clinic_id}:{appointment_id}")
+
+
+def lock_contact_budget(conn, clinic_id, day) -> None:
+    """Level 5 (contacts): the contact budget of one clinic-local day; several days are
+    always taken in ascending order."""
+    _advisory(conn, f"contact-budget:{clinic_id}:{day.isoformat()}")
+
+
+def lock_calendar_accounts(conn, clinic_id) -> None:
+    """Outside the scheduling order: serializes a clinic's calendar connects and
+    disconnects (OAuth callbacks). Taken alone."""
+    _advisory(conn, f"calendar_accounts:{clinic_id}")
+
+
+def lock_busy_refresh(conn, clinic_id, doctor_id) -> None:
+    """Separate namespace: calendar_sync's external busy refresh of one doctor. Taken
+    standalone, never together with the scheduling locks."""
+    _advisory(conn, f"busy:{clinic_id}:{doctor_id}")
 
 
 def lock_doctors(conn, clinic_id, ids=None):

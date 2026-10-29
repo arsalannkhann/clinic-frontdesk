@@ -2642,6 +2642,7 @@
     "/v1/tools/appointment-status": {
       "post": {
         "summary": "Get Appointment Status",
+        "description": "Only appointments this same credential reserved through /v1/tools/reserve-slot (ADR\n0005): never Bolna-gateway, staff or other-credential bookings, whatever the UUID.",
         "operationId": "get_appointment_status_v1_tools_appointment_status_post",
         "parameters": [
           {
@@ -3901,6 +3902,10 @@
           "test_calls_enabled": {
             "type": "boolean",
             "title": "Test Calls Enabled"
+          },
+          "include_reference_in_messages": {
+            "type": "boolean",
+            "title": "Include Reference In Messages"
           }
         },
         "additionalProperties": false,
@@ -3919,7 +3924,8 @@
           "emergency_text",
           "handoff_text",
           "scripts_approved",
-          "test_calls_enabled"
+          "test_calls_enabled",
+          "include_reference_in_messages"
         ],
         "title": "ClinicConfig"
       },
@@ -4083,6 +4089,17 @@
               }
             ],
             "title": "Test Calls Enabled"
+          },
+          "include_reference_in_messages": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Include Reference In Messages"
           }
         },
         "additionalProperties": false,

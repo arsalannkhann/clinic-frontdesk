@@ -5,6 +5,7 @@ from uuid import uuid4
 from psycopg.pq import TransactionStatus
 
 from clinic_voice.errors import LeaseLost, NotFound
+from clinic_voice.locks import lock_busy_refresh
 
 
 def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end, heartbeat=None):
@@ -60,9 +61,7 @@ def refresh_external_busy(conn, port, clinic_id, doctor_id, start, end, heartbea
         if index and heartbeat is not None and not heartbeat():
             raise LeaseLost()
         fetched.append((calendar, port.free_busy([calendar], start, end)))
-    conn.execute(
-        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"busy:{clinic_id}:{doctor_id}",)
-    )
+    lock_busy_refresh(conn, clinic_id, doctor_id)
     if conn.execute(
         "SELECT 1 FROM external_busy WHERE clinic_id=%s AND doctor_id=%s"
         " AND starts_at < %s AND ends_at > %s AND fetched_at > %s LIMIT 1",

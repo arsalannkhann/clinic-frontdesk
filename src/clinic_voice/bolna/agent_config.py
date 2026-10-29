@@ -18,7 +18,7 @@ from urllib.parse import urlsplit
 
 from clinic_voice.bolna.gateway import SUPPORTED_LANGUAGES
 from clinic_voice.config import LOOPBACK_HOSTS
-from clinic_voice.credentials import parse
+from clinic_voice.credentials import GATEWAY_SCOPES, parse_any
 
 REDACTED = "<redacted>"
 PROMPTS = Path(__file__).resolve().parents[3] / "agents" / "prompts"
@@ -222,8 +222,8 @@ def system_prompt(base: str, clinic: dict, language: str | None = None) -> str:
 def _token_header(tool_token: str) -> str:
     if tool_token == REDACTED:
         return f"Bearer {REDACTED}"
-    if parse(tool_token) is None:
-        raise ValueError("tool token is not a tenant tool credential")
+    if parse_any(tool_token, GATEWAY_SCOPES) is None:
+        raise ValueError("tool token is not a tenant gateway credential (bolna or tools)")
     return f"Bearer {tool_token}"
 
 

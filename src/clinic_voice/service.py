@@ -14,7 +14,7 @@ from clinic_voice.domain import (
     new_booking_reference,
     utc_now,
 )
-from clinic_voice.locks import lock_doctors
+from clinic_voice.locks import lock_action, lock_doctors
 
 
 def get_context(conn, clinic_id, doctor_id, service_id):
@@ -131,10 +131,14 @@ def spoken_status(status):
     return SPOKEN_STATUS.get(status, UNKNOWN_SPOKEN_STATUS)
 
 
-def appointment_status(conn, clinic_id, appointment_id):
+def appointment_status(conn, clinic_id, appointment_id, tool_credential_id):
+    """Status of an appointment reserved through /v1/tools with this tool credential. Any
+    other appointment (Bolna gateway, staff, another or rotated credential) is 404, the same
+    as an unknown id."""
     row = conn.execute(
-        "SELECT id, status, starts_at, ends_at FROM appointments WHERE clinic_id=%s AND id=%s",
-        (clinic_id, appointment_id),
+        "SELECT id, status, starts_at, ends_at FROM appointments WHERE clinic_id=%s AND id=%s"
+        " AND tool_credential_id=%s",
+        (clinic_id, appointment_id, tool_credential_id),
     ).fetchone()
     if not row:
         raise HTTPException(404, "Appointment not found")
@@ -170,8 +174,8 @@ REFERENCE_CONSTRAINT = "appointments_booking_reference_key"
 REFERENCE_ATTEMPTS = 5
 INSERT_APPOINTMENT = """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,
     ends_at,blocks_until,status,idempotency_key,request_hash,call_session_id,patient_id,
-    rescheduled_from,booking_reference)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s,%s,%s,%s) RETURNING *"""
+    rescheduled_from,tool_credential_id,booking_reference)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s,%s,%s,%s,%s) RETURNING *"""
 
 
 def _insert_appointment(conn, values):
@@ -203,11 +207,13 @@ def insert_reservation(
     rescheduled_from=None,
     attach_patient=None,
     after_insert=None,
+    tool_credential_id=None,
 ):
     """Check the slot and insert a pending_sync appointment plus its calendar.create job in
     the caller's transaction. The caller must hold the doctor row lock (locks.py, level 3).
     attach_patient(conn, starts_at) -> patient id | None runs after the slot check;
-    after_insert(conn, appointment_id, patient_id) runs after the appointment insert."""
+    after_insert(conn, appointment_id, patient_id) runs after the appointment insert.
+    tool_credential_id records the /v1/tools credential that reserved it (status reads)."""
     context = get_context(conn, clinic_id, doctor_id, service_id)
     day = starts_at.astimezone(ZoneInfo(context["timezone"])).date()
     available = slots(conn, clinic_id, doctor_id, service_id, day, context=context)
@@ -233,6 +239,7 @@ def insert_reservation(
             call_session_id,
             patient_id,
             rescheduled_from,
+            tool_credential_id,
         ),
     )
     conn.execute(
@@ -254,6 +261,7 @@ def reserve(
     attach_patient=None,
     after_insert=None,
     gate=None,
+    tool_credential_id=None,
 ):
     """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
     session that created it (the gateway derives `key` from that session's execution id).
@@ -262,7 +270,8 @@ def reserve(
     patient record inside the reservation transaction; a replay never calls it. gate(conn)
     (gateway only) re-checks the clinic's line inside the transaction, after the action and
     session locks and before the doctor rows (locks.py, level 1b); it raises to refuse. A
-    replay is not re-gated (it changes nothing)."""
+    replay is not re-gated (it changes nothing). tool_credential_id (/v1/tools only) is
+    stored on the new appointment."""
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
@@ -270,9 +279,7 @@ def reserve(
     try:
         with connect(url) as conn:
             # Serialize the same logical action even if the winner commits between reads.
-            conn.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{clinic_id}:{key}",)
-            )
+            lock_action(conn, clinic_id, key)
             previous = replay(conn, clinic_id, key, request_hash)
             if previous:
                 return previous
@@ -314,6 +321,7 @@ def reserve(
                 call_session_id=call_session_id,
                 attach_patient=attach_patient,
                 after_insert=after_insert,
+                tool_credential_id=tool_credential_id,
             )
             result = response(row)
         return result

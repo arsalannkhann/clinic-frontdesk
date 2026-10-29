@@ -228,7 +228,8 @@ def resolve(conn, clinic_id, doctor: str, service_name: str) -> tuple[UUID, UUID
     return doctors[0], services[0]
 
 
-def _clinic_zone(conn, clinic_id) -> ZoneInfo:
+def clinic_zone(conn, clinic_id) -> ZoneInfo:
+    """The clinic's IANA zone (gateway and bolna.bookings speak times in it)."""
     row = conn.execute("SELECT timezone FROM clinics WHERE id=%s", (clinic_id,)).fetchone()
     return ZoneInfo(row["timezone"])
 
@@ -249,7 +250,7 @@ def spoken_slots(starts, zone, day) -> str:
 def check_slots(conn, clinic_id, query):
     doctor_id, service_id = resolve(conn, clinic_id, query.doctor, query.service)
     available = service.slots(conn, clinic_id, doctor_id, service_id, query.day)[:3]
-    zone = _clinic_zone(conn, clinic_id)
+    zone = clinic_zone(conn, clinic_id)
     return {"slots": available, "spoken": spoken_slots(available, zone, query.day)}
 
 

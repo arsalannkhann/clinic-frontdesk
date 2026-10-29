@@ -8,6 +8,8 @@ from clinic_voice.domain import as_uuid
 from clinic_voice.locks import lock_doctor_set, lock_doctors
 
 NOT_FOUND = "Not found"
+# Outbox kinds admin.requeue_outbox refuses (409): each may already have contacted a patient.
+CONTACT_KINDS = ("notification.send", "reminder.call", "reminder.stop")
 
 
 def _update(conn, table, columns, clinic_id, row_id, changes):
@@ -27,10 +29,10 @@ def _update(conn, table, columns, clinic_id, row_id, changes):
 CLINIC_COLUMNS = (
     "id,name,timezone,lead_time_minutes,horizon_days,outbound_enabled,quiet_hours_start,"
     "quiet_hours_end,reminder_lead_minutes,daily_contact_budget,emergency_text,handoff_text,"
-    "scripts_approved,test_calls_enabled"
+    "scripts_approved,test_calls_enabled,include_reference_in_messages"
 )
 SCRIPT_COLUMNS = ("emergency_text", "handoff_text")
-OWNER_COLUMNS = ("scripts_approved", "test_calls_enabled")
+OWNER_COLUMNS = ("scripts_approved", "test_calls_enabled", "include_reference_in_messages")
 
 
 def _clinic_out(row):
@@ -66,6 +68,10 @@ def update_clinic(conn, staff, changes):
     scripts_approved or test_calls_enabled (403 otherwise). Approval needs both texts
     non-empty (422 otherwise) and is audited as 'clinic.scripts_approved';
     test_calls_enabled changes as 'clinic.test_calls_enabled' / 'clinic.test_calls_disabled'.
+
+    include_reference_in_messages (T12, owner only, default off): whether confirmation and
+    reminder messages carry the booking reference (ADR 0008). Audited as
+    'clinic.reference_in_messages_enabled' / 'clinic.reference_in_messages_disabled'.
     """
     clinic_id = staff["clinic_id"]
     columns = (
@@ -111,6 +117,13 @@ def update_clinic(conn, staff, changes):
             "clinic.test_calls_enabled"
             if changes["test_calls_enabled"]
             else "clinic.test_calls_disabled"
+        )
+        audit(conn, clinic_id, staff["id"], action, clinic_id)
+    if "include_reference_in_messages" in changes:
+        action = (
+            "clinic.reference_in_messages_enabled"
+            if changes["include_reference_in_messages"]
+            else "clinic.reference_in_messages_disabled"
         )
         audit(conn, clinic_id, staff["id"], action, clinic_id)
     if "outbound_enabled" in changes:
@@ -273,7 +286,8 @@ def requeue_outbox(conn, staff, job_id):
     """Return a dead job to pending with a fresh budget of attempts.
 
     attempts is kept (fences rely on it only ever growing); max_attempts becomes attempts +
-    DEFAULT_MAX_ATTEMPTS. A job for an appointment that has already started is refused (409).
+    DEFAULT_MAX_ATTEMPTS. A job for an appointment that has already started is refused (409),
+    and so are provision.step and the patient contact kinds (CONTACT_KINDS).
     For calendar.create whose last_error is one of CALENDAR_DEAD_CODES, the appointment is
     returned from needs_review to pending_sync (same version only), since that review was
     caused by this job's failure; the worker re-reads the event id and re-checks external busy
@@ -302,6 +316,11 @@ def requeue_outbox(conn, staff, job_id):
         # Its dead-letter hook moved provisioning to manual_review; recover with reset and
         # advance (owner), which re-check the state and keep one step in flight.
         raise HTTPException(409, "Provisioning steps are re-run with reset and advance")
+    if peek["kind"] in CONTACT_KINDS:
+        # Patient contact: a dead send or call may have reached the patient (its hook sent the
+        # contact to needs_review), and a dead stop leaves placed calls in review. Requeueing
+        # could contact the patient twice; staff settle these from the reminder review.
+        raise HTTPException(409, "Patient contact jobs are not requeued; review the contact")
     if peek["appointment_id"] is not None:
         conn.execute(
             "SELECT id FROM appointments WHERE clinic_id=%s AND id=%s FOR UPDATE",

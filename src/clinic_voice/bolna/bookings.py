@@ -28,16 +28,16 @@ persisted, and a new appointment is described by its own (pending) status.
 import hashlib
 import hmac
 from datetime import UTC, timedelta
-from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 from psycopg.errors import ExclusionViolation, UniqueViolation
 
 from clinic_voice import appointments, patients, reminders, service
-from clinic_voice.bolna.gateway import derive_key, require_line
+from clinic_voice.bolna.gateway import clinic_zone, derive_key, require_line
 from clinic_voice.db import connect
 from clinic_voice.domain import ACTIVE_STATUSES, normalize_reference, spoken_reference
-from clinic_voice.locks import lock_doctors
+from clinic_voice.locks import lock_action, lock_doctors
+from clinic_voice.reminders import spoken_when
 
 MAX_VERIFICATION_FAILURES = 3
 VERIFY_FAILED = (
@@ -63,20 +63,6 @@ OPT_OUT_WORDS = {
     "call": "calls",
     "message": "messages",
 }
-
-
-def _zone(conn, clinic_id) -> ZoneInfo:
-    row = conn.execute("SELECT timezone FROM clinics WHERE id=%s", (clinic_id,)).fetchone()
-    return ZoneInfo(row["timezone"])
-
-
-def _when(moment, zone) -> str:
-    local = moment.astimezone(zone)
-    return (
-        local.strftime("%A %d %B").replace(" 0", " ")
-        + " at "
-        + local.strftime("%I:%M %p").lstrip("0")
-    )
 
 
 def _session(conn, clinic_id, session_id, lock=False):
@@ -137,7 +123,7 @@ def verify(conn, clinic_id, session_id, query, hash_key: bytes):
         VALUES (%s,%s,%s) ON CONFLICT DO NOTHING""",
         (clinic_id, session_id, row["id"]),
     )
-    zone = _zone(conn, clinic_id)
+    zone = clinic_zone(conn, clinic_id)
     return {
         "booking_reference": row["booking_reference"],
         "status": row["status"],
@@ -145,7 +131,7 @@ def verify(conn, clinic_id, session_id, query, hash_key: bytes):
         "doctor": row["doctor"],
         "service": row["service"],
         "spoken": (
-            f"I found the booking with {row['doctor']} on {_when(row['starts_at'], zone)}. "
+            f"I found the booking with {row['doctor']} on {spoken_when(row['starts_at'], zone)}. "
             + service.spoken_status(row["status"])
         ),
     }
@@ -177,7 +163,7 @@ def _changeable(row):
 
 
 def _lock(conn, clinic_id, key):
-    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))", (f"{clinic_id}:{key}",))
+    lock_action(conn, clinic_id, key)
 
 
 def _change(conn, clinic_id, key):
@@ -189,7 +175,7 @@ def _change(conn, clinic_id, key):
 
 def cancel(conn, clinic_id, session_id, request):
     row = _verified(conn, clinic_id, session_id, request.booking_reference)
-    zone = _zone(conn, clinic_id)
+    zone = clinic_zone(conn, clinic_id)
     key = derive_key(request.execution_id, "cancel-booking", {"appointment_id": str(row["id"])})
     out = {"booking_reference": row["booking_reference"], "starts_at": row["starts_at"]}
     if not request.confirmed:
@@ -199,7 +185,7 @@ def cancel(conn, clinic_id, session_id, request):
             "changed": False,
             "status": row["status"],
             "spoken": (
-                f"Please confirm: cancel the appointment on {_when(row['starts_at'], zone)}?"
+                f"Please confirm: cancel the appointment on {spoken_when(row['starts_at'], zone)}?"
                 " Nothing has been changed yet."
             ),
         }
@@ -228,7 +214,7 @@ def _rescheduled(new_row, previous_reference, zone):
         "status": new_row["status"],
         "starts_at": new_row["starts_at"],
         "spoken": (
-            f"Your appointment has been moved to {_when(new_row['starts_at'], zone)}. "
+            f"Your appointment has been moved to {spoken_when(new_row['starts_at'], zone)}. "
             + service.spoken_status(new_row["status"])
             + " Your new booking reference is "
             + spoken_reference(new_row["booking_reference"])
@@ -244,7 +230,7 @@ def reschedule(url, clinic_id, session_id, request, retention_days: int):
     starts_at = request.starts_at
     with connect(url) as conn:
         row = _verified(conn, clinic_id, session_id, request.booking_reference)
-        zone = _zone(conn, clinic_id)
+        zone = clinic_zone(conn, clinic_id)
         args = {
             "appointment_id": str(row["id"]),
             "starts_at": starts_at.astimezone(UTC).isoformat(),
@@ -259,8 +245,8 @@ def reschedule(url, clinic_id, session_id, request, retention_days: int):
                 "status": row["status"],
                 "starts_at": row["starts_at"],
                 "spoken": (
-                    f"Please confirm: move the appointment on {_when(row['starts_at'], zone)}"
-                    f" to {_when(starts_at, zone)}? Nothing has been changed yet."
+                    f"Please confirm: move the appointment on {spoken_when(row['starts_at'], zone)}"
+                    f" to {spoken_when(starts_at, zone)}? Nothing has been changed yet."
                 ),
             }
     try:
@@ -357,7 +343,7 @@ def opt_out(conn, clinic_id, session_id, request):
     if row["patient_id"] is None:
         raise HTTPException(409, OPT_OUT_NO_PATIENT)
     channel = OPT_OUT_SCOPES[request.scope]
-    zone = _zone(conn, clinic_id)
+    zone = clinic_zone(conn, clinic_id)
     words = OPT_OUT_WORDS[channel]
     out = {"booking_reference": row["booking_reference"], "scope": request.scope}
     if not request.confirmed:
@@ -366,7 +352,7 @@ def opt_out(conn, clinic_id, session_id, request):
             "opted_out": False,
             "spoken": (
                 f"Please confirm: stop appointment {words} for the appointment on"
-                f" {_when(row['starts_at'], zone)}? Nothing has been changed yet."
+                f" {spoken_when(row['starts_at'], zone)}? Nothing has been changed yet."
             ),
         }
     require_line(conn, clinic_id, True, lock=True)  # Lock order 1b: the line is still open.
@@ -378,6 +364,6 @@ def opt_out(conn, clinic_id, session_id, request):
         "opted_out": True,
         "spoken": (
             f"Done. The clinic will not send you {words} about the appointment on"
-            f" {_when(row['starts_at'], zone)}. Clinic staff can change this if you ask them."
+            f" {spoken_when(row['starts_at'], zone)}. Clinic staff can change this if you ask them."
         ),
     }

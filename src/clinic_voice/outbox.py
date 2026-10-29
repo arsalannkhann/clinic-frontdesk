@@ -205,15 +205,17 @@ def _run_on_dead(conn, job):
         handler.on_dead(conn, job)
 
 
-# Kinds a worker claims only when it has the port they need.
-BOLNA_KINDS = ("bolna.reconcile", "reminder.call", "provision.step")
+# Kinds a worker claims only when it has the port they need. reminder.stop is one: a worker
+# without a Bolna port would only spend its attempts (retry 'bolna_unconfigured') and then
+# dead-letter the stop, sending placed calls to review although a Bolna worker could stop them.
+BOLNA_KINDS = ("bolna.reconcile", "reminder.call", "reminder.stop", "provision.step")
 MESSAGING_KINDS = ("notification.send",)
 
 
 def excluded_kinds(ports) -> tuple[str, ...] | None:
     """Kinds this worker must leave to another worker (neither attempted nor dead-lettered
-    here): bolna.reconcile, reminder.call and provision.step without a Bolna port,
-    notification.send without a messaging port."""
+    here): bolna.reconcile, reminder.call, reminder.stop and provision.step without a Bolna
+    port, notification.send without a messaging port."""
     excluded = ()
     if getattr(ports, "bolna", None) is None:
         excluded += BOLNA_KINDS

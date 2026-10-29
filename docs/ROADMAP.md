@@ -1,5 +1,26 @@
 # Implementation roadmap
 
+## Status after T12 (29 October 2026)
+
+All twelve build tasks (docs/plans/2026-10-29-full-build.md) are implemented on `claude/tenant-credentials` and tested locally against PostgreSQL with synthetic data. "Done" below means done against fakes or `httpx.MockTransport` contract fixtures; nothing has run against a live Google, Bolna or messaging account, and no real call or patient message has been made.
+
+| Task | State |
+| --- | --- |
+| T1 clinic configuration admin API | Done |
+| T2 schedule exceptions, lead time, buffers | Done |
+| T3 calendar port, fake adapter, external busy cache | Done |
+| T4 durable worker, verified confirmation | Done |
+| T5 Google OAuth and calendar adapter | Done against MockTransport; not live-validated |
+| T6 Bolna gateway and agent compiler | Done against fixtures; not live-validated |
+| T7 patients, consent, verified cancel/reschedule | Done; spoken wording needs clinic approval |
+| T8 webhook inbox and reconciliation | Done with synthetic payloads; no live delivery received |
+| T9 confirmations and reminders | Done with fakes; no messaging provider; outbound agent not designed |
+| T10 provisioning state machine | Done with fakes; outbound agent and credential rotation manual |
+| T11 staff dashboard | Done; not deployed |
+| T12 final review and documentation | Done (credential scopes, line-gated tool API, message reference off by default) |
+
+Pilot blockers (all need the owner; see "Owner actions required before any live use" in docs/CLAUDE_HANDOFF.md): live contract validation of Bolna and Google with owner-authorized test accounts; the outbound reminder agent design and review; clinic-approved emergency, handoff, reschedule and "not yet confirmed" wording; a messaging provider meeting the idempotency criteria plus consent and DLT/TRAI compliance; secret management and key rotation plan; retention periods and a purge schedule; a cross-call verification rate limit per phone hash and clinic; a staff login rate limit and MFA; human transfer; native-speaker evaluation; hosting, TLS and a restore drill.
+
 ## 0 Foundation complete
 
 Local slot computation, anonymous reservations, tenant token mapping, PostgreSQL exclusion and composite foreign keys, retry idempotency, atomic outbox insertion, migrations, CLI, tests, CI, source review, voice prompts and handoff. Provider calls are not implemented.

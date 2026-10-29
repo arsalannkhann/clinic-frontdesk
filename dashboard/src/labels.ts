@@ -30,11 +30,14 @@ const APPOINTMENT = table({
   cancelled: ["Cancelled", "neutral"],
 });
 
-// Calendar sync state derived from the appointment status.
+// Calendar sync state derived from the appointment status. needs_review does not say why:
+// the calendar write may have failed, or the slot may be busy in the external calendar
+// (external_conflict) or the review may be a staff/reconciliation decision, so it never
+// claims "sync failed".
 const SYNC = table({
   pending_sync: ["Pending calendar sync", "warn"],
   confirmed: ["Synced to calendar", "ok"],
-  needs_review: ["Sync failed: needs review", "bad"],
+  needs_review: ["Not synced: needs staff review", "bad"],
   cancelled: ["Not applicable (cancelled)", "neutral"],
 });
 

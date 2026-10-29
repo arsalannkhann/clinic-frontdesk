@@ -23,7 +23,7 @@ Steps:
   the state stays draft with last_error calendar_not_connected.
 - agent (calendar_connected): compile the agent (agent_config) under the deterministic name
   agent_name(); find an existing agent by the stored agent_id, else by name in
-  list_agents(); then issue a fresh tool credential (plaintext in memory only; its id is
+  list_agents(); then issue a fresh bolna-scope credential (plaintext in memory only; its id is
   recorded as attempt_credential_id) and update the found agent (PUT, full replacement) or create one. Before a
   create, agent_create_pending is committed as write intent. A create that timed out (or a
   crash after the intent) is reconciled on the next attempt by the name lookup; when the
@@ -45,6 +45,8 @@ moves the state to manual_review in the dead-letter transaction (on_dead).
 
 import logging
 from datetime import timedelta
+
+from psycopg.errors import UniqueViolation
 
 from clinic_voice import credentials
 from clinic_voice import provisioning as service
@@ -259,7 +261,10 @@ def _agent(conn, job, port, row) -> bool:
     if not extend_lease(conn, job):
         conn.rollback()
         return False
-    credential_id, token = credentials.issue(conn, clinic_id, service.CREDENTIAL_LABEL)
+    # bolna scope: accepted by /v1/bolna/* only, never by the generic /v1/tools/* API.
+    credential_id, token = credentials.issue(
+        conn, clinic_id, service.CREDENTIAL_LABEL, scope=service.CREDENTIAL_SCOPE
+    )
     # The write below counts as an attempt whatever its outcome.
     updated = conn.execute(
         "UPDATE provisioning SET attempt_credential_id=%s, agent_name=%s,"
@@ -346,22 +351,42 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
             agent_create_pending=False if created else row["agent_create_pending"],
             attempt_credential_id=None,
         )
-    # Compare-and-set: the clinic's agent id must still be what this step read before the
-    # write (a concurrent bolna set-agent must not be overwritten).
-    swapped = conn.execute(
-        "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s"
-        " AND bolna_agent_id IS NOT DISTINCT FROM %s RETURNING id",
-        (agent_id, job.clinic_id, clinic["bolna_agent_id"]),
-    ).fetchone()
+    try:
+        # Savepoint: another clinic's provisioning may record the same agent id between the
+        # agent_taken check and this write (unique index provisioning_agent).
+        with conn.transaction():
+            # Compare-and-set: the clinic's agent id must still be what this step read before
+            # the write (a concurrent bolna set-agent must not be overwritten).
+            swapped = conn.execute(
+                "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s"
+                " AND bolna_agent_id IS NOT DISTINCT FROM %s RETURNING id",
+                (agent_id, job.clinic_id, clinic["bolna_agent_id"]),
+            ).fetchone()
+            if swapped is not None:
+                conn.execute(
+                    "UPDATE provisioning SET agent_id=%s, agent_create_pending=false,"
+                    " state='agent_created', tool_credential_id=%s,"
+                    " attempt_credential_id=NULL, resume_state='agent_created',"
+                    " last_error=NULL, version=version + 1, updated_at=now()"
+                    " WHERE clinic_id=%s",
+                    (agent_id, credential_id, job.clinic_id),
+                )
+    except UniqueViolation:
+        # Claimed elsewhere concurrently: same outcome as agent_taken above.
+        conn.rollback()
+        return _finish(
+            conn,
+            job,
+            row,
+            "manual_review",
+            "agent",
+            "agent_conflict",
+            agent_create_pending=False if created else row["agent_create_pending"],
+            attempt_credential_id=None,
+        )
     if swapped is None:
         conn.rollback()
         return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
-    conn.execute(
-        "UPDATE provisioning SET agent_id=%s, agent_create_pending=false, state='agent_created',"
-        " tool_credential_id=%s, attempt_credential_id=NULL, resume_state='agent_created',"
-        " last_error=NULL, version=version + 1, updated_at=now() WHERE clinic_id=%s",
-        (agent_id, credential_id, job.clinic_id),
-    )
     # The agent now carries the new credential: earlier provisioning credentials (from
     # attempts whose outcome was unknown, or a previous agent version) are revoked.
     conn.execute(

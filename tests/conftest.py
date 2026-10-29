@@ -26,9 +26,9 @@ def database():
     yield url
 
 
-def _open_line(conn, *clinics):
-    """Mark clinics' provisioning active so the Bolna gateway serves them (T10 gating).
-    Gateway tests that are not about gating start from an open line."""
+def activate_lines(conn, *clinics):
+    """Mark clinics' provisioning active so the Bolna gateway and the line-gated /v1/tools
+    API serve them (T10/T12 gating). Tests that are not about gating start from an open line."""
     for clinic in clinics:
         conn.execute(
             "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
@@ -40,4 +40,4 @@ def _open_line(conn, *clinics):
 
 @pytest.fixture
 def open_line():
-    return _open_line
+    return activate_lines

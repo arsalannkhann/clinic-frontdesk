@@ -27,6 +27,7 @@ from datetime import datetime
 from uuid import UUID, uuid4
 
 from clinic_voice.crypto import CryptoError, Keyring
+from clinic_voice.locks import lock_patient_phone
 
 log = logging.getLogger("clinic_voice.patients")
 
@@ -223,10 +224,7 @@ def attach(
         return None
     patient_id = None
     if phone is not None and details.name:
-        conn.execute(
-            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-            (f"patient:{clinic_id}:{phone[1].hex()}",),
-        )
+        lock_patient_phone(conn, clinic_id, phone[1])
         matches = _matching(conn, keyring, clinic_id, phone[1], details.name)
         if len(matches) == 1 and _lock_existing(conn, clinic_id, matches[0]):
             patient_id = matches[0]

@@ -4,6 +4,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 import pytest
+from conftest import activate_lines
 from fastapi.testclient import TestClient
 
 from clinic_voice import credentials, staff
@@ -64,6 +65,7 @@ def audit_actions(database):
 def tool_headers(database):
     with connect(database) as conn:
         _, token = credentials.issue(conn, CLINIC, "synthetic")
+        activate_lines(conn, CLINIC)
     return {"Authorization": "Bearer " + token}
 
 

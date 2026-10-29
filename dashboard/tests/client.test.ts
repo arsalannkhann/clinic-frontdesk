@@ -151,7 +151,7 @@ describe("ApiClient", () => {
   it("a failed login (401 without a token) does not trigger the session handler", async () => {
     const { client, onUnauthorized } = harness([json(401, { detail: "Invalid email or password" })], null);
     const error = await client
-      .request("post", "/v1/staff/login", { body: { email: "a@b.co", password: "x" } })
+      .request("post", "/v1/staff/login", { body: { email: "a@example.test", password: "x" } })
       .catch((e: unknown) => e);
     expect((error as ApiError).message).toBe(LOGIN_FAILED_MESSAGE);
     expect(onUnauthorized).not.toHaveBeenCalled();

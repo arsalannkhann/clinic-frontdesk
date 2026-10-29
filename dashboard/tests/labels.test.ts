@@ -35,6 +35,9 @@ describe("appointment labels", () => {
     expect(appointmentStatusLabel("pending_sync").text).toBe("Pending calendar sync");
     expect(appointmentStatusLabel("needs_review").text).toBe("Needs review");
     expect(syncLabel("pending_sync").text).toBe("Pending calendar sync");
+    // A review may come from an external calendar conflict, not a failed sync.
+    expect(syncLabel("needs_review").text).toBe("Not synced: needs staff review");
+    expect(syncLabel("needs_review").text).not.toMatch(/fail/i);
     for (const status of ["pending_sync", "needs_review", "cancelled"]) {
       expect(appointmentStatusLabel(status).text).not.toMatch(/confirm/i);
       expect(appointmentStatusLabel(status).tone).not.toBe("ok");

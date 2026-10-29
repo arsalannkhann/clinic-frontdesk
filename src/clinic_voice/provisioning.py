@@ -33,6 +33,9 @@ from clinic_voice.audit import audit
 AGENT_GENERATION = 1
 STEP_MAX_ATTEMPTS = 6
 CREDENTIAL_LABEL = "provisioning:agent"
+# The agent's credential works on /v1/bolna/* only (deps.tenant), so it cannot reach the
+# generic /v1/tools/* API (T12).
+CREDENTIAL_SCOPE = "bolna"
 # State -> the step a provision.step job runs from it.
 STEPS = {
     "draft": "calendar",
@@ -106,10 +109,12 @@ def agent_taken(conn, clinic_id, agent_id) -> bool:
 
 
 def credential_active(conn, clinic_id, credential_id) -> bool:
-    """The tool credential exists for this clinic, is unrevoked and unexpired."""
+    """The agent's credential exists for this clinic with a gateway scope (bolna, or tools
+    from a database provisioned before migration 016), is unrevoked and unexpired."""
     return (
         conn.execute(
-            "SELECT 1 FROM tenant_credentials WHERE clinic_id=%s AND id=%s AND scope='tools'"
+            "SELECT 1 FROM tenant_credentials WHERE clinic_id=%s AND id=%s"
+            " AND scope IN ('bolna','tools')"
             " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
             (clinic_id, credential_id),
         ).fetchone()
@@ -313,7 +318,8 @@ def reset(conn, staff, confirm_no_stray_agent=False):
     step still refuses to create while the lookup cannot rule out a stray agent. Clearing it
     needs confirm_no_stray_agent: the owner checked the Bolna account and no agent named
     agent_name exists. It is accepted only after create_uncertain or lease_lost; it also
-    revokes the credential that the lost write may have handed to that agent."""
+    revokes the credential that the lost write may have handed to that agent. Without the
+    confirmation attempt_credential_id is kept (never cleared without revoking)."""
     clinic_id = staff["clinic_id"]
     row = _locked(conn, clinic_id)
     if row["state"] not in RESETTABLE:
@@ -330,12 +336,16 @@ def reset(conn, staff, confirm_no_stray_agent=False):
 
             credentials.revoke(conn, held)
         pending = False
+    # attempt_credential_id is kept unless the owner confirmed no stray agent (it was then
+    # revoked above): an agent update whose outcome was unknown may still hold it, so it is
+    # neither cleared unrevoked nor revoked here. The next agent step replaces it, and
+    # revokes it once a newer credential is acknowledged (or the step stops).
     conn.execute(
         "UPDATE provisioning SET state=resume_state, last_error=NULL, agent_create_pending=%s,"
-        " attempt_credential_id=CASE WHEN %s THEN attempt_credential_id END,"
+        " attempt_credential_id=CASE WHEN %s THEN NULL ELSE attempt_credential_id END,"
         " calendar_attempts=0, agent_attempts=0, number_attempts=0, verify_attempts=0,"
         " version=version + 1, updated_at=now() WHERE clinic_id=%s",
-        (pending, pending, clinic_id),
+        (pending, confirm_no_stray_agent, clinic_id),
     )
     outcome = "reset_confirmed_no_stray_agent" if confirm_no_stray_agent else "reset"
     record(conn, clinic_id, row["state"], row["resume_state"], "reset", outcome, staff["id"])

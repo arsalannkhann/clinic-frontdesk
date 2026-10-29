@@ -5,14 +5,22 @@ from datetime import timedelta
 from uuid import UUID, uuid4
 
 # Format: <prefix>_<credential id hex>.<43-char urlsafe secret>. The id is a lookup handle,
-# not a secret. The prefix names the scope: cvt_ tool credentials (Authorization header of
-# the tool APIs), cvw_ webhook credentials (path segment of /v1/webhooks/bolna/{token}).
-PREFIXES = {"tools": "cvt", "webhook": "cvw"}
+# not a secret. The prefix names the scope:
+# - cvt_ tools: the generic tool API (/v1/tools/*); also accepted by /v1/bolna/* for clinics
+#   configured by hand before the bolna scope existed.
+# - cvb_ bolna: the Bolna gateway (/v1/bolna/*) only. Provisioning issues these for the
+#   agent it creates; /v1/tools/* refuses them, so the agent's credential cannot reach the
+#   generic tool API.
+# - cvw_ webhook: path segment of /v1/webhooks/bolna/{token}.
+PREFIXES = {"tools": "cvt", "bolna": "cvb", "webhook": "cvw"}
 PATTERNS = {
     scope: re.compile(rf"^{prefix}_([0-9a-f]{{32}})\.([A-Za-z0-9_-]{{43}})$")
     for scope, prefix in PREFIXES.items()
 }
 TOKEN_PATTERN = PATTERNS["tools"]
+# Scopes /v1/bolna/* accepts, and an agent's api_token may carry: bolna (provisioned), tools
+# (a clinic configured by hand with a tools credential).
+GATEWAY_SCOPES = ("bolna", "tools")
 LAST_USED_RESOLUTION = timedelta(minutes=5)
 
 
@@ -28,6 +36,15 @@ def parse(token: str, scope: str = "tools"):
     if not match:
         return None
     return UUID(match.group(1)), match.group(2)
+
+
+def parse_any(token: str, scopes: tuple[str, ...]):
+    """parse() against each scope in turn; the first match, else None."""
+    for scope in scopes:
+        parsed = parse(token, scope)
+        if parsed:
+            return parsed
+    return None
 
 
 def _insert(conn, clinic_id, label, rotated_from=None, expires_at=None, scope="tools"):
@@ -77,7 +94,20 @@ def revoke(conn, credential_id) -> bool:
 def authenticate(conn, token: str, scope: str = "tools"):
     """Return the clinic for an active credential of `scope`, else None. Callers must not say
     why. A token of one scope never authenticates for another (prefix and stored scope)."""
-    parsed = parse(token, scope)
+    found = authenticate_credential(conn, token, (scope,))
+    return None if found is None else found[0]
+
+
+def authenticate_credential(conn, token: str, scopes: tuple[str, ...]):
+    """(clinic_id, credential_id) for an active credential of one of `scopes`, else None.
+    The token's prefix selects the scope it is checked against; the stored scope must match
+    it, so a token never authenticates for a scope it was not issued for."""
+    parsed = scope = None
+    for candidate in scopes:
+        parsed = parse(token, candidate)
+        if parsed:
+            scope = candidate
+            break
     if not parsed:
         return None
     credential_id, secret = parsed
@@ -97,7 +127,7 @@ def authenticate(conn, token: str, scope: str = "tools"):
         conn.execute(
             "UPDATE tenant_credentials SET last_used_at=now() WHERE id=%s", (credential_id,)
         )
-    return row["clinic_id"]
+    return row["clinic_id"], credential_id
 
 
 def list_for_clinic(conn, clinic_id):

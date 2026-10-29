@@ -1,8 +1,11 @@
 """Bolna trusted gateway routes. Bolna calls these as custom function tools during a call.
 
-Authentication is the tenant tool credential (`cvt_` token) that the compiled agent sends as
-its tool `api_token` ("Bearer <token>", which Bolna documents as the Authorization header
-value). The credential alone selects the clinic; call-context fields in the body never do.
+Authentication is the tenant gateway credential that the compiled agent sends as its tool
+`api_token` ("Bearer <token>", which Bolna documents as the Authorization header value): a
+bolna-scope `cvb_` token (issued by provisioning, `credential issue --scope bolna`), or a
+tools-scope `cvt_` token for a clinic configured by hand before the bolna scope existed. The
+credential alone selects the clinic; call-context fields in the body never do. The generic
+/v1/tools/* API refuses bolna-scope tokens (deps.tool_caller).
 Responses are private (no-store) and carry no patient data or caller number.
 
 Line gating (T10, gateway.require_line), before anything is written: booking-changing tools
