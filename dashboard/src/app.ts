@@ -16,7 +16,7 @@ import { outboxScreen, remindersScreen } from "./screens/operations";
 import { provisioningScreen } from "./screens/provisioning";
 import { scheduleScreen } from "./screens/schedule";
 import { usersScreen } from "./screens/users";
-import { endSession, onSessionChange, sessionToken, sessionUser } from "./session";
+import { endSession, endSessionIfCurrent, onSessionChange, sessionToken, sessionUser } from "./session";
 import { setFlash, showStatus } from "./ui";
 
 export const SCREENS: readonly Screen[] = [
@@ -46,9 +46,9 @@ export function startApp(root: HTMLElement, baseUrl: string): void {
   const api = new ApiClient({
     baseUrl,
     getToken: sessionToken,
-    onUnauthorized: () => {
-      endSession(); // Clears the flash and shows the sign-in form.
-      showStatus(flash, "error", SESSION_ENDED_MESSAGE);
+    onUnauthorized: (token) => {
+      // Clears the flash and shows the sign-in form, unless a newer session replaced it.
+      if (endSessionIfCurrent(token)) showStatus(flash, "error", SESSION_ENDED_MESSAGE);
     },
   });
 

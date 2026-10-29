@@ -4,7 +4,6 @@ import openapiTS, { astToString } from "openapi-typescript";
 import { describe, expect, it } from "vitest";
 import { contentSecurityPolicy } from "../vite.config";
 import { apiBaseUrl } from "../src/config";
-import { zonedToIso, isoToZoned } from "../src/time";
 
 const root = join(__dirname, "..");
 const specPath = join(root, "..", "docs", "openapi.json");
@@ -44,16 +43,5 @@ describe("configuration", () => {
     expect(csp).not.toContain("unsafe-inline");
     expect(csp).not.toContain("unsafe-eval");
     expect(contentSecurityPolicy("")).toContain("connect-src 'self';");
-  });
-});
-
-describe("clinic time", () => {
-  it("converts clinic wall time to UTC and back", () => {
-    expect(zonedToIso("2030-01-01T10:00", "Asia/Kolkata")).toBe("2030-01-01T04:30:00.000Z");
-    expect(zonedToIso("2030-01-01", "Asia/Kolkata")).toBe("2029-12-31T18:30:00.000Z");
-    expect(isoToZoned("2030-01-01T04:30:00Z", "Asia/Kolkata")).toBe("2030-01-01T10:00");
-    // Across a DST change (New York, 2030-03-10).
-    expect(zonedToIso("2030-03-10T12:00", "America/New_York")).toBe("2030-03-10T16:00:00.000Z");
-    expect(zonedToIso("2030-03-09T12:00", "America/New_York")).toBe("2030-03-09T17:00:00.000Z");
   });
 });

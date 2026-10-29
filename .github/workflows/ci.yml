@@ -39,6 +39,8 @@ jobs:
         run: |
           clinic-voice export-openapi > /tmp/openapi.json
           diff -u docs/openapi.json /tmp/openapi.json
+  # Actions are pinned by major tag, matching the verify job above; pin both jobs by commit
+  # SHA together if the repository adopts SHA pinning.
   dashboard:
     runs-on: ubuntu-latest
     defaults:
@@ -51,7 +53,8 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
-      - run: npm ci
+      # No install scripts: none of the pinned dev dependencies needs one to build or test.
+      - run: npm ci --ignore-scripts
       - run: npm run typecheck
       - run: npm run build
       - run: npm test

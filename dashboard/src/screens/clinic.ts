@@ -20,6 +20,38 @@ import {
 type Clinic = Schemas["ClinicConfig"];
 type ClinicUpdate = Schemas["ClinicUpdate"];
 
+export const OUTBOUND_OFF_WARNING =
+  "Turn off outbound contact? Contacts due while outbound is off are suppressed permanently " +
+  "(turning it back on does not resend them).";
+export const BUDGET_ZERO_WARNING =
+  "Set the daily contact budget to 0? This stops all outbound confirmations and reminders; " +
+  "contacts that come due are suppressed.";
+
+/** The confirmations a clinic update needs before it is sent, in order. */
+export function confirmationsFor(update: ClinicUpdate, clinic: Clinic): string[] {
+  const messages: string[] = [];
+  if (update.outbound_enabled === true) {
+    messages.push(
+      "Enable outbound contact? Consented patients will receive confirmations and reminders.",
+    );
+  }
+  if (update.outbound_enabled === false) messages.push(OUTBOUND_OFF_WARNING);
+  if (update.daily_contact_budget === 0) messages.push(BUDGET_ZERO_WARNING);
+  if (update.timezone !== undefined) {
+    messages.push(
+      `Change the clinic time zone from ${clinic.timezone} to ${update.timezone}? Working ` +
+        "hours, quiet hours and reminder times are interpreted in the new zone.",
+    );
+  }
+  if (
+    (update.emergency_text !== undefined || update.handoff_text !== undefined) &&
+    clinic.scripts_approved
+  ) {
+    messages.push("Changing a script clears its approval. Continue?");
+  }
+  return messages;
+}
+
 function form(ctx: Context, clinic: Clinic): HTMLElement {
   const writer = canWrite(ctx.user);
   const owner = isOwner(ctx.user);
@@ -68,14 +100,8 @@ function form(ctx: Context, clinic: Clinic): HTMLElement {
     () => {
       const update = changes();
       if (!Object.keys(update).length) return showStatus(status, "info", "No changes to save.");
-      if (update.outbound_enabled === true) {
-        const ok = confirmAction(
-          "Enable outbound contact? Consented patients will receive confirmations and reminders.",
-        );
-        if (!ok) return;
-      }
-      if ((update.emergency_text ?? update.handoff_text) !== undefined && clinic.scripts_approved) {
-        if (!confirmAction("Changing a script clears its approval. Continue?")) return;
+      for (const message of confirmationsFor(update, clinic)) {
+        if (!confirmAction(message)) return;
       }
       void run(
         status,

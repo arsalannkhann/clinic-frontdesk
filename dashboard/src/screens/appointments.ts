@@ -1,4 +1,5 @@
 import type { Schemas } from "../api/client";
+import { loadClinicTimeZone } from "../clinicZone";
 import type { Context, Screen } from "../context";
 import { h, mount } from "../dom";
 import { APPOINTMENT_STATUSES, appointmentStatusLabel, syncLabel } from "../labels";
@@ -160,8 +161,8 @@ function appointmentTable(
   list: Appointment[],
   names: Names,
   empty: string,
+  tz: string,
 ): HTMLElement {
-  const tz = ctx.timeZone();
   const status = statusLine();
   const panel = h("div");
   const rows = list.map((a) => [
@@ -179,7 +180,7 @@ function appointmentTable(
     "div",
     {},
     table(
-      ["Starts", "Reference", "Doctor", "Service", "Status", "Calendar sync", "Patient", "Phone", ""],
+      [`Starts (${tz})`, "Reference", "Doctor", "Service", "Status", "Calendar sync", "Patient", "Phone", ""],
       rows,
       empty,
     ),
@@ -189,7 +190,7 @@ function appointmentTable(
 }
 
 async function load(ctx: Context): Promise<HTMLElement> {
-  const tz = ctx.timeZone();
+  const tz = await loadClinicTimeZone(ctx); // No fallback: refuse to render without it.
   const query = {
     from: filters.from ? zonedToIso(filters.from, tz) : null,
     to: filters.to ? zonedToIso(filters.to, tz) : null,
@@ -239,7 +240,7 @@ async function load(ctx: Context): Promise<HTMLElement> {
         "Calendar sync failed for these bookings. Requeue the sync or cancel. Never tell a " +
           "patient they are confirmed until the status shows Confirmed.",
       ),
-      appointmentTable(ctx, review, names, "Nothing needs review."),
+      appointmentTable(ctx, review, names, "Nothing needs review.", tz),
     ),
     section(
       "Appointments",
@@ -247,12 +248,12 @@ async function load(ctx: Context): Promise<HTMLElement> {
         "div",
         { class: "inline-form" },
         field(`From (clinic date, ${tz})`, from),
-        field("To (exclusive)", to),
+        field(`To, exclusive (clinic date, ${tz})`, to),
         field("Status", state),
         field("Limit", limit),
         apply,
       ),
-      appointmentTable(ctx, list, names, "No appointments match."),
+      appointmentTable(ctx, list, names, "No appointments match.", tz),
     ),
   );
 }

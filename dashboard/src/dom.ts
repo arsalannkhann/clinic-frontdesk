@@ -1,9 +1,47 @@
 /**
  * Minimal DOM builders. Every string child becomes a Text node, so data from the API is
  * never parsed as HTML. There is deliberately no way to set innerHTML, inline event-handler
- * attributes, inline styles or non-http(s) URLs through these helpers; a test scans the
- * sources for HTML-string sinks.
+ * attributes, inline styles or non-http(s) URLs through these helpers, and only the tags in
+ * ALLOWED_TAGS can be created (no script, iframe, object, embed, style, link, meta, img, ...).
+ * A test scans the sources for HTML-string sinks.
  */
+
+export const ALLOWED_TAGS = [
+  "a",
+  "button",
+  "datalist",
+  "dd",
+  "div",
+  "dl",
+  "dt",
+  "fieldset",
+  "form",
+  "h1",
+  "h2",
+  "h3",
+  "header",
+  "input",
+  "label",
+  "legend",
+  "main",
+  "nav",
+  "option",
+  "p",
+  "section",
+  "select",
+  "small",
+  "span",
+  "strong",
+  "table",
+  "tbody",
+  "td",
+  "textarea",
+  "th",
+  "thead",
+  "tr",
+] as const;
+export type AllowedTag = (typeof ALLOWED_TAGS)[number];
+const ALLOWED = new Set<string>(ALLOWED_TAGS);
 
 export type Child = Node | string | number | null | undefined | false | readonly Child[];
 
@@ -17,7 +55,8 @@ export interface Props {
   on?: Handlers;
 }
 
-const BLOCKED_ATTRIBUTE = /^(on|style$|srcdoc$|formaction$)/i;
+// srcset and ping carry URLs that the single-URL check below cannot vet; refuse them.
+const BLOCKED_ATTRIBUTE = /^(on|style$|srcdoc$|formaction$|srcset$|imagesrcset$|ping$)/i;
 const URL_ATTRIBUTES = new Set(["href", "src", "action", "xlink:href", "poster", "data"]);
 
 /** True for absolute http(s) URLs and same-document relative ones. */
@@ -39,11 +78,13 @@ export function append(parent: Node, children: readonly Child[]): void {
   }
 }
 
-export function h<K extends keyof HTMLElementTagNameMap>(
+export function h<K extends AllowedTag>(
   tag: K,
   props: Props = {},
   ...children: Child[]
 ): HTMLElementTagNameMap[K] {
+  // Checked at run time too, for callers that bypass the type (e.g. a computed tag name).
+  if (!ALLOWED.has(tag)) throw new Error(`Tag not allowed: ${String(tag)}`);
   const element = document.createElement(tag);
   if (props.class) element.className = props.class;
   for (const [name, value] of Object.entries(props.attrs ?? {})) {

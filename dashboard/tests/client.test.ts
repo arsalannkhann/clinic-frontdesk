@@ -7,7 +7,13 @@ import {
   SESSION_ENDED_MESSAGE,
   messageFor,
 } from "../src/api/errors";
-import { endSession, sessionToken, sessionUser, startSession } from "../src/session";
+import {
+  endSession,
+  endSessionIfCurrent,
+  sessionToken,
+  sessionUser,
+  startSession,
+} from "../src/session";
 
 const TOKEN = `cvs_${"a".repeat(32)}.${"B".repeat(43)}`;
 const USER = { id: "00000000-0000-4000-8000-000000000009", email: "o@example.test", role: "owner" } as const;
@@ -103,7 +109,7 @@ describe("ApiClient", () => {
 
   it("on 401 with a token, ends the session and reports a session-ended message", async () => {
     startSession({ token: TOKEN, expires_at: "2099-01-01T00:00:00Z", user: USER });
-    const onUnauthorized = vi.fn(endSession);
+    const onUnauthorized = vi.fn(endSessionIfCurrent);
     const client = new ApiClient({
       baseUrl: "",
       getToken: sessionToken,
@@ -115,8 +121,31 @@ describe("ApiClient", () => {
     expect((error as ApiError).status).toBe(401);
     expect((error as ApiError).message).toBe(SESSION_ENDED_MESSAGE);
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).toHaveBeenCalledWith(TOKEN);
     expect(sessionToken()).toBeNull();
     expect(sessionUser()).toBeNull();
+  });
+
+  it("a late 401 for an old token does not end a newer session", async () => {
+    const newer = `cvs_${"c".repeat(32)}.${"D".repeat(43)}`;
+    startSession({ token: TOKEN, expires_at: "2099-01-01T00:00:00Z", user: USER });
+    let release: (r: Response) => void = () => undefined;
+    const client = new ApiClient({
+      baseUrl: "",
+      getToken: sessionToken,
+      onUnauthorized: endSessionIfCurrent,
+      fetchImpl: (() => new Promise<Response>((resolve) => (release = resolve))) as typeof fetch,
+    });
+    const pending = client.request("get", "/v1/staff/me").catch((e: unknown) => e);
+    // The user signs out and in again while the old request is still in flight.
+    startSession({ token: newer, expires_at: "2099-01-01T00:00:00Z", user: USER });
+    release(json(401, { detail: "Invalid credentials" }));
+    const error = await pending;
+    expect((error as ApiError).status).toBe(401);
+    expect(sessionToken()).toBe(newer);
+    expect(endSessionIfCurrent(TOKEN)).toBe(false);
+    expect(endSessionIfCurrent(newer)).toBe(true);
+    expect(sessionToken()).toBeNull();
   });
 
   it("a failed login (401 without a token) does not trigger the session handler", async () => {

@@ -58,6 +58,14 @@ export function endSession(): void {
   if (had) notify();
 }
 
+/** End the session only if `token` is still the current one; returns whether it did. A
+ * late 401 for a previous session's token must not sign out a newer session. */
+export function endSessionIfCurrent(token: string): boolean {
+  if (current === null || current.token !== token) return false;
+  endSession();
+  return true;
+}
+
 export function onSessionChange(listener: (user: StaffUser | null) => void): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);

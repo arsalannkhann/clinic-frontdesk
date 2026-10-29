@@ -51,6 +51,7 @@ describe("rendering user data", () => {
     const responses: Record<string, unknown> = {
       "/v1/admin/doctors": [{ id: "d1", name: PAYLOAD, active: true, booking_calendar_id: null, busy_calendar_ids: [], calendar_account_id: null }],
       "/v1/admin/services": [],
+      "/v1/admin/clinic": { timezone: "Asia/Kolkata" },
       "/v1/admin/appointments": [appointment],
     };
     const api = new ApiClient({
@@ -91,6 +92,19 @@ describe("rendering user data", () => {
     const el = badge(appointmentStatusLabel(PAYLOAD));
     expect(el.textContent).toBe("Unknown");
     expect(el.children).toHaveLength(0);
+  });
+
+  it("creates only allowlisted tags", () => {
+    for (const tag of ["script", "iframe", "object", "embed", "style", "link", "meta", "img", "base"]) {
+      expect(() => h(tag as "div")).toThrow(/Tag not allowed/);
+    }
+    expect(h("div").tagName).toBe("DIV");
+  });
+
+  it("refuses URL-list attributes", () => {
+    expect(() => h("a", { attrs: { ping: "https://evil.example" } })).toThrow();
+    expect(() => h("div", { attrs: { srcset: "https://evil.example/x 1x" } })).toThrow();
+    expect(() => h("div", { attrs: { SrcSet: "x" } })).toThrow();
   });
 
   it("refuses event-handler attributes and script URLs", () => {

@@ -6,6 +6,7 @@ from pydantic import ValidationError
 
 from clinic_voice.api import app
 from clinic_voice.config import Settings, get_settings
+from clinic_voice.deps import staff_session
 
 ALLOWED = "https://dash.clinic.example"
 OTHER = "https://evil.example"
@@ -17,13 +18,13 @@ def make_client(monkeypatch):
     monkeypatch.setenv("DATABASE_URL", "postgresql://unused/unused")
     clients = []
 
-    def make(origins=None):
+    def make(origins=None, raise_server_exceptions=True):
         if origins is None:
             monkeypatch.delenv("DASHBOARD_ORIGINS", raising=False)
         else:
             monkeypatch.setenv("DASHBOARD_ORIGINS", origins)
         get_settings.cache_clear()
-        client = TestClient(app)
+        client = TestClient(app, raise_server_exceptions=raise_server_exceptions)
         client.__enter__()
         clients.append(client)
         return client
@@ -31,6 +32,7 @@ def make_client(monkeypatch):
     yield make
     for client in clients:
         client.__exit__(None, None, None)
+    app.dependency_overrides.clear()
     get_settings.cache_clear()
 
 
@@ -127,3 +129,63 @@ def test_origin_setting_is_normalized():
 def test_invalid_origins_are_rejected(value):
     with pytest.raises(ValidationError):
         Settings(database_url="postgresql://unused/unused", dashboard_origins=value)
+
+
+def _boom():
+    raise RuntimeError("unexpected failure with secret detail")
+
+
+def test_unhandled_error_keeps_cors_headers_for_allowed_origin(make_client):
+    client = make_client(ALLOWED, raise_server_exceptions=False)
+    app.dependency_overrides[staff_session] = _boom
+    r = client.get("/v1/staff/me", headers={"Origin": ALLOWED})
+    assert r.status_code == 500
+    assert r.json() == {"detail": "Internal server error"}
+    assert "secret" not in r.text
+    assert r.headers["access-control-allow-origin"] == ALLOWED
+    assert r.headers["cache-control"] == "no-store"
+    # A disallowed origin gets the same generic 500 without CORS headers.
+    r = client.get("/v1/staff/me", headers={"Origin": OTHER})
+    assert r.status_code == 500
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_unhandled_error_is_still_raised_to_the_server(make_client):
+    client = make_client(ALLOWED)  # raise_server_exceptions=True: the error propagates.
+    app.dependency_overrides[staff_session] = _boom
+    with pytest.raises(RuntimeError):
+        client.get("/v1/staff/me", headers={"Origin": ALLOWED})
+
+
+def test_staff_and_admin_responses_are_no_store(make_client):
+    client = make_client()  # Independent of CORS configuration.
+    for path in ("/v1/staff/me", "/v1/admin/clinic", "/v1/admin/appointments"):
+        r = client.get(path)
+        assert r.status_code == 401
+        assert r.headers["cache-control"] == "no-store"
+    app.dependency_overrides[staff_session] = lambda: {
+        "id": "00000000-0000-4000-8000-000000000009",
+        "clinic_id": "00000000-0000-4000-8000-000000000001",
+        "email": "owner@example.test",
+        "role": "owner",
+    }
+    r = client.get("/v1/staff/me")
+    assert r.status_code == 200
+    assert r.headers["cache-control"] == "no-store"
+    # Other routes are untouched.
+    assert "cache-control" not in client.get("/health/live").headers
+
+
+def test_path_prefix_fails_closed_for_cors_but_keeps_no_store(make_client):
+    client = make_client(ALLOWED)
+    prefixed = TestClient(app, root_path="/api")
+    prefixed.__enter__()
+    try:
+        r = prefixed.get("/api/v1/staff/me", headers={"Origin": ALLOWED})
+        assert "access-control-allow-origin" not in r.headers
+        assert r.headers["cache-control"] == "no-store"
+    finally:
+        prefixed.__exit__(None, None, None)
+    assert client.get("/v1/staff/me", headers={"Origin": ALLOWED}).headers[
+        "access-control-allow-origin"
+    ] == (ALLOWED)

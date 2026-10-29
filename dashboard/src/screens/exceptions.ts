@@ -1,3 +1,4 @@
+import { loadClinicTimeZone } from "../clinicZone";
 import type { Context, Screen } from "../context";
 import { h, mount } from "../dom";
 import { canWrite } from "../session";
@@ -23,7 +24,7 @@ const KINDS = [
 ] as const;
 
 async function load(ctx: Context): Promise<HTMLElement> {
-  const tz = ctx.timeZone();
+  const tz = await loadClinicTimeZone(ctx); // No fallback: refuse to render without it.
   const [doctors, exceptions] = await Promise.all([
     ctx.api.request("get", "/v1/admin/doctors"),
     ctx.api.request("get", "/v1/admin/exceptions", {
@@ -114,8 +115,8 @@ async function load(ctx: Context): Promise<HTMLElement> {
             { class: "inline-form" },
             field("Doctor", doctor),
             field("Kind", kind),
-            field("Starts", starts),
-            field("Ends", ends),
+            field(`Starts (clinic time, ${tz})`, starts),
+            field(`Ends (clinic time, ${tz})`, ends),
             field("Label", label),
             create,
             button("Refresh", () => ctx.refresh()),

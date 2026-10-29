@@ -12,7 +12,7 @@ Node.js 20.19+ or 22.12+ and npm. Dependencies are dev-only and pinned exactly i
 
 ```sh
 cd dashboard
-npm ci
+npm ci                    # or npm ci --ignore-scripts (as CI does); no dependency needs install scripts
 ```
 
 ## Development
@@ -65,4 +65,8 @@ cd dashboard && npm run gen:api
 - All data is rendered as Text nodes. No code assigns HTML strings to the DOM; a test scans the sources for HTML sinks, web storage and console logging.
 - State codes become words only in `src/labels.ts`. "Confirmed" appears only for the exact appointment status `confirmed`; pending_sync shows "Pending calendar sync", needs_review shows "Needs review", and anything unrecognized shows "Unknown".
 - Destructive or consequential actions ask for confirmation first.
+- A 401 ends the session only if the request carried the current token (a late reply for an old session cannot sign out a new one).
+- `h()` creates only allowlisted tags and refuses `srcset` and `ping` along with inline handlers, `style` and non-http(s) URLs.
+- Appointments and schedule exceptions load the clinic time zone themselves and refuse to show time inputs without it (no UTC fallback). Date-only filters mean the start of that day in the clinic zone. Local times in a spring-forward gap are refused; repeated fall-back times take the earlier instant (`src/time.ts`).
+- Turning outbound off, setting the daily budget to 0 and changing the time zone each ask for confirmation.
 - Calendar connection opens Google's consent page in a new tab (so this tab keeps its in-memory session). Only an https URL on `accounts.google.com` is accepted from the API.

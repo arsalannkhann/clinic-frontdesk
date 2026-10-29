@@ -18,6 +18,14 @@ export class ApiError extends Error {
   }
 }
 
+/** A problem the user can fix (e.g. a local time that does not exist); its message is shown. */
+export class UserError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UserError";
+  }
+}
+
 export const NETWORK_MESSAGE = "Cannot reach the server. Check your connection and try again.";
 export const SESSION_ENDED_MESSAGE = "Your session has ended. Sign in again.";
 export const LOGIN_FAILED_MESSAGE = "Invalid email or password.";
@@ -95,6 +103,6 @@ export async function toApiError(response: Response, hadToken: boolean): Promise
 
 /** A user-safe message for anything thrown by an action. */
 export function errorMessage(error: unknown): string {
-  if (error instanceof ApiError) return error.message;
+  if (error instanceof ApiError || error instanceof UserError) return error.message;
   return "Something went wrong. Try again.";
 }

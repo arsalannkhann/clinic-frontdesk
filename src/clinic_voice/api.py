@@ -88,23 +88,71 @@ async def lifespan(app):
 DASHBOARD_PATHS = ("/v1/staff/", "/v1/admin/")
 CORS_METHODS = ["GET", "POST", "PATCH", "PUT", "DELETE"]
 CORS_HEADERS = ["Authorization", "Content-Type"]
+INTERNAL_ERROR = b'{"detail":"Internal server error"}'
+log = logging.getLogger("clinic_voice.api")
 
 
-class DashboardCORS:
-    """CORS for the staff dashboard only: the origins in DASHBOARD_ORIGINS (none by default),
-    on the staff and admin paths, without credentials (the dashboard sends a bearer token,
-    never cookies). Settings are read per request so the origin list follows configuration;
-    the Starlette middleware is rebuilt only when the list changes."""
+def _is_dashboard_path(path: str) -> bool:
+    return path.startswith(DASHBOARD_PATHS)
+
+
+class DashboardMiddleware:
+    """Response policy for the staff and admin paths (/v1/staff/*, /v1/admin/*).
+
+    - Cache-Control: no-store on every response (session-scoped data; a route that sets its
+      own Cache-Control keeps it). Matched on the path with any root_path prefix removed.
+    - An unhandled exception becomes a generic 500 *inside* the CORS layer, so an allowed
+      dashboard origin can still read it (Starlette's ServerErrorMiddleware sits outside all
+      user middleware and would answer without CORS headers). The exception is re-raised
+      afterwards so the server still logs it.
+    - CORS for the origins in DASHBOARD_ORIGINS (none by default), without credentials
+      (bearer tokens, never cookies). Matched on the raw request path only: behind a
+      deployment path prefix (/api/v1/admin/...) no CORS headers are sent, failing closed.
+      Settings are read per request; the Starlette middleware is rebuilt only when the
+      origin list changes.
+    """
 
     def __init__(self, app):
         self.app = app
         self._origins: tuple[str, ...] = ()
         self._cors = None
 
-    def _middleware(self, origins: tuple[str, ...]):
+    async def _guarded(self, scope, receive, send):
+        started = False
+
+        async def send_wrapper(message):
+            nonlocal started
+            if message["type"] == "http.response.start":
+                started = True
+                headers = list(message.get("headers", []))
+                if not any(name.lower() == b"cache-control" for name, _ in headers):
+                    headers.append((b"cache-control", b"no-store"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_wrapper)
+        except Exception:
+            if started:
+                raise
+            log.error("unhandled error on a staff/admin route")  # No request data logged.
+            await send_wrapper(
+                {
+                    "type": "http.response.start",
+                    "status": 500,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(INTERNAL_ERROR)).encode()),
+                    ],
+                }
+            )
+            await send_wrapper({"type": "http.response.body", "body": INTERNAL_ERROR})
+            raise
+
+    def _cors_for(self, origins: tuple[str, ...]):
         if origins != self._origins or self._cors is None:
             self._cors = CORSMiddleware(
-                self.app,
+                self._guarded,
                 allow_origins=list(origins),
                 allow_methods=CORS_METHODS,
                 allow_headers=CORS_HEADERS,
@@ -115,15 +163,21 @@ class DashboardCORS:
         return self._cors
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope["path"].startswith(DASHBOARD_PATHS):
-            origins = tuple(get_settings().dashboard_origin_list())
-            if origins:
-                return await self._middleware(origins)(scope, receive, send)
-        return await self.app(scope, receive, send)
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        raw = scope["path"]
+        root = scope.get("root_path") or ""
+        route = raw[len(root) :] if root and raw.startswith(root) else raw
+        if not _is_dashboard_path(route):
+            return await self.app(scope, receive, send)
+        origins = tuple(get_settings().dashboard_origin_list()) if _is_dashboard_path(raw) else ()
+        if origins:
+            return await self._cors_for(origins)(scope, receive, send)
+        return await self._guarded(scope, receive, send)
 
 
 app = FastAPI(title="Clinic Voice AI", version="0.1.0", lifespan=lifespan)
-app.add_middleware(DashboardCORS)
+app.add_middleware(DashboardMiddleware)
 
 app.include_router(admin_router)
 app.include_router(appointments_router)

@@ -44,8 +44,9 @@ export interface ClientConfig {
   /** API origin (and optional prefix) without a trailing slash; "" for same origin. */
   baseUrl: string;
   getToken: () => string | null;
-  /** Called after a 401 on a request that carried a token. */
-  onUnauthorized: () => void;
+  /** Called after a 401 with the token that request carried (which may no longer be the
+   * current one: a slow request can finish after a new sign-in). */
+  onUnauthorized: (token: string) => void;
   fetchImpl?: typeof fetch;
 }
 
@@ -114,7 +115,7 @@ export class ApiClient {
     }
     if (!response.ok) {
       const error = await toApiError(response, token !== null);
-      if (response.status === 401 && token !== null) this.#config.onUnauthorized();
+      if (response.status === 401 && token !== null) this.#config.onUnauthorized(token);
       throw error;
     }
     if (response.status === 204) return undefined as ResponseOf<P, M>;

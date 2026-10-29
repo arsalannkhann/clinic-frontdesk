@@ -121,7 +121,7 @@ Development: run the API on port 8000, then `cd dashboard && npm ci && npm run d
 Production build: `cd dashboard && npm ci && VITE_API_BASE_URL=<API origin or empty> npm run build`, then serve `dashboard/dist/` as static files. Two layouts:
 
 - Same origin (preferred): one host serves `dist/` and forwards `/v1/` to the API. Build with `VITE_API_BASE_URL` empty and leave `DASHBOARD_ORIGINS` unset.
-- Separate origins: build with `VITE_API_BASE_URL=https://api.clinic.example` and start the API with `DASHBOARD_ORIGINS=https://dash.clinic.example` (comma-separated for several; exact origins, no wildcards). A malformed value fails startup.
+- Separate origins: the API must see the staff/admin paths unprefixed (`/v1/...`); behind a path prefix CORS is not sent (fails closed). Build with `VITE_API_BASE_URL=https://api.clinic.example` and start the API with `DASHBOARD_ORIGINS=https://dash.clinic.example` (comma-separated for several; exact origins, no wildcards). A malformed value fails startup.
 
-Serve `dist/` over TLS with the headers listed in docs/SECURITY.md (CSP with `frame-ancestors 'none'`, HSTS, nosniff, no-referrer). Users must sign in again after a reload; that is intended (the token is never stored). For the calendar connection, Google's consent page opens in a new tab; after consenting, close it and refresh the Calendar screen.
+Serve `dist/` over TLS with the headers listed in docs/SECURITY.md (CSP with `frame-ancestors 'none'`, HSTS, nosniff, no-referrer). Users must sign in again after a reload; that is intended (the token is never stored). The Appointments and Schedule exceptions screens show and accept times in the clinic's time zone (named next to each time input) and do not open if the zone cannot be loaded. For the calendar connection, Google's consent page opens in a new tab; after consenting, close it and refresh the Calendar screen.
 
