@@ -712,6 +712,7 @@ class ProvisioningOut(StrictModel):
     resume_state: ProvisioningState  # Where a reset returns.
     agent_id: str | None
     agent_name: str | None  # Deterministic provider reference used for lookups.
+    agent_create_pending: bool  # An agent create may have reached Bolna unrecorded.
     tool_credential_id: UUID | None  # The agent's tool credential (id only).
     phone_number_id: str | None
     attempts: ProvisioningAttempts
@@ -724,6 +725,12 @@ class ProvisioningOut(StrictModel):
 
 class ProvisioningNumber(StrictModel):
     phone_number_id: PhoneNumberId
+
+
+class ProvisioningReset(StrictModel):
+    # The owner checked the Bolna account: no agent named agent_name exists. Clears an
+    # ambiguous create intent; accepted only after create_uncertain or lease_lost.
+    confirm_no_stray_agent: bool = False
 
 
 class ProvisioningAdvanced(StrictModel):

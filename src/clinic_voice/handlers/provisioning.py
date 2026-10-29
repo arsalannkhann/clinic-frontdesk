@@ -140,7 +140,12 @@ def _exhausted(row, step) -> bool:
 
 
 def _count_attempt(conn, job, step):
+    """Count one attempt, fenced on the job's lease and the row version, and commit. None:
+    the lease or the version was lost (the caller stops)."""
     column = ATTEMPT_COLUMNS[step]
+    if not extend_lease(conn, job):
+        conn.rollback()
+        return None
     row = conn.execute(
         f"UPDATE provisioning SET {column}={column} + 1 WHERE clinic_id=%s AND version=%s"  # noqa: S608
         f" RETURNING {column} AS n",
@@ -244,6 +249,12 @@ def _agent(conn, job, port, row) -> bool:
         return _provider_error(conn, job, row, "agent", error)
     if refusal is not None:
         return _finish(conn, job, row, "manual_review", "agent", refusal)
+    if agent_id is not None:
+        taken = service.agent_taken(conn, clinic_id, agent_id)
+        conn.commit()
+        if taken:
+            # Checked before any credential is issued or any write is sent.
+            return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
     # Issue the credential and record write intent together, fenced, before provider I/O.
     if not extend_lease(conn, job):
         conn.rollback()
@@ -313,8 +324,6 @@ def _agent(conn, job, port, row) -> bool:
 
 
 def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) -> bool:
-    if clinic["bolna_outbound_agent_id"] == agent_id:
-        return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
     if not extend_lease(conn, job):
         conn.rollback()
         return False
@@ -322,10 +331,29 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
     if current is None or current["version"] != row["version"] or current["state"] != row["state"]:
         conn.rollback()
         return complete(conn, job)
-    taken = conn.execute(
-        "SELECT 1 FROM provisioning WHERE agent_id=%s AND clinic_id<>%s", (agent_id, job.clinic_id)
+    if service.agent_taken(conn, job.clinic_id, agent_id):
+        # The target was checked before the write, so this is a created id that belongs
+        # elsewhere, or an agent claimed elsewhere while the write ran. That agent must not
+        # keep this clinic's credential: the attempt's credential is revoked with the review.
+        conn.rollback()
+        return _finish(
+            conn,
+            job,
+            row,
+            "manual_review",
+            "agent",
+            "agent_conflict",
+            agent_create_pending=False if created else row["agent_create_pending"],
+            attempt_credential_id=None,
+        )
+    # Compare-and-set: the clinic's agent id must still be what this step read before the
+    # write (a concurrent bolna set-agent must not be overwritten).
+    swapped = conn.execute(
+        "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s"
+        " AND bolna_agent_id IS NOT DISTINCT FROM %s RETURNING id",
+        (agent_id, job.clinic_id, clinic["bolna_agent_id"]),
     ).fetchone()
-    if taken:
+    if swapped is None:
         conn.rollback()
         return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
     conn.execute(
@@ -334,7 +362,6 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
         " last_error=NULL, version=version + 1, updated_at=now() WHERE clinic_id=%s",
         (agent_id, credential_id, job.clinic_id),
     )
-    conn.execute("UPDATE clinics SET bolna_agent_id=%s WHERE id=%s", (agent_id, job.clinic_id))
     # The agent now carries the new credential: earlier provisioning credentials (from
     # attempts whose outcome was unknown, or a previous agent version) are revoked.
     conn.execute(
@@ -395,6 +422,20 @@ def _verify(conn, job, port, row) -> bool:
         }
     except ValueError:
         return _finish(conn, job, row, "failed", "verify", "agent_config_invalid")
+    active = row["tool_credential_id"] is not None and service.credential_active(
+        conn, job.clinic_id, row["tool_credential_id"]
+    )
+    conn.commit()
+    if not active:
+        return _finish(
+            conn,
+            job,
+            row,
+            "manual_review",
+            "verify",
+            "credential_inactive",
+            resume="calendar_connected",
+        )
     require_idle(conn)
     try:
         agent = port.get_agent(row["agent_id"])
@@ -411,9 +452,13 @@ def _verify(conn, job, port, row) -> bool:
         return _finish(
             conn, job, row, "manual_review", "verify", "tools_mismatch", resume="calendar_connected"
         )
+    # None: Bolna masked the token (only that counts as unchecked). UNREADABLE (absent or
+    # not a tool credential) fails like a different credential.
     readable = [token_id for token_id in agent.token_credential_ids if token_id is not None]
-    expected_credential = row["tool_credential_id"].hex if row["tool_credential_id"] else None
-    if any(token_id != expected_credential for token_id in readable):
+    expected_credential = row["tool_credential_id"].hex
+    if not agent.token_credential_ids or any(
+        token_id != expected_credential for token_id in readable
+    ):
         return _finish(
             conn,
             job,
@@ -446,17 +491,18 @@ def on_dead(conn, job):
     ).fetchone()
     if row is None or row["state"] not in service.STEPS:
         return
+    # The outbox row already carries the dead-letter code (same transaction). A lease that
+    # expired with every attempt spent means workers died mid-step (possibly mid-create).
+    dead = conn.execute(
+        "SELECT last_error FROM outbox WHERE clinic_id=%s AND id=%s", (job.clinic_id, job.id)
+    ).fetchone()
+    code = "lease_lost" if dead and dead["last_error"] == "lease_expired" else "retries_exhausted"
     conn.execute(
-        "UPDATE provisioning SET state='manual_review', last_error='retries_exhausted',"
+        "UPDATE provisioning SET state='manual_review', last_error=%s,"
         " version=version + 1, updated_at=now() WHERE clinic_id=%s",
-        (job.clinic_id,),
+        (code, job.clinic_id),
     )
     _revoke_unheld(conn, job.clinic_id)
     service.record(
-        conn,
-        job.clinic_id,
-        row["state"],
-        "manual_review",
-        service.STEPS[row["state"]],
-        "retries_exhausted",
+        conn, job.clinic_id, row["state"], "manual_review", service.STEPS[row["state"]], code
     )

@@ -6,6 +6,11 @@ locks in this global order, and never in reverse, so the paths cannot deadlock:
 1a. Call session row FOR NO KEY UPDATE (Bolna gateway only): serializes the per-session
    appointment cap check in reserve(), and verification failure counting in
    bolna.bookings.verify (which takes no other lock).
+1b. Clinic row FOR SHARE (Bolna gateway only, gateway.require_line(lock=True)): every
+   booking-changing tool re-checks the clinic's line inside its write transaction (reserve,
+   cancel, reschedule, opt-out; opt-out takes no earlier lock). Changes that close the line
+   update the clinic row (admin.update_clinic, test_calls_enabled off), which takes no other
+   lock, so it waits for in-flight tool writes and no tool write commits after it.
 2. Doctor-set advisory lock ("doctors:<clinic>"): shared by create_doctor, exclusive for a
    clinic-wide schedule exception, so no doctor appears mid-way through that exception.
 3. Doctor rows FOR UPDATE in ascending id order.
@@ -53,6 +58,18 @@ takes no other lock. A cancel updates reminder rows after its appointment row; a
 updates only reminder rows (no appointment lock) and then inserts reminder.stop jobs, and a
 send re-reads consent and opt-out only after locking its reminder row, so an opt-out
 committed before that lock always suppresses the send.
+
+Provisioning (T10, provisioning.py and handlers/provisioning.py), outside the scheduling
+locks: staff requests (advance, select_number, activate, reset) lock the provisioning row
+FOR UPDATE (inserting it first when missing), then read the clinic row (FOR SHARE in
+activate and the manual-setup check), then insert an outbox row (advance only); they never
+lock an existing outbox row. The worker's provision.step takes its own fenced outbox row
+(extend_lease), then the provisioning row FOR UPDATE, then updates the clinic row
+(bolna_agent_id compare-and-set) and tenant_credentials rows. The dead-letter hook runs with
+the outbox row already locked, then updates the provisioning row and tenant_credentials.
+The CLI's activate-manual follows the same order: the provisioning row (when it exists),
+then the clinic row FOR UPDATE, then inserts or updates the provisioning row.
+Gateway line checks take only the clinic row FOR SHARE (level 1b), never provisioning.
 
 No provider or network I/O may run while these are held.
 

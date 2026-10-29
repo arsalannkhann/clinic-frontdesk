@@ -26,7 +26,13 @@ from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.config import get_settings
 from clinic_voice.db import connect
 from clinic_voice.outbox import Ports, run_once
-from clinic_voice.providers.bolna import BolnaClient, FakeBolna, PhoneNumber, summarize_agent
+from clinic_voice.providers.bolna import (
+    UNREADABLE,
+    BolnaClient,
+    FakeBolna,
+    PhoneNumber,
+    summarize_agent,
+)
 from clinic_voice.providers.calendar import (
     FakeCalendar,
     ProviderPermanent,
@@ -304,13 +310,37 @@ def test_uncertain_create_without_consistent_lookup_goes_to_manual_review(env):
     assert len(calls(env["fake"], "create_agent")) == 1 and env["fake"].agents == {}
     # Advance is refused until the owner resets (after checking the Bolna account).
     assert advance(env, owner).status_code == 409
+    held = provisioning_row(env)["attempt_credential_id"]
+    # A plain reset keeps the create intent: the next step refuses to create again.
     r = env["client"].post(f"{BASE}/reset", headers=h(owner))
     assert r.status_code == 200 and r.json()["state"] == "calendar_connected"
+    assert r.json()["agent_create_pending"] is True
+    review = step(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "create_uncertain")
+    assert len(calls(env["fake"], "create_agent")) == 1
+    # The owner confirms no stray agent exists: the intent and its credential are cleared.
+    r = env["client"].post(f"{BASE}/reset", headers=h(owner), json={"confirm_no_stray_agent": True})
+    assert r.status_code == 200 and r.json()["agent_create_pending"] is False
+    assert provisioning_row(env)["attempt_credential_id"] is None
+    assert rows(env["url"], "SELECT revoked_at FROM tenant_credentials WHERE id=%s", (held,))[0][
+        "revoked_at"
+    ]
     assert step(env, owner)["state"] == "agent_created"
     assert len(env["fake"].agents) == 1
-    assert "provisioning.reset" in [
-        a["action"] for a in rows(env["url"], "SELECT action FROM audit_events")
-    ]
+    actions = [a["action"] for a in rows(env["url"], "SELECT action FROM audit_events")]
+    assert "provisioning.reset" in actions and "provisioning.reset_confirmed" in actions
+
+
+def test_confirming_no_stray_agent_needs_an_uncertain_create(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    env["fake"].fail_next("create_agent", 1, ProviderPermanent)
+    step(env, owner)
+    assert state(env, owner)["state"] == "failed"
+    r = env["client"].post(f"{BASE}/reset", headers=h(owner), json={"confirm_no_stray_agent": True})
+    assert r.status_code == 409
+    assert env["client"].post(f"{BASE}/reset", headers=h(owner), json={}).status_code == 200
 
 
 def test_uncertain_create_without_lookup_goes_to_manual_review(env):
@@ -353,6 +383,81 @@ def test_hand_configured_agent_is_never_replaced(env):
     review = step(env, owner)
     assert (review["state"], review["last_error"]) == ("manual_review", "agent_preconfigured")
     assert not calls(env["fake"], "create_agent")
+
+
+CONFLICT_AGENT_SQL = {
+    "own_outbound": "UPDATE clinics SET bolna_outbound_agent_id=%(a)s WHERE id=%(c)s",
+    "other_inbound": "UPDATE clinics SET bolna_agent_id=%(a)s WHERE id=%(o)s",
+    "other_outbound": "UPDATE clinics SET bolna_outbound_agent_id=%(a)s WHERE id=%(o)s",
+    "other_provisioning": "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
+    " VALUES (%(o)s,'agent_created','agent_created',%(a)s)",
+}
+
+
+@pytest.mark.parametrize("owner_of", list(CONFLICT_AGENT_SQL))
+def test_found_agent_owned_elsewhere_is_never_written(env, owner_of):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    # An agent with this clinic's deterministic name that belongs elsewhere.
+    found = env["fake"].create_agent(
+        {"agent_config": {"agent_name": service.agent_name(CLINIC), "tasks": []}}
+    )
+    execute(env["url"], CONFLICT_AGENT_SQL[owner_of], {"a": found, "c": CLINIC, "o": OTHER_CLINIC})
+    review = step(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "agent_conflict")
+    assert not calls(env["fake"], "update_agent")
+    assert len(calls(env["fake"], "create_agent")) == 1  # Only the setup's own create.
+    assert provisioning_credentials(env) == []  # Refused before any credential was issued.
+    assert review["agent_id"] is None
+
+
+def test_created_agent_claimed_elsewhere_is_reviewed_and_its_credential_revoked(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    fake = env["fake"]
+    original = fake.create_agent
+
+    def create_then_claimed(payload):
+        agent_id = original(payload)
+        execute(
+            env["url"],
+            "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s",
+            (agent_id, OTHER_CLINIC),
+        )
+        return agent_id
+
+    fake.create_agent = create_then_claimed
+    review = step(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "agent_conflict")
+    assert review["agent_id"] is None and review["tool_credential_id"] is None
+    assert all(c["revoked_at"] is not None for c in provisioning_credentials(env))
+    assert rows(env["url"], "SELECT bolna_agent_id FROM clinics WHERE id=%s", (CLINIC,)) == [
+        {"bolna_agent_id": None}
+    ]
+
+
+def test_concurrent_set_agent_is_not_overwritten(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    fake = env["fake"]
+    original = fake.create_agent
+    hand_set = "55555555-5555-4555-8555-555555555555"
+
+    def create_while_set_agent_runs(payload):
+        agent_id = original(payload)
+        execute(env["url"], "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s", (hand_set, CLINIC))
+        return agent_id
+
+    fake.create_agent = create_while_set_agent_runs
+    review = step(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "agent_conflict")
+    assert review["agent_id"] is None
+    assert rows(env["url"], "SELECT bolna_agent_id FROM clinics WHERE id=%s", (CLINIC,)) == [
+        {"bolna_agent_id": hand_set}
+    ]
 
 
 class Unauthorized(ProviderPermanent):
@@ -412,6 +517,10 @@ def test_refusals_do_not_count_against_the_attempt_budget(env):
     assert select(env, owner).status_code == 200
     assert step(env, owner)["state"] == "number_assigned"
     assert state(env, owner)["attempts"]["number"] == 1  # The assignment write.
+
+
+def provisioning_row(env, clinic=CLINIC):
+    return rows(env["url"], "SELECT * FROM provisioning WHERE clinic_id=%s", (clinic,))[0]
 
 
 def provisioning_credentials(env):
@@ -496,6 +605,31 @@ def test_dead_lettered_step_moves_to_manual_review(env):
     admin = headers(env, "admin")
     r = env["client"].post(f"/v1/admin/outbox/{jobs(env)[-1]['id']}/requeue", headers=h(admin))
     assert r.status_code == 409
+
+
+def test_lost_lease_dead_letter_is_lease_lost_and_allows_confirming_no_stray_agent(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    assert advance(env, owner).status_code == 202
+    # A worker died mid-create: write intent recorded, job processing with its lease gone.
+    execute(
+        env["url"],
+        "UPDATE provisioning SET agent_create_pending=true WHERE clinic_id=%s",
+        (CLINIC,),
+    )
+    execute(
+        env["url"],
+        "UPDATE outbox SET status='processing', attempts=max_attempts, lease_owner='dead',"
+        " lease_expires_at=now() - interval '1 second'"
+        " WHERE kind='provision.step' AND status='pending'",
+    )
+    work(env)
+    review = state(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "lease_lost")
+    assert jobs(env)[-1]["status"] == "dead"
+    r = env["client"].post(f"{BASE}/reset", headers=h(owner), json={"confirm_no_stray_agent": True})
+    assert r.status_code == 200 and r.json()["agent_create_pending"] is False
 
 
 # Numbers
@@ -610,6 +744,56 @@ def test_verify_detects_a_foreign_credential(env):
     params["clinic_context"]["api_token"] = f"Bearer {other}"
     review = step(env, owner)
     assert (review["state"], review["last_error"]) == ("manual_review", "credential_mismatch")
+
+
+@pytest.mark.parametrize(
+    ("token", "outcome"),
+    [("Bearer not-a-tool-token", "credential_mismatch"), ("Bearer ********", None)],
+)
+def test_verify_fails_an_unreadable_token_and_flags_only_a_true_mask(env, token, outcome):
+    owner = headers(env)
+    connect_calendar(env)
+    assigned = to_state(env, owner, "number_assigned")
+    params = env["fake"].agents[assigned["agent_id"]]["agent_config"]["tasks"][0]["tools_config"][
+        "api_tools"
+    ]["tools_params"]
+    for entry in params.values():
+        entry["api_token"] = token
+    view = step(env, owner)
+    if outcome is None:
+        assert view["state"] == "verified"
+        assert view["events"][0]["outcome"] == "token_unchecked"
+    else:
+        assert (view["state"], view["last_error"]) == ("manual_review", outcome)
+
+
+def test_verify_and_activate_require_an_active_tool_credential(env):
+    owner = headers(env)
+    connect_calendar(env)
+    approve_scripts(env, owner)
+    assigned = to_state(env, owner, "number_assigned")
+    execute(
+        env["url"],
+        "UPDATE tenant_credentials SET revoked_at=now() WHERE id=%s",
+        (assigned["tool_credential_id"],),
+    )
+    review = step(env, owner)
+    assert (review["state"], review["last_error"], review["resume_state"]) == (
+        "manual_review",
+        "credential_inactive",
+        "calendar_connected",
+    )
+    assert not calls(env["fake"], "get_agent")
+    # Reset re-runs the agent step, which issues a fresh credential; then it verifies.
+    assert env["client"].post(f"{BASE}/reset", headers=h(owner)).status_code == 200
+    verified = to_state(env, owner, "verified")
+    execute(
+        env["url"],
+        "UPDATE tenant_credentials SET expires_at=now() - interval '1 second' WHERE id=%s",
+        (verified["tool_credential_id"],),
+    )
+    r = env["client"].post(f"{BASE}/activate", headers=h(owner))
+    assert r.status_code == 409 and "credential" in r.json()["detail"]
 
 
 # Activation
@@ -879,6 +1063,12 @@ def client(handler):
     return BolnaClient("synthetic-bolna-key", http, base_url="https://api.example.test")
 
 
+def test_client_list_agents_skips_malformed_items():
+    body = [agent_body(), {"agent_name": "no id"}, "junk"]
+    bolna = client(lambda request: httpx.Response(200, json=body))
+    assert [agent.id for agent in bolna.list_agents()] == [AGENT]
+
+
 def test_client_get_and_list_agents_keep_only_allowlisted_fields():
     seen = []
 
@@ -917,8 +1107,7 @@ def test_client_agent_reads_map_errors():
     bolna = client(lambda request: next(responses))
     with pytest.raises(ProviderRetryable):
         bolna.list_agents()
-    with pytest.raises(ProviderRetryable):
-        bolna.list_agents()
+    assert bolna.list_agents() == []  # A malformed item is skipped, not fatal.
     with pytest.raises(ProviderRetryable):
         bolna.list_agents()
     with pytest.raises(ProviderPermanent):
@@ -935,6 +1124,10 @@ def test_summarize_agent_accepts_string_encoded_tools_and_masked_tokens():
     agent = summarize_agent(body)
     assert agent.tool_urls == {"check_slots": GATEWAY + "/v1/bolna/tools/check-slots"}
     assert agent.token_credential_ids == (None,)
+    for unreadable in ("Bearer garbage", "", None, "cvt_short.***"):
+        tools["tools_params"]["check_slots"]["api_token"] = unreadable
+        body["tasks"][0]["tools_config"]["api_tools"] = tools
+        assert summarize_agent(body).token_credential_ids == (UNREADABLE,)
     assert summarize_agent({"id": "bad id"}) is None
     assert summarize_agent([]) is None
 
@@ -1130,6 +1323,98 @@ def test_manual_activation_checks_prerequisites_and_opens_the_line(env, capsys):
         manual(env)
 
 
+def test_hand_configured_clinic_cannot_start_api_provisioning(env):
+    owner = headers(env)
+    connect_calendar(env)
+    approve_scripts(env, owner)
+    execute(
+        env["url"],
+        "UPDATE clinics SET bolna_agent_id='77777777-7777-4777-8777-777777777777' WHERE id=%s",
+        (CLINIC,),
+    )
+    for r in (
+        advance(env, owner),
+        select(env, owner),
+        env["client"].post(f"{BASE}/reset", headers=h(owner)),
+        env["client"].post(f"{BASE}/activate", headers=h(owner)),
+    ):
+        assert r.status_code == 409 and r.json()["detail"] == service.MANUAL_SETUP
+    assert rows(env["url"], "SELECT * FROM provisioning") == []
+    manual(env)
+    assert state(env, owner)["state"] == "active"
+
+
+def test_manual_activation_accepts_an_untouched_draft_row(env):
+    owner = headers(env)
+    connect_calendar(env)
+    approve_scripts(env, owner)
+    assert select(env, owner).status_code == 200  # Creates the draft row.
+    execute(
+        env["url"],
+        "UPDATE clinics SET bolna_agent_id='77777777-7777-4777-8777-777777777777' WHERE id=%s",
+        (CLINIC,),
+    )
+    manual(env)
+    view = state(env, owner)
+    assert (view["state"], view["agent_id"]) == ("active", "77777777-7777-4777-8777-777777777777")
+
+
+def test_manual_activation_refuses_an_agent_used_elsewhere(env):
+    owner = headers(env)
+    connect_calendar(env)
+    approve_scripts(env, owner)
+    agent = "77777777-7777-4777-8777-777777777777"
+    execute(env["url"], "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s", (agent, CLINIC))
+    execute(
+        env["url"],
+        "UPDATE clinics SET bolna_outbound_agent_id=%s WHERE id=%s",
+        (agent, OTHER_CLINIC),
+    )
+    with pytest.raises(SystemExit, match="in use elsewhere"):
+        manual(env)
+
+
+def test_manual_activation_reports_a_concurrent_change_cleanly(env, monkeypatch):
+    def collide(conn, clinic_id):
+        raise psycopg.errors.UniqueViolation("synthetic")
+
+    monkeypatch.setattr(service, "activate_manual", collide)
+    with pytest.raises(SystemExit, match="Concurrent change"):
+        manual(env)
+
+
+def test_concurrent_number_selection_returns_409(env):
+    owner = headers(env)
+    execute(
+        env["url"],
+        "INSERT INTO provisioning (clinic_id) VALUES (%s)",
+        (OTHER_CLINIC,),
+    )
+    with connect(env["url"]) as blocker:
+        # Another clinic takes the number; uncommitted, so the taken check cannot see it and
+        # the selection waits on the unique index until it commits.
+        blocker.execute(
+            "UPDATE provisioning SET phone_number_id=%s WHERE clinic_id=%s",
+            (NUMBER_ID, OTHER_CLINIC),
+        )
+        with ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(select, env, owner)
+            waited = rows(
+                env["url"],
+                "SELECT count(*) AS n FROM pg_stat_activity WHERE wait_event_type='Lock'",
+            )
+            for _ in range(50):
+                if waited[0]["n"]:
+                    break
+                waited = rows(
+                    env["url"],
+                    "SELECT count(*) AS n FROM pg_stat_activity WHERE wait_event_type='Lock'",
+                )
+            blocker.commit()
+            r = pending.result(timeout=30)
+    assert r.status_code == 409 and r.json()["detail"] == "That number cannot be selected"
+
+
 def test_manual_activation_refuses_a_provisioned_clinic(env):
     owner = headers(env)
     connect_calendar(env)
@@ -1137,3 +1422,20 @@ def test_manual_activation_refuses_a_provisioned_clinic(env):
     to_state(env, owner, "agent_created")
     with pytest.raises(SystemExit, match="already has provisioning"):
         manual(env)
+
+
+def test_line_closed_after_the_first_check_refuses_the_write(env, monkeypatch):
+    token = tool_token(env)
+    set_line(env, "verified+test")
+    original = gateway.upsert_session
+
+    def upsert_then_close(conn, *args, **kwargs):
+        session = original(conn, *args, **kwargs)
+        # The owner turns test calls off between the route's check and the write.
+        execute(env["url"], "UPDATE clinics SET test_calls_enabled=false WHERE id=%s", (CLINIC,))
+        return session
+
+    monkeypatch.setattr(gateway, "upsert_session", upsert_then_close)
+    r = call_tool(env, token, "reserve-slot")
+    assert r.status_code == 403 and r.json() == {"detail": gateway.NOT_ACCEPTING}
+    assert rows(env["url"], "SELECT id FROM appointments") == []

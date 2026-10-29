@@ -25,6 +25,7 @@ with ids only. No credential, provider body or phone number is stored or logged.
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
+from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from clinic_voice.audit import audit
@@ -47,6 +48,10 @@ NEXT = {
 }
 NUMBER_SELECTABLE = ("draft", "calendar_connected", "agent_created")
 RESETTABLE = ("failed", "manual_review")
+# Errors after which the owner may clear an ambiguous create intent (reset with
+# confirm_no_stray_agent): the lookup could not rule out an agent created by a lost write.
+STRAY_AGENT_ERRORS = ("create_uncertain", "lease_lost")
+MANUAL_SETUP = "Manual setup: use clinic-voice provisioning activate-manual"
 EVENT_LIMIT = 50
 
 COLUMNS = (
@@ -82,6 +87,33 @@ def record(conn, clinic_id, from_state, to_state, step, outcome, actor_id=None) 
         "INSERT INTO provisioning_events (id,clinic_id,from_state,to_state,step,outcome,actor_id)"
         " VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (uuid4(), clinic_id, from_state, to_state, step, outcome, actor_id),
+    )
+
+
+def agent_taken(conn, clinic_id, agent_id) -> bool:
+    """Whether agent_id belongs elsewhere: this clinic's outbound agent, or any other
+    clinic's provisioned, inbound or outbound agent. The Bolna account is shared, so a name
+    or id lookup could return another clinic's agent; it must never be overwritten."""
+    row = conn.execute(
+        """SELECT EXISTS (SELECT 1 FROM provisioning WHERE agent_id=%(a)s AND clinic_id<>%(c)s)
+        OR EXISTS (SELECT 1 FROM clinics WHERE id<>%(c)s
+            AND (bolna_agent_id=%(a)s OR bolna_outbound_agent_id=%(a)s))
+        OR EXISTS (SELECT 1 FROM clinics WHERE id=%(c)s AND bolna_outbound_agent_id=%(a)s)
+        AS taken""",
+        {"a": agent_id, "c": clinic_id},
+    ).fetchone()
+    return row["taken"]
+
+
+def credential_active(conn, clinic_id, credential_id) -> bool:
+    """The tool credential exists for this clinic, is unrevoked and unexpired."""
+    return (
+        conn.execute(
+            "SELECT 1 FROM tenant_credentials WHERE clinic_id=%s AND id=%s AND scope='tools'"
+            " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+            (clinic_id, credential_id),
+        ).fetchone()
+        is not None
     )
 
 
@@ -138,6 +170,7 @@ def view(conn, clinic_id):
             "resume_state": "draft",
             "agent_id": None,
             "agent_name": None,
+            "agent_create_pending": False,
             "tool_credential_id": None,
             "phone_number_id": None,
             "attempts": {"calendar": 0, "agent": 0, "number": 0, "verify": 0},
@@ -152,6 +185,7 @@ def view(conn, clinic_id):
         "resume_state": row["resume_state"],
         "agent_id": row["agent_id"],
         "agent_name": row["agent_name"],
+        "agent_create_pending": row["agent_create_pending"],
         "tool_credential_id": row["tool_credential_id"],
         "phone_number_id": row["phone_number_id"],
         "attempts": _attempts(row),
@@ -164,6 +198,17 @@ def view(conn, clinic_id):
 
 
 def _locked(conn, clinic_id):
+    """The clinic's provisioning row, created as draft if missing and locked. A clinic set
+    up by hand (agent id recorded, no row) is refused: a draft row would only start a second
+    agent for it; the operator activates it with activate-manual instead."""
+    row = load(conn, clinic_id, lock=True)
+    if row is not None:
+        return row
+    clinic = conn.execute(
+        "SELECT bolna_agent_id FROM clinics WHERE id=%s FOR SHARE", (clinic_id,)
+    ).fetchone()
+    if clinic is not None and clinic["bolna_agent_id"] is not None:
+        raise HTTPException(409, MANUAL_SETUP)
     ensure(conn, clinic_id)
     return load(conn, clinic_id, lock=True)
 
@@ -208,11 +253,16 @@ def select_number(conn, staff, phone_number_id):
     if taken:
         # Same response as any other conflict: do not reveal which clinic holds it.
         raise HTTPException(409, "That number cannot be selected")
-    conn.execute(
-        "UPDATE provisioning SET phone_number_id=%s, last_error=NULL, version=version + 1,"
-        " updated_at=now() WHERE clinic_id=%s",
-        (phone_number_id, clinic_id),
-    )
+    try:
+        with conn.transaction():
+            conn.execute(
+                "UPDATE provisioning SET phone_number_id=%s, last_error=NULL,"
+                " version=version + 1, updated_at=now() WHERE clinic_id=%s",
+                (phone_number_id, clinic_id),
+            )
+    except UniqueViolation:
+        # Another clinic selected it concurrently (unique index on phone_number_id).
+        raise HTTPException(409, "That number cannot be selected") from None
     record(
         conn, clinic_id, row["state"], row["state"], "select_number", "number_selected", staff["id"]
     )
@@ -243,6 +293,10 @@ def activate(conn, staff):
         raise HTTPException(409, "Approved emergency and handoff scripts are required")
     if clinic["bolna_agent_id"] != row["agent_id"]:
         raise HTTPException(409, "The clinic's agent changed; reset and verify again")
+    if row["tool_credential_id"] is None or not credential_active(
+        conn, clinic_id, row["tool_credential_id"]
+    ):
+        raise HTTPException(409, "The agent's tool credential is no longer active")
     conn.execute(
         "UPDATE provisioning SET state='active', last_error=NULL, version=version + 1,"
         " updated_at=now() WHERE clinic_id=%s",
@@ -253,25 +307,44 @@ def activate(conn, staff):
     return view(conn, clinic_id)
 
 
-def reset(conn, staff):
-    """failed | manual_review -> resume_state (owner). Clears the error, the step attempt
-    counters and the create intent: the owner asserts that the provider state was checked
-    (for an ambiguous create, that no stray agent named agent_name exists, or that it is the
-    one to keep; the next step looks it up again by name either way)."""
+def reset(conn, staff, confirm_no_stray_agent=False):
+    """failed | manual_review -> resume_state (owner). Clears the error and the step attempt
+    counters. An ambiguous create intent (agent_create_pending) is kept, so the next agent
+    step still refuses to create while the lookup cannot rule out a stray agent. Clearing it
+    needs confirm_no_stray_agent: the owner checked the Bolna account and no agent named
+    agent_name exists. It is accepted only after create_uncertain or lease_lost; it also
+    revokes the credential that the lost write may have handed to that agent."""
     clinic_id = staff["clinic_id"]
     row = _locked(conn, clinic_id)
     if row["state"] not in RESETTABLE:
         raise HTTPException(409, "Only failed or manual_review provisioning can be reset")
     if step_pending(conn, clinic_id):
         raise HTTPException(409, "A provisioning step is already pending")
+    pending = row["agent_create_pending"]
+    if confirm_no_stray_agent:
+        if not pending or row["last_error"] not in STRAY_AGENT_ERRORS:
+            raise HTTPException(409, "There is no uncertain agent create to confirm")
+        held = row["attempt_credential_id"]
+        if held is not None and held != row["tool_credential_id"]:
+            from clinic_voice import credentials
+
+            credentials.revoke(conn, held)
+        pending = False
     conn.execute(
-        "UPDATE provisioning SET state=resume_state, last_error=NULL, agent_create_pending=false,"
+        "UPDATE provisioning SET state=resume_state, last_error=NULL, agent_create_pending=%s,"
+        " attempt_credential_id=CASE WHEN %s THEN attempt_credential_id END,"
         " calendar_attempts=0, agent_attempts=0, number_attempts=0, verify_attempts=0,"
         " version=version + 1, updated_at=now() WHERE clinic_id=%s",
-        (clinic_id,),
+        (pending, pending, clinic_id),
     )
-    record(conn, clinic_id, row["state"], row["resume_state"], "reset", "reset", staff["id"])
-    audit(conn, clinic_id, staff["id"], "provisioning.reset")
+    outcome = "reset_confirmed_no_stray_agent" if confirm_no_stray_agent else "reset"
+    record(conn, clinic_id, row["state"], row["resume_state"], "reset", outcome, staff["id"])
+    audit(
+        conn,
+        clinic_id,
+        staff["id"],
+        "provisioning.reset_confirmed" if confirm_no_stray_agent else "provisioning.reset",
+    )
     return view(conn, clinic_id)
 
 
@@ -281,11 +354,17 @@ class ManualActivationRefused(Exception):
 
 def activate_manual(conn, clinic_id) -> None:
     """Mark a clinic set up by hand (agent recorded with `bolna set-agent`, number routed in
-    the Bolna dashboard) as active, so the gateway serves it. Operator CLI only. Checks what
-    still applies: the clinic exists and has no provisioning row (provisioned clinics are
-    activated through the API), its calendar is ready, its scripts are approved and its
-    bolna_agent_id is set. Writes the row (state active, the hand-set agent id, no number
-    id) and an event with no actor, outcome manual_activation. Nothing is sent to Bolna."""
+    the Bolna dashboard) as active, so the gateway serves it. Operator CLI only.
+
+    It does NOT verify anything at Bolna (no agent, tool URL, credential or number check):
+    the operator vouches for the hand configuration. It checks what still applies locally:
+    the clinic exists; it has no provisioning row, or only an untouched draft row (no agent,
+    no credential, no step pending); its calendar is ready; its scripts are approved; its
+    bolna_agent_id is set and belongs to no other clinic (nor is its own outbound agent).
+    Writes the row (state active, the hand-set agent id, no number id) and an event with no
+    actor, outcome manual_activation. Nothing is sent to Bolna."""
+    # Lock order (locks.py): the provisioning row, then the clinic row.
+    row = load(conn, clinic_id, lock=True)
     clinic = conn.execute(
         "SELECT bolna_agent_id, emergency_text, handoff_text, scripts_approved FROM clinics"
         " WHERE id=%s FOR UPDATE",
@@ -293,7 +372,14 @@ def activate_manual(conn, clinic_id) -> None:
     ).fetchone()
     if clinic is None:
         raise ManualActivationRefused("Clinic not found")
-    if load(conn, clinic_id, lock=True) is not None:
+    if row is not None and not (
+        row["state"] == "draft"
+        and row["agent_id"] is None
+        and row["attempt_credential_id"] is None
+        and row["tool_credential_id"] is None
+        and not row["agent_create_pending"]
+        and not step_pending(conn, clinic_id)
+    ):
         raise ManualActivationRefused(
             "Clinic already has provisioning state; use the provisioning API"
         )
@@ -307,14 +393,25 @@ def activate_manual(conn, clinic_id) -> None:
         raise ManualActivationRefused("Approved emergency and handoff scripts are required")
     if not calendar_ready(conn, clinic_id):
         raise ManualActivationRefused("Connect a calendar and map a doctor first")
-    if conn.execute(
-        "SELECT 1 FROM provisioning WHERE agent_id=%s", (clinic["bolna_agent_id"],)
-    ).fetchone():
-        raise ManualActivationRefused("That agent is provisioned for another clinic")
-    conn.execute(
-        "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
-        " VALUES (%s,'active','verified',%s)",
-        (clinic_id, clinic["bolna_agent_id"]),
-    )
+    if agent_taken(conn, clinic_id, clinic["bolna_agent_id"]):
+        raise ManualActivationRefused("That agent is in use elsewhere")
+    try:
+        with conn.transaction():
+            if row is None:
+                conn.execute(
+                    "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id)"
+                    " VALUES (%s,'active','verified',%s)",
+                    (clinic_id, clinic["bolna_agent_id"]),
+                )
+            else:
+                conn.execute(
+                    "UPDATE provisioning SET state='active', resume_state='verified',"
+                    " agent_id=%s, last_error=NULL, version=version + 1, updated_at=now()"
+                    " WHERE clinic_id=%s",
+                    (clinic["bolna_agent_id"], clinic_id),
+                )
+    except UniqueViolation:
+        # Concurrent activation of this clinic, or the agent was provisioned elsewhere.
+        raise ManualActivationRefused("Concurrent change; check the state and retry") from None
     record(conn, clinic_id, "draft", "active", "activate", "manual_activation")
     audit(conn, clinic_id, None, "provisioning.manual_activation")

@@ -288,6 +288,8 @@ def bolna_agent_command(url, args):
 def provisioning_command(url, args):
     """activate-manual: mark a hand-configured clinic active (provisioning.activate_manual).
     Prints a fixed reason when a prerequisite is missing."""
+    import psycopg
+
     from clinic_voice import provisioning
 
     with connect(url) as conn:
@@ -296,6 +298,9 @@ def provisioning_command(url, args):
         except provisioning.ManualActivationRefused as error:
             conn.rollback()
             raise SystemExit(str(error)) from None
+        except psycopg.errors.IntegrityError:
+            conn.rollback()
+            raise SystemExit("Concurrent change; check the state and retry") from None
     print(f"provisioning state=active clinic={args.clinic}")
 
 

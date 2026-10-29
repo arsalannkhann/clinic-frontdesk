@@ -35,6 +35,7 @@ and the API key are never logged or raised; httpx errors are not chained.
 """
 
 import json
+import logging
 import math
 import re
 import time
@@ -59,6 +60,7 @@ DEFAULT_BASE = "https://api.bolna.ai"
 DEFAULT_TIMEOUT = 10.0
 # Largest response body read from the API; larger bodies are cut off like a timeout.
 MAX_RESPONSE_BYTES = 1024 * 1024
+log = logging.getLogger(__name__)
 # httpx timeouts apply per operation (connect, write, each read), so
 # each gets timeout_seconds / 3 and the whole call is also checked against timeout_seconds
 # while the body streams. A call therefore ends within about 4/3 of timeout_seconds, which
@@ -248,8 +250,9 @@ class PhoneNumber:
 @dataclass(frozen=True)
 class Agent:
     """Allowlisted agent fields. tool_urls maps tool name -> URL; token_credential_ids holds,
-    per tool, the tenant credential id (hex) of its api_token, or None when the token is
-    absent, masked or not a tool credential. No secret, prompt or other field is kept."""
+    per tool, the tenant credential id (hex) of its api_token, None when the token is masked
+    (only asterisks, optionally after "Bearer "), or UNREADABLE when it is absent or not a
+    tool credential. No secret, prompt or other field is kept."""
 
     id: str
     name: str | None
@@ -267,12 +270,20 @@ def _maybe_json(value):
     return value
 
 
+UNREADABLE = "unreadable"  # Not a hex id, so it never equals a credential id.
+MASKED_TOKEN = re.compile(r"(Bearer +)?\*+")
+
+
 def _credential_id(api_token) -> str | None:
+    """The credential id (hex) of a tool token; None only for a true mask; UNREADABLE for
+    anything else (absent, empty, another format), which verification treats as a mismatch."""
     if not isinstance(api_token, str):
+        return UNREADABLE
+    if MASKED_TOKEN.fullmatch(api_token):
         return None
     scheme, _, token = api_token.partition(" ")
     parsed = credentials.parse(token if scheme == "Bearer" else api_token)
-    return None if parsed is None else parsed[0].hex
+    return UNREADABLE if parsed is None else parsed[0].hex
 
 
 def summarize_agent(body) -> Agent | None:
@@ -645,10 +656,14 @@ class BolnaClient:
         body = _json(response)
         if not isinstance(body, list):
             raise ProviderRetryable("malformed")
+        # The shared account returns every agent in one response (no pagination or name
+        # filter is documented), bounded by MAX_RESPONSE_BYTES. An item without a usable id
+        # is skipped (it cannot match a name lookup or a stored id); it is counted, not logged.
         agents = [summarize_agent(item) for item in body]
-        if any(agent is None for agent in agents):
-            raise ProviderRetryable("malformed")
-        return agents
+        skipped = sum(agent is None for agent in agents)
+        if skipped:
+            log.info("bolna list_agents skipped malformed items count=%s", skipped)
+        return [agent for agent in agents if agent is not None]
 
     def get_execution(self, execution_id):
         response = self._send("GET", f"/executions/{_safe_id(execution_id)}", write=False)

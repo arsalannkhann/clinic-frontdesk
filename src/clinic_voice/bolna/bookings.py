@@ -34,7 +34,7 @@ from fastapi import HTTPException
 from psycopg.errors import ExclusionViolation, UniqueViolation
 
 from clinic_voice import appointments, patients, reminders, service
-from clinic_voice.bolna.gateway import derive_key
+from clinic_voice.bolna.gateway import derive_key, require_line
 from clinic_voice.db import connect
 from clinic_voice.domain import ACTIVE_STATUSES, normalize_reference, spoken_reference
 from clinic_voice.locks import lock_doctors
@@ -204,6 +204,7 @@ def cancel(conn, clinic_id, session_id, request):
             ),
         }
     _lock(conn, clinic_id, key)  # Lock order 1.
+    require_line(conn, clinic_id, True, lock=True)  # Lock order 1b: the line is still open.
     if _change(conn, clinic_id, key) is None:
         locked = appointments.lock_appointment(conn, clinic_id, row["id"])  # Lock order 5.
         _changeable(locked)
@@ -265,6 +266,7 @@ def reschedule(url, clinic_id, session_id, request, retention_days: int):
     try:
         with connect(url) as conn:
             _lock(conn, clinic_id, key)
+            require_line(conn, clinic_id, True, lock=True)  # Lock order 1b.
             done = _replayed(conn, clinic_id, key, request_hash, row, zone)
             if done:
                 return done
@@ -367,6 +369,7 @@ def opt_out(conn, clinic_id, session_id, request):
                 f" {_when(row['starts_at'], zone)}? Nothing has been changed yet."
             ),
         }
+    require_line(conn, clinic_id, True, lock=True)  # Lock order 1b: the line is still open.
     reminders.opt_out(
         conn, clinic_id, row["patient_id"], "all", channel, "tool", appointment_id=row["id"]
     )

@@ -253,12 +253,16 @@ def reserve(
     max_session_active=None,
     attach_patient=None,
     after_insert=None,
+    gate=None,
 ):
     """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
     session that created it (the gateway derives `key` from that session's execution id).
     max_session_active caps that session's pending_sync/confirmed appointments (409 beyond
     it); replays are never capped. attach_patient (gateway only) creates or attaches the
-    patient record inside the reservation transaction; a replay never calls it."""
+    patient record inside the reservation transaction; a replay never calls it. gate(conn)
+    (gateway only) re-checks the clinic's line inside the transaction, after the action and
+    session locks and before the doctor rows (locks.py, level 1b); it raises to refuse. A
+    replay is not re-gated (it changes nothing)."""
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
@@ -294,6 +298,8 @@ def reserve(
                 ).fetchone()["n"]
                 if held >= max_session_active:
                     raise HTTPException(409, SESSION_LIMIT_MESSAGE)
+            if gate is not None:
+                gate(conn)
             # Short DB-only lock orders competing writes for the same doctor (see locks.py).
             # GiST exclusion alone can deadlock simultaneous overlapping inserts.
             lock_doctors(conn, clinic_id, [request.doctor_id])

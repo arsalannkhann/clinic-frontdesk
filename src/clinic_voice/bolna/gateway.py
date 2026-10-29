@@ -61,15 +61,21 @@ NOT_ACCEPTING = (
 LINE_OPEN = ("verified", "active")
 
 
-def require_line(conn, clinic_id, changes: bool) -> None:
+def require_line(conn, clinic_id, changes: bool, lock: bool = False) -> None:
     """Refuse the tool (403, speakable NOT_ACCEPTING) unless the clinic's line is open:
     active for every tool; verified for context and read-only tools, and for
     booking-changing tools too while clinics.test_calls_enabled is on. A clinic without a
     provisioning row is not active. Runs before anything is written (no call session is
-    recorded for a refused request)."""
+    recorded for a refused request).
+
+    lock=True re-checks inside a booking write transaction and holds the clinic row FOR
+    SHARE until it commits (locks.py, level 1b). Every change that closes the line updates
+    the clinics row (test_calls_enabled off; a future deactivation must too), so it waits
+    for in-flight writes and none commits after the line closed."""
+    suffix = " FOR SHARE OF c" if lock else ""
     row = conn.execute(
         "SELECT p.state, c.test_calls_enabled FROM clinics c"
-        " LEFT JOIN provisioning p ON p.clinic_id = c.id WHERE c.id=%s",
+        " LEFT JOIN provisioning p ON p.clinic_id = c.id WHERE c.id=%s" + suffix,
         (clinic_id,),
     ).fetchone()
     state = row["state"] if row else None
@@ -346,6 +352,7 @@ def reserve(url, clinic_id, session_id, request, doctor_id, service_id, crypto, 
         max_session_active=MAX_SESSION_ACTIVE,
         attach_patient=attach,
         after_insert=scope_declines,
+        gate=lambda conn: require_line(conn, clinic_id, True, lock=True),
     )
     # A replay returns the appointment's current status (it may since have been confirmed,
     # cancelled or sent for review): speak that, never a fixed "reserved".

@@ -1258,7 +1258,7 @@
           "admin"
         ],
         "summary": "Reset Provisioning",
-        "description": "failed | manual_review -> the state whose step must run again (owner).",
+        "description": "failed | manual_review -> the state whose step must run again (owner). An uncertain\nagent create stays pending unless confirm_no_stray_agent is true (409 unless the last\nerror was create_uncertain or lease_lost).",
         "operationId": "reset_provisioning_v1_admin_provisioning_reset_post",
         "parameters": [
           {
@@ -1278,6 +1278,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/ProvisioningReset"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "description": "Successful Response",
@@ -4751,6 +4768,10 @@
             ],
             "title": "Agent Name"
           },
+          "agent_create_pending": {
+            "type": "boolean",
+            "title": "Agent Create Pending"
+          },
           "tool_credential_id": {
             "anyOf": [
               {
@@ -4823,6 +4844,7 @@
           "resume_state",
           "agent_id",
           "agent_name",
+          "agent_create_pending",
           "tool_credential_id",
           "phone_number_id",
           "attempts",
@@ -4833,6 +4855,18 @@
           "events"
         ],
         "title": "ProvisioningOut"
+      },
+      "ProvisioningReset": {
+        "properties": {
+          "confirm_no_stray_agent": {
+            "type": "boolean",
+            "title": "Confirm No Stray Agent",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "ProvisioningReset"
       },
       "ReminderOut": {
         "properties": {

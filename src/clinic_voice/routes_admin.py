@@ -22,6 +22,7 @@ from clinic_voice.schemas import (
     ProvisioningAdvanced,
     ProvisioningNumber,
     ProvisioningOut,
+    ProvisioningReset,
     ReminderOut,
     ReminderStatus,
     ServiceCreate,
@@ -195,7 +196,10 @@ def activate_provisioning(staff=Depends(owner)):
 
 
 @router.post("/provisioning/reset", response_model=ProvisioningOut)
-def reset_provisioning(staff=Depends(owner)):
-    """failed | manual_review -> the state whose step must run again (owner)."""
+def reset_provisioning(body: ProvisioningReset | None = None, staff=Depends(owner)):
+    """failed | manual_review -> the state whose step must run again (owner). An uncertain
+    agent create stays pending unless confirm_no_stray_agent is true (409 unless the last
+    error was create_uncertain or lease_lost)."""
+    confirm = body.confirm_no_stray_agent if body is not None else False
     with database() as conn:
-        return provisioning.reset(conn, staff)
+        return provisioning.reset(conn, staff, confirm_no_stray_agent=confirm)
