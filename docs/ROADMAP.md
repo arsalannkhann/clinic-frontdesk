@@ -16,11 +16,15 @@ Acceptance: tenant A cannot reference tenant B IDs; revoked keys fail; two worke
 
 Add minimum patient contact information with consent/retention/encryption, verified call/session context, explicit booking confirmation, opaque booking lookup, verified cancel/reschedule, audit transitions. Require appointment reference and caller verification rather than phone-only lookup. Build a trusted gateway translating Bolna tools to backend APIs with stable action IDs.
 
+Progress (T6): call sessions (migration 011; caller number encrypted and HMAC-hashed), the Bolna tool gateway (check-slots, reserve-slot with server-derived idempotency keys, session-bound appointment-status) and the context endpoint are implemented and PostgreSQL-tested. Not yet: identity verification, booking references, cancel/reschedule, session end/retention, patient contact data.
+
 Acceptance: shared-phone caller cannot enumerate or modify another person's bookings; failed reschedule preserves old slot; retry/cancel races yield one consistent state; cancelled bookings free slots only under the documented sync policy.
 
 ## 3 Bolna voice and clinic provisioning
 
-Validate current hosted agent, tool, graph, language and voice schemas. Start with a working narrow booking flow; introduce graph-enforced actions when contract-tested. Persist provisioning steps and reconcile failures. Connect an existing verified test number before automating purchase. Human transfer, after-hours policy, emergency script, interruption behavior and no-confirm-before-tool-success are mandatory.
+Validate current hosted agent, tool, graph, language and voice schemas.
+
+Progress (T6): official docs re-read on 29 October 2026 (SOURCE_REVIEW.md); an agent configuration compiler with sanitized contract fixtures, `clinic-voice bolna compile-agent`, and a `BolnaPort` with fake and httpx client (MockTransport only) exist. Nothing has been validated against the live API; provisioning, number assignment and test calls remain. Start with a working narrow booking flow; introduce graph-enforced actions when contract-tested. Persist provisioning steps and reconcile failures. Connect an existing verified test number before automating purchase. Human transfer, after-hours policy, emergency script, interruption behavior and no-confirm-before-tool-success are mandatory.
 
 Acceptance: authorized test calls complete English/Hindi/Hinglish flows; caller correction and date read-back work; provider failures give a safe fallback. Record measured latency/cost and sanitized contract fixtures. No promises of instantaneous number allocation or error-free transcription.
 

@@ -26,17 +26,33 @@ class Settings(BaseSettings):
     app_env: str = "production"
     # "kid1:<base64 32 bytes>,kid2:..." - the first key encrypts; all keys decrypt.
     token_encryption_keys: SecretStr | None = None
-    # base64 32 bytes; HMAC key for crypto.phone_hash. Not used yet: reserved for caller
-    # lookup in T6/T7.
+    # base64 32 bytes; HMAC key for crypto.phone_hash. Required by the Bolna gateway, which
+    # hashes the provider-asserted caller number of each call session (503 when unset).
     phone_hash_key: SecretStr | None = None
     google_client_id: str | None = None
     google_client_secret: SecretStr | None = None
     google_redirect_uri: str | None = None
+    # Bolna platform API (providers/bolna.py). Unused by the gateway routes, which Bolna calls.
+    bolna_api_key: SecretStr | None = None
+    bolna_api_base: str = "https://api.bolna.ai"
+    # Public base URL of this API as Bolna reaches it; the agent compiler builds tool URLs
+    # from it (e.g. https://voice.clinic.example). Unset: compile-agent needs --gateway-url.
+    bolna_gateway_base_url: str | None = None
 
     @field_validator("google_redirect_uri")
     @classmethod
     def _redirect(cls, value):
         return _https_or_loopback(value, "google_redirect_uri")
+
+    @field_validator("bolna_api_base")
+    @classmethod
+    def _bolna_api(cls, value):
+        return _https_or_loopback(value, "bolna_api_base")
+
+    @field_validator("bolna_gateway_base_url")
+    @classmethod
+    def _gateway(cls, value):
+        return _https_or_loopback(value, "bolna_gateway_base_url")
 
     def google_configured(self) -> bool:
         return bool(

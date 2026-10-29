@@ -151,7 +151,9 @@ def replay(conn, clinic_id, key, fingerprint):
         return response(row)
 
 
-def reserve(url, clinic_id, request, key):
+def reserve(url, clinic_id, request, key, call_session_id=None):
+    """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
+    session that created it (the gateway derives `key` from that session's execution id)."""
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
@@ -180,8 +182,8 @@ def reserve(url, clinic_id, request, key):
             ends_at = request.starts_at + timedelta(minutes=context["duration_minutes"])
             row = conn.execute(
                 """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,ends_at,
-                blocks_until,status,idempotency_key,request_hash)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s) RETURNING *""",
+                blocks_until,status,idempotency_key,request_hash,call_session_id)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s) RETURNING *""",
                 (
                     appointment_id,
                     clinic_id,
@@ -192,6 +194,7 @@ def reserve(url, clinic_id, request, key):
                     ends_at + timedelta(minutes=context["buffer_after_minutes"]),
                     key,
                     fingerprint,
+                    call_session_id,
                 ),
             ).fetchone()
             conn.execute(

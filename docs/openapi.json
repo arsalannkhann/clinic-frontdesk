@@ -1199,6 +1199,250 @@
         }
       }
     },
+    "/v1/bolna/context": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Context",
+        "description": "Pre-call variables: clinic configuration only. With call context in the body (when\nused as a tool), the call session is recorded as well.",
+        "operationId": "context_v1_bolna_context_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BolnaCallContext"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Call"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaContextOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/check-slots": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Check Slots",
+        "operationId": "check_slots_v1_bolna_tools_check_slots_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaSlotQuery"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaSlotsOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/reserve-slot": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Reserve Slot",
+        "operationId": "reserve_slot_v1_bolna_tools_reserve_slot_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaReservation"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaReservationOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/appointment-status": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Appointment Status",
+        "operationId": "appointment_status_v1_bolna_tools_appointment_status_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaStatusQuery"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaStatusOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health/live": {
       "get": {
         "summary": "Live",
@@ -1821,6 +2065,318 @@
           "authorization_url"
         ],
         "title": "AuthorizationStart"
+      },
+      "BolnaCallContext": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id"
+        ],
+        "title": "BolnaCallContext"
+      },
+      "BolnaContextOut": {
+        "properties": {
+          "clinic_name": {
+            "type": "string",
+            "title": "Clinic Name"
+          },
+          "timezone": {
+            "type": "string",
+            "title": "Timezone"
+          },
+          "today": {
+            "type": "string",
+            "format": "date",
+            "title": "Today"
+          },
+          "doctors": {
+            "items": {
+              "$ref": "#/components/schemas/BolnaDoctorOut"
+            },
+            "type": "array",
+            "title": "Doctors"
+          },
+          "supported_languages": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Supported Languages"
+          },
+          "faq_text": {
+            "type": "string",
+            "title": "Faq Text"
+          },
+          "emergency_text": {
+            "type": "string",
+            "title": "Emergency Text"
+          },
+          "approved_text": {
+            "type": "boolean",
+            "title": "Approved Text"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "clinic_name",
+          "timezone",
+          "today",
+          "doctors",
+          "supported_languages",
+          "faq_text",
+          "emergency_text",
+          "approved_text"
+        ],
+        "title": "BolnaContextOut",
+        "description": "Pre-call variables. Clinic configuration only: no patient or booking data."
+      },
+      "BolnaDoctorOut": {
+        "properties": {
+          "name": {
+            "type": "string",
+            "title": "Name"
+          },
+          "services": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Services"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "name",
+          "services"
+        ],
+        "title": "BolnaDoctorOut"
+      },
+      "BolnaReservation": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "doctor": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Doctor"
+          },
+          "service": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Service"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "doctor",
+          "service",
+          "starts_at"
+        ],
+        "title": "BolnaReservation"
+      },
+      "BolnaReservationOut": {
+        "properties": {
+          "appointment_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Appointment Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "starts_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Starts At"
+          },
+          "spoken": {
+            "type": "string",
+            "title": "Spoken"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "appointment_id",
+          "status",
+          "starts_at",
+          "spoken"
+        ],
+        "title": "BolnaReservationOut"
+      },
+      "BolnaSlotQuery": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "doctor": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Doctor"
+          },
+          "service": {
+            "type": "string",
+            "maxLength": 120,
+            "minLength": 1,
+            "title": "Service"
+          },
+          "day": {
+            "type": "string",
+            "format": "date",
+            "title": "Day"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "doctor",
+          "service",
+          "day"
+        ],
+        "title": "BolnaSlotQuery"
+      },
+      "BolnaSlotsOut": {
+        "properties": {
+          "slots": {
+            "items": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "type": "array",
+            "title": "Slots"
+          },
+          "spoken": {
+            "type": "string",
+            "title": "Spoken"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "slots",
+          "spoken"
+        ],
+        "title": "BolnaSlotsOut"
+      },
+      "BolnaStatusOut": {
+        "properties": {
+          "appointment_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Appointment Id"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "spoken": {
+            "type": "string",
+            "title": "Spoken"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "appointment_id",
+          "status",
+          "spoken"
+        ],
+        "title": "BolnaStatusOut"
+      },
+      "BolnaStatusQuery": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "appointment_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Appointment Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "appointment_id"
+        ],
+        "title": "BolnaStatusQuery"
       },
       "CalendarAccountOut": {
         "properties": {

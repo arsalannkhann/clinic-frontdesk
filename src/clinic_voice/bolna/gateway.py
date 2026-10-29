@@ -1,0 +1,261 @@
+"""Trusted Bolna tool gateway: call sessions and speakable wrappers around the scheduling
+services.
+
+Trust model (see docs/SECURITY.md and ADR 0005):
+- The tenant comes only from the authenticated tool credential.
+- execution_id, from_number and agent_id are Bolna call-context values rendered into the
+  tool request. They scope the conversation (one call session per clinic and execution id)
+  but are provider-asserted: the caller number is never identity proof, is stored only as
+  ciphertext plus a keyed hash, and is never echoed, logged or audited.
+- The idempotency key of a write is derived on the server from the execution id, the tool
+  and the canonical arguments, so a Bolna retry replays the same result and the LLM never
+  supplies keys.
+- Responses are short speakable text without patient data.
+"""
+
+import hashlib
+import json
+import logging
+import re
+from datetime import UTC
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
+
+from fastapi import HTTPException
+
+from clinic_voice import service
+from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key, phone_hash
+from clinic_voice.schemas import ReservationRequest
+
+log = logging.getLogger("clinic_voice.bolna")
+
+PROVIDER = "bolna"
+KEY_PREFIX = "bolna:"
+SUPPORTED_LANGUAGES = ("en", "hi")
+E164 = re.compile(r"\+[1-9]\d{6,14}")
+NOT_CONFIGURED = "Call session storage not configured"
+PLACEHOLDER_FAQ = (
+    "No clinic-approved answers are configured. Offer to take the question to clinic staff."
+)
+PLACEHOLDER_EMERGENCY = (
+    "No clinic-approved emergency script is configured. Say you cannot help with emergencies"
+    " and ask the caller to contact local emergency services."
+)
+
+
+def session_crypto(settings) -> tuple[Keyring, bytes]:
+    """Keyring and phone-hash key for call sessions, or 503. Both are required: the gateway
+    refuses to store a caller number it cannot encrypt and hash."""
+    keys = settings.token_encryption_keys
+    hash_key = settings.phone_hash_key
+    if not keys or not keys.get_secret_value() or not hash_key or not hash_key.get_secret_value():
+        log.error("call session storage needs TOKEN_ENCRYPTION_KEYS and PHONE_HASH_KEY")
+        raise HTTPException(503, NOT_CONFIGURED)
+    try:
+        return Keyring.from_setting(keys.get_secret_value()), decode_hash_key(
+            hash_key.get_secret_value()
+        )
+    except CryptoError:
+        log.error("call session keyring or phone hash key is invalid")
+        raise HTTPException(503, NOT_CONFIGURED) from None
+
+
+def session_aad(clinic_id: UUID, session_id: UUID) -> bytes:
+    return b"call_session:" + clinic_id.bytes + session_id.bytes
+
+
+def caller_number(value: str) -> str | None:
+    """The provider-asserted number if it is E.164, else None (withheld or unrendered)."""
+    value = value.strip()
+    return value if E164.fullmatch(value) else None
+
+
+def provider_uuid(value: str) -> str | None:
+    try:
+        return str(UUID(value.strip()))
+    except ValueError:
+        return None
+
+
+def _sealed(keyring, hash_key, clinic_id, session_id, number):
+    if number is None:
+        return None, None, None
+    key_id, blob = keyring.encrypt(number.encode(), session_aad(clinic_id, session_id))
+    return blob, key_id, phone_hash(hash_key, number)
+
+
+def upsert_session(conn, clinic_id, context, crypto) -> UUID:
+    """The call session for (clinic, execution id), created on first use. A later call may
+    fill a missing caller number or agent id but never replaces one already stored.
+    Commits, so the session is recorded even when the tool itself then fails, and so that
+    service.reserve (its own connection) can reference it."""
+    keyring, hash_key = crypto
+    execution_id = str(context.execution_id)
+    agent_id = provider_uuid(context.agent_id)
+    number = caller_number(context.from_number)
+    session_id = uuid4()
+    blob, key_id, digest = _sealed(keyring, hash_key, clinic_id, session_id, number)
+    row = conn.execute(
+        """INSERT INTO call_sessions (id,clinic_id,provider,execution_id,agent_id,
+        caller_number_ciphertext,caller_number_key_id,caller_number_hash)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        ON CONFLICT (clinic_id, execution_id) DO NOTHING RETURNING id""",
+        (session_id, clinic_id, PROVIDER, execution_id, agent_id, blob, key_id, digest),
+    ).fetchone()
+    if row:
+        conn.commit()
+        return row["id"]
+    row = conn.execute(
+        """SELECT id, status, agent_id, caller_number_hash IS NULL AS no_number
+        FROM call_sessions WHERE clinic_id=%s AND execution_id=%s FOR UPDATE""",
+        (clinic_id, execution_id),
+    ).fetchone()
+    if row["status"] != "active":
+        raise HTTPException(409, "This call has ended")
+    if row["no_number"] and number is not None:
+        blob, key_id, digest = _sealed(keyring, hash_key, clinic_id, row["id"], number)
+        conn.execute(
+            """UPDATE call_sessions SET caller_number_ciphertext=%s, caller_number_key_id=%s,
+            caller_number_hash=%s WHERE clinic_id=%s AND id=%s AND caller_number_hash IS NULL""",
+            (blob, key_id, digest, clinic_id, row["id"]),
+        )
+    if row["agent_id"] is None and agent_id is not None:
+        conn.execute(
+            "UPDATE call_sessions SET agent_id=%s WHERE clinic_id=%s AND id=%s",
+            (agent_id, clinic_id, row["id"]),
+        )
+    conn.commit()
+    return row["id"]
+
+
+def derive_key(execution_id: UUID, tool: str, args: dict) -> str:
+    """bolna:<execution_id>:<tool>:<sha256(canonical json args)[:24]>."""
+    canonical = json.dumps(args, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode()).hexdigest()[:24]
+    return f"{KEY_PREFIX}{execution_id}:{tool}:{digest}"
+
+
+def _normal(name: str) -> str:
+    return " ".join(name.split()).casefold()
+
+
+def resolve(conn, clinic_id, doctor: str, service_name: str) -> tuple[UUID, UUID]:
+    """Map spoken catalog names (as listed by /v1/bolna/context) to this clinic's active
+    doctor and service ids. Exact match after case and whitespace folding; never fuzzy."""
+    doctors = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id, name FROM doctors WHERE clinic_id=%s AND active", (clinic_id,)
+        ).fetchall()
+        if _normal(row["name"]) == _normal(doctor)
+    ]
+    if not doctors:
+        raise HTTPException(404, "I could not find that doctor at this clinic.")
+    if len(doctors) > 1:
+        raise HTTPException(409, "More than one doctor has that name; clinic staff must help.")
+    services = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id, name FROM services WHERE clinic_id=%s AND doctor_id=%s AND active",
+            (clinic_id, doctors[0]),
+        ).fetchall()
+        if _normal(row["name"]) == _normal(service_name)
+    ]
+    if not services:
+        raise HTTPException(404, "That doctor does not offer that service.")
+    if len(services) > 1:
+        raise HTTPException(409, "More than one service has that name; clinic staff must help.")
+    return doctors[0], services[0]
+
+
+def _clinic_zone(conn, clinic_id) -> ZoneInfo:
+    row = conn.execute("SELECT timezone FROM clinics WHERE id=%s", (clinic_id,)).fetchone()
+    return ZoneInfo(row["timezone"])
+
+
+def _clock(moment) -> str:
+    return moment.strftime("%I:%M %p").lstrip("0")
+
+
+def spoken_slots(starts, zone, day) -> str:
+    when = day.strftime("%A %d %B").replace(" 0", " ")
+    if not starts:
+        return f"There are no open times on {when}."
+    times = [_clock(s.astimezone(zone)) for s in starts]
+    listed = times[0] if len(times) == 1 else ", ".join(times[:-1]) + " or " + times[-1]
+    return f"Open times on {when}: {listed}."
+
+
+def check_slots(conn, clinic_id, query):
+    doctor_id, service_id = resolve(conn, clinic_id, query.doctor, query.service)
+    available = service.slots(conn, clinic_id, doctor_id, service_id, query.day)[:3]
+    zone = _clinic_zone(conn, clinic_id)
+    return {"slots": available, "spoken": spoken_slots(available, zone, query.day)}
+
+
+def reserve(url, conn, clinic_id, session_id, request):
+    doctor_id, service_id = resolve(conn, clinic_id, request.doctor, request.service)
+    args = {
+        "doctor_id": str(doctor_id),
+        "service_id": str(service_id),
+        "starts_at": request.starts_at.astimezone(UTC).isoformat(),
+    }
+    key = derive_key(request.execution_id, "reserve-slot", args)
+    result = service.reserve(
+        url,
+        clinic_id,
+        ReservationRequest(doctor_id=doctor_id, service_id=service_id, starts_at=request.starts_at),
+        key,
+        call_session_id=session_id,
+    )
+    return {
+        "appointment_id": result["appointment_id"],
+        "status": result["status"],
+        "starts_at": result["starts_at"],
+        "spoken": result["spoken_confirmation"],
+    }
+
+
+def appointment_status(conn, clinic_id, query):
+    """Only appointments created in this same call session (clinic + execution id)."""
+    row = conn.execute(
+        """SELECT a.id, a.status FROM appointments a
+        JOIN call_sessions s ON s.clinic_id=a.clinic_id AND s.id=a.call_session_id
+        WHERE a.clinic_id=%s AND a.id=%s AND s.execution_id=%s""",
+        (clinic_id, query.appointment_id, str(query.execution_id)),
+    ).fetchone()
+    if not row:
+        raise HTTPException(404, "I cannot find that request in this call.")
+    return {
+        "appointment_id": row["id"],
+        "status": row["status"],
+        "spoken": service.spoken_status(row["status"]),
+    }
+
+
+def clinic_context(conn, clinic_id):
+    clinic = conn.execute("SELECT name, timezone FROM clinics WHERE id=%s", (clinic_id,)).fetchone()
+    if not clinic:
+        raise HTTPException(404, "Clinic not found")
+    rows = conn.execute(
+        """SELECT d.id, d.name AS doctor, s.name AS service FROM doctors d
+        LEFT JOIN services s ON s.clinic_id=d.clinic_id AND s.doctor_id=d.id AND s.active
+        WHERE d.clinic_id=%s AND d.active ORDER BY d.name, d.id, s.name""",
+        (clinic_id,),
+    ).fetchall()
+    doctors = {}
+    for row in rows:
+        entry = doctors.setdefault(row["id"], {"name": row["doctor"], "services": []})
+        if row["service"] is not None:
+            entry["services"].append(row["service"])
+    zone = ZoneInfo(clinic["timezone"])
+    return {
+        "clinic_name": clinic["name"],
+        "timezone": clinic["timezone"],
+        "today": service.utc_now().astimezone(zone).date(),
+        "doctors": list(doctors.values()),
+        "supported_languages": list(SUPPORTED_LANGUAGES),
+        "faq_text": PLACEHOLDER_FAQ,
+        "emergency_text": PLACEHOLDER_EMERGENCY,
+        "approved_text": False,
+    }

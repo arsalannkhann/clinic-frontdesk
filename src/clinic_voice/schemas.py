@@ -346,3 +346,77 @@ class CalendarAccountOut(StrictModel):
     connected_by: UUID
     created_at: AwareDatetime
     revoked_at: AwareDatetime | None
+
+
+# Bolna trusted gateway (routes_bolna.py). Bolna renders each tool's `param` template with
+# %(name)s specifiers, so every value arrives as a string. execution_id, from_number and
+# agent_id are Bolna call-context variables (docs/SOURCE_REVIEW.md): provider-asserted call
+# metadata, never tenant or caller identity. The tenant comes only from the tool credential.
+# Unknown fields are rejected like everywhere else.
+ProviderNumber = Annotated[str, BeforeValidator(_no_control_characters), Field(max_length=32)]
+CatalogName = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+]
+
+
+class BolnaCallContext(StrictModel):
+    execution_id: UUID
+    # The number that initiated the call. Stored encrypted when it is E.164, else ignored
+    # (withheld numbers, unrendered templates). Never echoed.
+    from_number: ProviderNumber = ""
+    # Recorded when it is a UUID (Bolna agent ids are), else ignored like from_number.
+    agent_id: Annotated[str, BeforeValidator(_no_control_characters), Field(max_length=64)] = ""
+
+
+class BolnaSlotQuery(BolnaCallContext):
+    doctor: CatalogName
+    service: CatalogName
+    day: date
+
+
+class BolnaReservation(BolnaCallContext):
+    doctor: CatalogName
+    service: CatalogName
+    starts_at: AwareDatetime
+
+
+class BolnaStatusQuery(BolnaCallContext):
+    appointment_id: UUID
+
+
+class BolnaSlotsOut(StrictModel):
+    slots: list[AwareDatetime]
+    spoken: str
+
+
+class BolnaReservationOut(StrictModel):
+    appointment_id: UUID
+    status: str
+    starts_at: AwareDatetime
+    spoken: str
+
+
+class BolnaStatusOut(StrictModel):
+    appointment_id: UUID
+    status: str
+    spoken: str
+
+
+class BolnaDoctorOut(StrictModel):
+    name: str
+    services: list[str]
+
+
+class BolnaContextOut(StrictModel):
+    """Pre-call variables. Clinic configuration only: no patient or booking data."""
+
+    clinic_name: str
+    timezone: str
+    today: date
+    doctors: list[BolnaDoctorOut]
+    supported_languages: list[str]
+    faq_text: str
+    emergency_text: str
+    approved_text: bool  # False: the two texts above are placeholders, not clinic-approved.

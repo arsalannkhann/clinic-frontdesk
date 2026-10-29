@@ -175,6 +175,30 @@ def worker_command(url, args, settings):
     run_loop(url, worker_id, ports, stop, interval=args.interval)
 
 
+def bolna_command(url, args, settings):
+    """Print a compiled agent payload for review. The tool token is never needed or printed:
+    the payload is compiled with a redaction placeholder. Nothing is sent to Bolna."""
+    import json
+
+    from clinic_voice.bolna import agent_config
+
+    base = args.gateway_url or settings.bolna_gateway_base_url
+    if not base:
+        raise SystemExit("Set BOLNA_GATEWAY_BASE_URL or pass --gateway-url")
+    with connect(url) as conn:
+        try:
+            clinic = agent_config.load_clinic(conn, args.clinic)
+        except LookupError as error:
+            raise SystemExit(str(error)) from None
+    try:
+        payload = agent_config.compile_agent(
+            clinic, gateway_base_url=base, tool_token=agent_config.REDACTED
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from None
+    print(json.dumps(agent_config.redact(payload), indent=2, ensure_ascii=False))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="clinic-voice")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -210,6 +234,13 @@ def main(argv=None):
     )
     worker.add_argument("--worker-id", help="Lease owner name (default host:pid)")
     worker.add_argument("--interval", type=float, default=2.0, help="Idle poll seconds")
+    bolna = commands.add_parser("bolna", help="Bolna agent configuration (offline only)")
+    bolna_actions = bolna.add_subparsers(dest="action", required=True)
+    compile_agent = bolna_actions.add_parser(
+        "compile-agent", help="Print the agent payload with the tool token redacted"
+    )
+    compile_agent.add_argument("--clinic", type=UUID, required=True)
+    compile_agent.add_argument("--gateway-url", help="Public base URL (default from settings)")
     args = parser.parse_args(argv)
     if args.command == "worker" and not 0.1 <= args.interval <= 300:
         parser.error("--interval must be between 0.1 and 300 seconds")
@@ -243,5 +274,7 @@ def main(argv=None):
         staff_command(url, args)
     elif args.command == "worker":
         worker_command(url, args, settings)
+    elif args.command == "bolna":
+        bolna_command(url, args, settings)
     else:
         credential_command(url, args)

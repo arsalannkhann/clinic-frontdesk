@@ -9,10 +9,12 @@ from fastapi.responses import JSONResponse
 from psycopg import Error as DatabaseError
 
 from clinic_voice import staff as staff_service
+from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tenant
 from clinic_voice.errors import NotFound
 from clinic_voice.routes_admin import router as admin_router
+from clinic_voice.routes_bolna import router as bolna_router
 from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
 from clinic_voice.schemas import (
@@ -68,6 +70,7 @@ app = FastAPI(title="Clinic Voice AI", version="0.1.0", lifespan=lifespan)
 app.include_router(admin_router)
 app.include_router(calendar_admin_router)
 app.include_router(oauth_router)
+app.include_router(bolna_router)
 
 
 @app.exception_handler(DatabaseError)
@@ -93,7 +96,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "010_appointment_calendar_account.sql"
+REQUIRED_MIGRATION = "011_call_sessions.sql"
 
 
 @app.get("/health/live")
@@ -128,6 +131,9 @@ def reserve_slot(
     ],
     clinic_id=Depends(tenant),
 ):
+    if idempotency_key.startswith(BOLNA_KEY_PREFIX):
+        # Reserved for keys the Bolna gateway derives, which bind appointments to a call session.
+        raise HTTPException(422, "Idempotency key prefix is reserved")
     return reserve(
         get_settings().database_url.get_secret_value(), clinic_id, request, idempotency_key
     )

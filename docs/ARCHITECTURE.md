@@ -6,7 +6,7 @@ Use a modular monolith with API and worker processes sharing PostgreSQL. Bolna h
 flowchart LR
   Caller --> Bolna[Bolna hosted voice]
   Bolna --> Speech[Sarvam speech]
-  Bolna --> Gateway[Authenticated tool gateway planned]
+  Bolna --> Gateway[Bolna tool gateway; tests only]
   Staff[Staff dashboard planned] --> API[FastAPI]
   Gateway --> API
   API --> DB[(PostgreSQL)]
@@ -66,3 +66,9 @@ Booking lifecycle: pending_sync → confirmed or needs_review; confirmed → can
 Plan a dedicated authenticated inbox: validate custom secret header, map agent/execution to tenant on the server, enforce body size, redact/minimize payload, persist before 2xx, process asynchronously. Deduplicate by provider event ID or execution+status+payload hash; execution ID alone drops later state updates. Reject regressions after terminal state. Poll executions to reconcile missing deliveries; do not rely on vendor retries.
 
 No clinical notes in calendar titles, prompt variables, logs, or analytics. Use opaque booking references and minimum operational information. Encrypt refresh tokens with managed keys; separate retention for appointment metadata, recordings, transcripts, and audit records. Recording storage is disabled by default in the planned integration.
+
+## Bolna gateway and agent compiler (T6; contract-tested only)
+
+`routes_bolna.py` exposes `/v1/bolna/context` and `/v1/bolna/tools/{check-slots,reserve-slot,appointment-status}`; `bolna/gateway.py` holds the services. Each tool call upserts a `call_sessions` row (migration 011) keyed by clinic and Bolna `execution_id`, then delegates to `service.slots`, `service.reserve` (with a server-derived idempotency key and `call_session_id`) or a session-bound status query that reuses `service.spoken_status`. The gateway resolves doctor and service by exact (case- and whitespace-folded) name because the context endpoint publishes names only (ADR 0005).
+
+`bolna/agent_config.py` compiles a Bolna v2 agent payload from the clinic row, `agents/prompts/receptionist.md` and the gateway tool table: a `simple_llm_agent` (not a graph agent; `agents/flow.yaml` is not enforced by Bolna), Sarvam `saaras` transcriber and `bulbul` synthesizer, keyed `multilingual_config` for `en` and `hi`, and four `custom_task` tools posting to the gateway. `clinic-voice bolna compile-agent --clinic <id>` prints it with the token redacted; nothing pushes it to Bolna. `providers/bolna.py` defines `BolnaPort` (create/update agent, get execution, list/assign numbers, start/stop calls), a deterministic `FakeBolna` and an httpx `BolnaClient`, tested only with `httpx.MockTransport`; nothing in the app or worker calls it yet. Number purchase is not implemented.
