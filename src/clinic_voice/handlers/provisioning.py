@@ -12,31 +12,44 @@ assignment) and each provider error; refusals (calendar_not_connected, number_no
 ...) and successful reads do not count. A step whose counter has reached STEP_MAX_ATTEMPTS
 goes to manual_review (retries_exhausted) before any further provider call.
 
-Credentials: an agent write is sent with a credential recorded as attempt_credential_id; once
-Bolna acknowledges it, it becomes tool_credential_id. Whenever a step ends in failed or
-manual_review, every provisioning credential of the clinic except tool_credential_id (held
-by the agent) and attempt_credential_id (possibly held: a write whose outcome is unknown)
-is revoked; a write Bolna refused (4xx) or never sent gives its credential up at once.
+Credentials: an agent write is sent with two credentials issued together: a bolna-scope tool
+credential (attempt_credential_id) and a webhook-scope credential carried in the agent's
+webhook_url (attempt_webhook_credential_id). Once Bolna acknowledges the write they become
+tool_credential_id and webhook_credential_id. Whenever a step ends in failed or
+manual_review, every provisioning credential of the clinic (both labels) except those four
+(held by the agent, or possibly held: a write whose outcome is unknown) is revoked; a write
+Bolna refused (4xx) or never sent gives its credentials up at once. Operator-issued
+credentials (other labels) are never touched.
 
 Steps:
 - calendar (draft): provisioning.calendar_ready, no provider call. Not ready is a refusal:
   the state stays draft with last_error calendar_not_connected.
 - agent (calendar_connected): compile the agent (agent_config) under the deterministic name
   agent_name(); find an existing agent by the stored agent_id, else by name in
-  list_agents(); then issue a fresh bolna-scope credential (plaintext in memory only; its id is
-  recorded as attempt_credential_id) and update the found agent (PUT, full replacement) or create one. Before a
+  list_agents(); then issue a fresh bolna-scope credential and webhook credential (plaintext
+  in memory only; their ids are recorded as attempt_credential_id and
+  attempt_webhook_credential_id) and update the found agent (PUT, full replacement) or create
+  one, with webhook_url <BOLNA_GATEWAY_BASE_URL>/v1/webhooks/bolna/<webhook token>. Before a
   create, agent_create_pending is committed as write intent. A create that timed out (or a
   crash after the intent) is reconciled on the next attempt by the name lookup; when the
   port has no lookup, or the lookup is not documented as consistent and finds nothing, the
   step goes to manual_review instead of creating a second agent. On success agent_id and
-  clinics.bolna_agent_id are set and earlier provisioning credentials are revoked.
+  clinics.bolna_agent_id are set and earlier provisioning credentials of both labels are
+  revoked.
 - number (agent_created): the owner-selected phone_number_id must be in list_phone_numbers()
   and not routed to another agent (refusal otherwise: number_not_in_account /
   number_in_use); then assign_phone_number (idempotent; a timeout retries and the next
   attempt sees the assignment in the listing). Never purchases.
-- verify (number_assigned): get_agent must return the recorded id and name, every expected
-  tool URL, and (where the token is readable) the recorded credential id; the number must be
-  routed to the agent. Any mismatch goes to manual_review (resume at the step to redo).
+- verify (number_assigned): the recorded tool credential and webhook credential must be
+  active; get_agent must return the recorded id and name, every expected tool URL, (where
+  the token is readable) the recorded credential id and (where the read exposes
+  webhook_url, which GET /v2/agent does not document) the expected webhook URL naming the
+  recorded webhook credential (webhook_mismatch otherwise); the number must be routed to the
+  agent. Any mismatch goes to manual_review (resume at the step to redo). The outcome is ok,
+  or names what could not be compared: token_unchecked (masked api_token),
+  webhook_unchecked (no webhook_url in the read, or webhook_credential_id NULL: a row
+  provisioned before migration 017, whose hand-set webhook URL is not managed here) or
+  token_and_webhook_unchecked.
 
 Errors: ProviderPermanent -> failed (unauthorized or provider_permanent); timeouts and
 retryable errors retry with backoff; a dead-lettered job (retries exhausted, lease expired)
@@ -123,17 +136,19 @@ def _finish(conn, job, row, to_state, step, outcome, *, resume=None, **values) -
 
 
 def _revoke_unheld(conn, clinic_id):
-    """Revoke the clinic's provisioning credentials that no agent holds or may hold (all but
-    tool_credential_id and attempt_credential_id). Runs after the row update, in its
-    transaction."""
+    """Revoke the clinic's provisioning credentials (tool and webhook labels) that no agent
+    holds or may hold (all but tool_credential_id, attempt_credential_id,
+    webhook_credential_id and attempt_webhook_credential_id). Runs after the row update, in
+    its transaction."""
     conn.execute(
-        "UPDATE tenant_credentials SET revoked_at=now() WHERE clinic_id=%(c)s AND label=%(l)s"
-        " AND revoked_at IS NULL"
-        " AND id IS DISTINCT FROM (SELECT tool_credential_id FROM provisioning"
-        " WHERE clinic_id=%(c)s)"
-        " AND id IS DISTINCT FROM (SELECT attempt_credential_id FROM provisioning"
-        " WHERE clinic_id=%(c)s)",
-        {"c": clinic_id, "l": service.CREDENTIAL_LABEL},
+        "UPDATE tenant_credentials t SET revoked_at=now() FROM provisioning p"
+        " WHERE p.clinic_id=%(c)s AND t.clinic_id=%(c)s AND t.label = ANY(%(l)s)"
+        " AND t.revoked_at IS NULL"
+        " AND t.id IS DISTINCT FROM p.tool_credential_id"
+        " AND t.id IS DISTINCT FROM p.attempt_credential_id"
+        " AND t.id IS DISTINCT FROM p.webhook_credential_id"
+        " AND t.id IS DISTINCT FROM p.attempt_webhook_credential_id",
+        {"c": clinic_id, "l": list(service.LABELS)},
     )
 
 
@@ -265,27 +280,32 @@ def _agent(conn, job, port, row) -> bool:
     credential_id, token = credentials.issue(
         conn, clinic_id, service.CREDENTIAL_LABEL, scope=service.CREDENTIAL_SCOPE
     )
+    # webhook scope: accepted by /v1/webhooks/bolna/{token} only; carried in webhook_url.
+    webhook_id, webhook_token = credentials.issue(
+        conn, clinic_id, service.WEBHOOK_LABEL, scope=service.WEBHOOK_SCOPE
+    )
     # The write below counts as an attempt whatever its outcome.
     updated = conn.execute(
-        "UPDATE provisioning SET attempt_credential_id=%s, agent_name=%s,"
-        " agent_create_pending = agent_create_pending OR %s,"
+        "UPDATE provisioning SET attempt_credential_id=%s, attempt_webhook_credential_id=%s,"
+        " agent_name=%s, agent_create_pending = agent_create_pending OR %s,"
         " agent_attempts = agent_attempts + 1, updated_at=now()"
         " WHERE clinic_id=%s AND version=%s AND state='calendar_connected' RETURNING clinic_id",
-        (credential_id, name, agent_id is None, clinic_id, row["version"]),
+        (credential_id, webhook_id, name, agent_id is None, clinic_id, row["version"]),
     ).fetchone()
     if updated is None:
         conn.rollback()
         return complete(conn, job)
     conn.commit()
     try:
-        # The token exists only in this payload, in memory; it is never stored or logged.
+        # The tokens exist only in this payload, in memory; they are never stored or logged.
         payload = agent_config.compile_agent(
             {"name": clinic["name"], "timezone": clinic["timezone"]},
             gateway_base_url=base,
             tool_token=token,
+            webhook_url=agent_config.webhook_url(base, webhook_token),
         )
     except ValueError:
-        # Nothing was sent: give this attempt's credential up and restore the previous
+        # Nothing was sent: give this attempt's credentials up and restore the previous
         # intent (an earlier timed-out create may still be unresolved).
         return _finish(
             conn,
@@ -296,9 +316,10 @@ def _agent(conn, job, port, row) -> bool:
             "agent_config_invalid",
             agent_create_pending=row["agent_create_pending"],
             attempt_credential_id=row["attempt_credential_id"],
+            attempt_webhook_credential_id=row["attempt_webhook_credential_id"],
         )
     finally:
-        del token
+        del token, webhook_token
     payload["agent_config"]["agent_name"] = name
     require_idle(conn)
     created = agent_id is None
@@ -308,8 +329,8 @@ def _agent(conn, job, port, row) -> bool:
         else:
             port.update_agent(agent_id, payload)
     except ProviderPermanent as error:
-        # A 4xx means this write was refused: its credential is given up. An earlier
-        # timed-out create, if any, is still unresolved, so its intent and credential stay.
+        # A 4xx means this write was refused: its credentials are given up. An earlier
+        # timed-out create, if any, is still unresolved, so its intent and credentials stay.
         code = "unauthorized" if error.code == "unauthorized" else "provider_permanent"
         return _finish(
             conn,
@@ -320,15 +341,16 @@ def _agent(conn, job, port, row) -> bool:
             code,
             agent_create_pending=row["agent_create_pending"],
             attempt_credential_id=row["attempt_credential_id"],
+            attempt_webhook_credential_id=row["attempt_webhook_credential_id"],
         )
     except ProviderError as error:
         return _provider_error(conn, job, row, "agent", error, counted=True)
     finally:
         del payload
-    return _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created)
+    return _agent_recorded(conn, job, row, clinic, agent_id, credential_id, webhook_id, created)
 
 
-def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) -> bool:
+def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, webhook_id, created) -> bool:
     if not extend_lease(conn, job):
         conn.rollback()
         return False
@@ -339,7 +361,7 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
     if service.agent_taken(conn, job.clinic_id, agent_id):
         # The target was checked before the write, so this is a created id that belongs
         # elsewhere, or an agent claimed elsewhere while the write ran. That agent must not
-        # keep this clinic's credential: the attempt's credential is revoked with the review.
+        # keep this clinic's credentials: the attempt's are revoked with the review.
         conn.rollback()
         return _finish(
             conn,
@@ -350,6 +372,7 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
             "agent_conflict",
             agent_create_pending=False if created else row["agent_create_pending"],
             attempt_credential_id=None,
+            attempt_webhook_credential_id=None,
         )
     try:
         # Savepoint: another clinic's provisioning may record the same agent id between the
@@ -366,10 +389,11 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
                 conn.execute(
                     "UPDATE provisioning SET agent_id=%s, agent_create_pending=false,"
                     " state='agent_created', tool_credential_id=%s,"
-                    " attempt_credential_id=NULL, resume_state='agent_created',"
+                    " attempt_credential_id=NULL, webhook_credential_id=%s,"
+                    " attempt_webhook_credential_id=NULL, resume_state='agent_created',"
                     " last_error=NULL, version=version + 1, updated_at=now()"
                     " WHERE clinic_id=%s",
-                    (agent_id, credential_id, job.clinic_id),
+                    (agent_id, credential_id, webhook_id, job.clinic_id),
                 )
     except UniqueViolation:
         # Claimed elsewhere concurrently: same outcome as agent_taken above.
@@ -383,16 +407,18 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, created) ->
             "agent_conflict",
             agent_create_pending=False if created else row["agent_create_pending"],
             attempt_credential_id=None,
+            attempt_webhook_credential_id=None,
         )
     if swapped is None:
         conn.rollback()
         return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
-    # The agent now carries the new credential: earlier provisioning credentials (from
-    # attempts whose outcome was unknown, or a previous agent version) are revoked.
+    # The agent now carries the new credentials: earlier provisioning credentials of both
+    # labels (from attempts whose outcome was unknown, or a previous agent version) are
+    # revoked.
     conn.execute(
-        "UPDATE tenant_credentials SET revoked_at=now() WHERE clinic_id=%s AND label=%s"
-        " AND id<>%s AND revoked_at IS NULL",
-        (job.clinic_id, service.CREDENTIAL_LABEL, credential_id),
+        "UPDATE tenant_credentials SET revoked_at=now() WHERE clinic_id=%s AND label = ANY(%s)"
+        " AND id <> ALL(%s) AND revoked_at IS NULL",
+        (job.clinic_id, list(service.LABELS), [credential_id, webhook_id]),
     )
     outcome = "created" if created else "reconciled"
     service.record(conn, job.clinic_id, row["state"], "agent_created", "agent", outcome)
@@ -450,6 +476,12 @@ def _verify(conn, job, port, row) -> bool:
     active = row["tool_credential_id"] is not None and service.credential_active(
         conn, job.clinic_id, row["tool_credential_id"]
     )
+    # NULL webhook_credential_id: provisioned before migration 017; not managed, not checked.
+    managed_webhook = row["webhook_credential_id"]
+    if active and managed_webhook is not None:
+        active = service.credential_active(
+            conn, job.clinic_id, managed_webhook, (service.WEBHOOK_SCOPE,)
+        )
     conn.commit()
     if not active:
         return _finish(
@@ -493,13 +525,37 @@ def _verify(conn, job, port, row) -> bool:
             "credential_mismatch",
             resume="calendar_connected",
         )
+    # GET /v2/agent does not document webhook_url: compared only when the read exposes it
+    # (a masked token segment still has its URL compared; an unusable value fails).
+    exposed = agent.webhook_base is not None or agent.webhook_credential_id is not None
+    webhook_checked = managed_webhook is not None and exposed
+    if webhook_checked and (
+        agent.webhook_base != agent_config.gateway_url(base) + agent_config.WEBHOOK_PATH
+        or agent.webhook_credential_id not in (None, managed_webhook.hex)
+    ):
+        return _finish(
+            conn,
+            job,
+            row,
+            "manual_review",
+            "verify",
+            "webhook_mismatch",
+            resume="calendar_connected",
+        )
+    webhook_checked = webhook_checked and agent.webhook_credential_id is not None
     if number is None or number.agent_id != row["agent_id"]:
         return _finish(
             conn, job, row, "manual_review", "verify", "number_mismatch", resume="agent_created"
         )
     # Bolna may mask api_token in GET responses (undocumented): then the credential cannot
-    # be compared and the outcome says so.
-    outcome = "ok" if len(readable) == len(agent.token_credential_ids) else "token_unchecked"
+    # be compared and the outcome says so; likewise for a webhook URL the read does not show.
+    token_checked = len(readable) == len(agent.token_credential_ids)
+    outcome = {
+        (True, True): "ok",
+        (False, True): "token_unchecked",
+        (True, False): "webhook_unchecked",
+        (False, False): "token_and_webhook_unchecked",
+    }[(token_checked, webhook_checked)]
     return _finish(conn, job, row, "verified", "verify", outcome)
 
 

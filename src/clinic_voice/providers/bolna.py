@@ -24,7 +24,9 @@ agents, get execution and list phone numbers.
 
 summarize_agent() is the single allowlist for agent data (GET /v2/agent/{id} and
 /v2/agent/all): id, agent_name, each tool's URL and the credential id parsed from each
-tool's api_token. The token's secret part, prompts and every other field are dropped.
+tool's api_token, and, only when the response carries it (undocumented), the webhook_url's
+credential id and the URL without its token segment. Token secrets, prompts and every other
+field are dropped.
 
 minimize_execution() is the single allowlist for execution data (webhook bodies and
 GET /executions alike); STATUS_RANK and FINAL_STATUSES define the monotonic status order
@@ -252,12 +254,18 @@ class Agent:
     """Allowlisted agent fields. tool_urls maps tool name -> URL; token_credential_ids holds,
     per tool, the tenant credential id (hex) of its api_token, None when the token is masked
     (only asterisks, optionally after "Bearer "), or UNREADABLE when it is absent or not a
-    tool credential. No secret, prompt or other field is kept."""
+    tool credential. webhook_base is webhook_url without its last segment (the token) and
+    webhook_credential_id that token's credential id (hex): both None when the response has
+    no webhook_url (GET /v2/agent does not document one); webhook_credential_id None with a
+    base when the token is masked, UNREADABLE when it is not a webhook credential. No secret,
+    prompt or other field is kept."""
 
     id: str
     name: str | None
     tool_urls: dict = field(default_factory=dict)
     token_credential_ids: tuple = ()
+    webhook_base: str | None = None
+    webhook_credential_id: str | None = None
 
 
 def _maybe_json(value):
@@ -288,6 +296,22 @@ def _credential_id(api_token) -> str | None:
     return UNREADABLE if parsed is None else parsed[0].hex
 
 
+MASKED_SEGMENT = re.compile(r"\*+")
+
+
+def _webhook(value) -> tuple[str | None, str | None]:
+    """(webhook_base, webhook_credential_id) of a webhook_url value; see Agent."""
+    if value is None or value == "":
+        return None, None
+    if not isinstance(value, str) or "/" not in value:
+        return None, UNREADABLE
+    base, _, segment = value.rpartition("/")
+    if MASKED_SEGMENT.fullmatch(segment):
+        return base, None
+    parsed = credentials.parse(segment, "webhook")
+    return base, UNREADABLE if parsed is None else parsed[0].hex
+
+
 def summarize_agent(body) -> Agent | None:
     """The allowlisted fields of an AgentV2 body (GET /v2/agent/{id}, items of
     /v2/agent/all), or None without a usable id. The api_token secret is never kept."""
@@ -309,7 +333,15 @@ def summarize_agent(body) -> Agent | None:
             url = entry.get("url")
             urls[tool_name] = url if isinstance(url, str) else None
             token_ids.append(_credential_id(entry.get("api_token")))
-    return Agent(agent_id, name if isinstance(name, str) else None, urls, tuple(token_ids))
+    webhook_base, webhook_id = _webhook(body.get("webhook_url"))
+    return Agent(
+        agent_id,
+        name if isinstance(name, str) else None,
+        urls,
+        tuple(token_ids),
+        webhook_base,
+        webhook_id,
+    )
 
 
 class BolnaPort(Protocol):
@@ -426,10 +458,17 @@ class FakeBolna:
             self._written("update_agent")
 
     def _summary(self, agent_id):
+        # The fake returns webhook_url when the stored agent has one; whether Bolna's GET
+        # response does is undocumented (tests cover both).
         config = (self.agents[agent_id] or {}).get("agent_config") or {}
-        return summarize_agent(
-            {"id": agent_id, "agent_name": config.get("agent_name"), "tasks": config.get("tasks")}
-        )
+        body = {
+            "id": agent_id,
+            "agent_name": config.get("agent_name"),
+            "tasks": config.get("tasks"),
+        }
+        if "webhook_url" in config:
+            body["webhook_url"] = config["webhook_url"]
+        return summarize_agent(body)
 
     def get_agent(self, agent_id):
         with self._lock:

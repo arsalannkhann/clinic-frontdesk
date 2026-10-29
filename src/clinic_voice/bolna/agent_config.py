@@ -8,6 +8,8 @@ payload has never been sent to Bolna. Nothing here makes network calls or persis
 Credentials: the tool token is an argument, injected only into the in-memory payload (each
 tool's `api_token`, which Bolna sends as the Authorization header). Pass REDACTED to build a
 payload for review; redact() strips tokens from a compiled payload before it is printed.
+The optional webhook URL (webhook_url()) carries a webhook-scope token as its last path
+segment (ADR 0007); redact() strips that too.
 """
 
 import copy
@@ -18,9 +20,10 @@ from urllib.parse import urlsplit
 
 from clinic_voice.bolna.gateway import SUPPORTED_LANGUAGES
 from clinic_voice.config import LOOPBACK_HOSTS
-from clinic_voice.credentials import GATEWAY_SCOPES, parse_any
+from clinic_voice.credentials import GATEWAY_SCOPES, parse, parse_any
 
 REDACTED = "<redacted>"
+WEBHOOK_PATH = "/v1/webhooks/bolna"
 PROMPTS = Path(__file__).resolve().parents[3] / "agents" / "prompts"
 # Call-context variables rendered by Bolna into prompts and tool params (SOURCE_REVIEW).
 CONTEXT_PARAMS = {
@@ -189,6 +192,24 @@ def gateway_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def webhook_url(base_url: str, webhook_token: str) -> str:
+    """The agent's webhook_url: <base>/v1/webhooks/bolna/<webhook token>. Pass REDACTED to
+    build it for review. The result is a secret unless redacted."""
+    if webhook_token != REDACTED and parse(webhook_token, "webhook") is None:
+        raise ValueError("webhook token is not a tenant webhook credential")
+    return f"{gateway_url(base_url)}{WEBHOOK_PATH}/{webhook_token}"
+
+
+def _checked_webhook_url(value: str) -> str:
+    parts = urlsplit(value or "")
+    host = (parts.hostname or "").lower()
+    if parts.query or parts.fragment or not host:
+        raise ValueError("webhook URL must be an absolute URL")
+    if parts.scheme != "https" and not (parts.scheme == "http" and host in LOOPBACK_HOSTS):
+        raise ValueError("webhook URL must be https (http only for localhost)")
+    return value
+
+
 def load_prompt(name: str = "receptionist", directory: Path = PROMPTS) -> str:
     text = (directory / f"{name}.md").read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -300,9 +321,11 @@ def compile_agent(
     tool_token: str,
     profile: AgentProfile | None = None,
     prompt: str | None = None,
+    webhook_url: str | None = None,
 ) -> dict:
     """The full agent payload for one clinic. `clinic` needs name and timezone. The result
-    holds the tool token (unless REDACTED); keep it in memory and never persist it."""
+    holds the tool token (unless REDACTED) and, when given, the webhook URL (build it with
+    webhook_url()); keep it in memory and never persist it."""
     profile = profile or AgentProfile()
     base = prompt if prompt is not None else load_prompt()
     active = profile.active_language
@@ -349,22 +372,29 @@ def compile_agent(
             "call_terminate": profile.call_terminate,
         },
     }
+    config = {
+        "agent_name": f"{name} receptionist"[:120],
+        "agent_welcome_message": (
+            f"Namaste, this is the AI assistant for {name}. How can I help you today?"
+        ),
+        "tasks": [task],
+    }
+    if webhook_url is not None:
+        # The only webhook field the create docs define (SOURCE_REVIEW): no header or secret.
+        config["webhook_url"] = _checked_webhook_url(webhook_url)
     return {
-        "agent_config": {
-            "agent_name": f"{name} receptionist"[:120],
-            "agent_welcome_message": (
-                f"Namaste, this is the AI assistant for {name}. How can I help you today?"
-            ),
-            "tasks": [task],
-        },
+        "agent_config": config,
         "agent_prompts": {"task_1": {"system_prompt": system_prompt(base, clinic)}},
     }
 
 
 def redact(payload: dict) -> dict:
-    """A deep copy with every tool api_token replaced."""
+    """A deep copy with every tool api_token and the webhook URL's token replaced."""
     result = copy.deepcopy(payload)
-    for task in result.get("agent_config", {}).get("tasks", []):
+    config = result.get("agent_config", {})
+    if isinstance(config.get("webhook_url"), str):
+        config["webhook_url"] = config["webhook_url"].rsplit("/", 1)[0] + "/" + REDACTED
+    for task in config.get("tasks", []):
         params = task.get("tools_config", {}).get("api_tools", {}).get("tools_params", {})
         for entry in params.values():
             if "api_token" in entry:

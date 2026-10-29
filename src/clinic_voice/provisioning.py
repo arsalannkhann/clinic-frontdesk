@@ -36,6 +36,12 @@ CREDENTIAL_LABEL = "provisioning:agent"
 # The agent's credential works on /v1/bolna/* only (deps.tenant), so it cannot reach the
 # generic /v1/tools/* API (T12).
 CREDENTIAL_SCOPE = "bolna"
+# The agent's webhook_url carries a webhook-scope credential of this label (migration 017);
+# operator-issued webhook credentials (other labels) are never touched by provisioning.
+WEBHOOK_LABEL = "provisioning:webhook"
+WEBHOOK_SCOPE = "webhook"
+# Labels of the credentials provisioning issues and revokes.
+LABELS = (CREDENTIAL_LABEL, WEBHOOK_LABEL)
 # State -> the step a provision.step job runs from it.
 STEPS = {
     "draft": "calendar",
@@ -59,7 +65,7 @@ EVENT_LIMIT = 50
 
 COLUMNS = (
     "state,resume_state,agent_id,agent_name,agent_create_pending,tool_credential_id,"
-    "attempt_credential_id,"
+    "attempt_credential_id,webhook_credential_id,attempt_webhook_credential_id,"
     "phone_number_id,calendar_attempts,agent_attempts,number_attempts,verify_attempts,"
     "last_error,version,updated_at"
 )
@@ -108,15 +114,16 @@ def agent_taken(conn, clinic_id, agent_id) -> bool:
     return row["taken"]
 
 
-def credential_active(conn, clinic_id, credential_id) -> bool:
-    """The agent's credential exists for this clinic with a gateway scope (bolna, or tools
-    from a database provisioned before migration 016), is unrevoked and unexpired."""
+def credential_active(conn, clinic_id, credential_id, scopes=("bolna", "tools")) -> bool:
+    """The agent's credential exists for this clinic with one of `scopes` (default: a gateway
+    scope, bolna, or tools from a database provisioned before migration 016; ('webhook',) for
+    the webhook credential), is unrevoked and unexpired."""
     return (
         conn.execute(
             "SELECT 1 FROM tenant_credentials WHERE clinic_id=%s AND id=%s"
-            " AND scope IN ('bolna','tools')"
+            " AND scope = ANY(%s)"
             " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
-            (clinic_id, credential_id),
+            (clinic_id, credential_id, list(scopes)),
         ).fetchone()
         is not None
     )
@@ -302,6 +309,11 @@ def activate(conn, staff):
         conn, clinic_id, row["tool_credential_id"]
     ):
         raise HTTPException(409, "The agent's tool credential is no longer active")
+    # NULL: provisioned before migration 017, webhook URL not managed here.
+    if row["webhook_credential_id"] is not None and not credential_active(
+        conn, clinic_id, row["webhook_credential_id"], (WEBHOOK_SCOPE,)
+    ):
+        raise HTTPException(409, "The agent's webhook credential is no longer active")
     conn.execute(
         "UPDATE provisioning SET state='active', last_error=NULL, version=version + 1,"
         " updated_at=now() WHERE clinic_id=%s",
@@ -318,8 +330,9 @@ def reset(conn, staff, confirm_no_stray_agent=False):
     step still refuses to create while the lookup cannot rule out a stray agent. Clearing it
     needs confirm_no_stray_agent: the owner checked the Bolna account and no agent named
     agent_name exists. It is accepted only after create_uncertain or lease_lost; it also
-    revokes the credential that the lost write may have handed to that agent. Without the
-    confirmation attempt_credential_id is kept (never cleared without revoking)."""
+    revokes the credentials (tool and webhook) that the lost write may have handed to that
+    agent. Without the confirmation attempt_credential_id and attempt_webhook_credential_id
+    are kept (never cleared without revoking)."""
     clinic_id = staff["clinic_id"]
     row = _locked(conn, clinic_id)
     if row["state"] not in RESETTABLE:
@@ -330,22 +343,28 @@ def reset(conn, staff, confirm_no_stray_agent=False):
     if confirm_no_stray_agent:
         if not pending or row["last_error"] not in STRAY_AGENT_ERRORS:
             raise HTTPException(409, "There is no uncertain agent create to confirm")
-        held = row["attempt_credential_id"]
-        if held is not None and held != row["tool_credential_id"]:
-            from clinic_voice import credentials
+        from clinic_voice import credentials
 
-            credentials.revoke(conn, held)
+        for attempt, held_by_agent in (
+            ("attempt_credential_id", "tool_credential_id"),
+            ("attempt_webhook_credential_id", "webhook_credential_id"),
+        ):
+            held = row[attempt]
+            if held is not None and held != row[held_by_agent]:
+                credentials.revoke(conn, held)
         pending = False
-    # attempt_credential_id is kept unless the owner confirmed no stray agent (it was then
-    # revoked above): an agent update whose outcome was unknown may still hold it, so it is
-    # neither cleared unrevoked nor revoked here. The next agent step replaces it, and
-    # revokes it once a newer credential is acknowledged (or the step stops).
+    # The attempt credentials are kept unless the owner confirmed no stray agent (they were
+    # then revoked above): an agent update whose outcome was unknown may still hold them, so
+    # they are neither cleared unrevoked nor revoked here. The next agent step replaces them,
+    # and revokes them once newer credentials are acknowledged (or the step stops).
     conn.execute(
         "UPDATE provisioning SET state=resume_state, last_error=NULL, agent_create_pending=%s,"
         " attempt_credential_id=CASE WHEN %s THEN NULL ELSE attempt_credential_id END,"
+        " attempt_webhook_credential_id=CASE WHEN %s THEN NULL"
+        " ELSE attempt_webhook_credential_id END,"
         " calendar_attempts=0, agent_attempts=0, number_attempts=0, verify_attempts=0,"
         " version=version + 1, updated_at=now() WHERE clinic_id=%s",
-        (pending, confirm_no_stray_agent, clinic_id),
+        (pending, confirm_no_stray_agent, confirm_no_stray_agent, clinic_id),
     )
     outcome = "reset_confirmed_no_stray_agent" if confirm_no_stray_agent else "reset"
     record(conn, clinic_id, row["state"], row["resume_state"], "reset", outcome, staff["id"])
@@ -387,6 +406,8 @@ def activate_manual(conn, clinic_id) -> None:
         and row["agent_id"] is None
         and row["attempt_credential_id"] is None
         and row["tool_credential_id"] is None
+        and row["attempt_webhook_credential_id"] is None
+        and row["webhook_credential_id"] is None
         and not row["agent_create_pending"]
         and not step_pending(conn, clinic_id)
     ):

@@ -611,12 +611,58 @@ def test_compiler_neutralizes_template_characters():
     assert payload["agent_config"]["agent_name"] == "Dr from_number (x)s Clinic receptionist"
 
 
+SYNTHETIC_WEBHOOK_TOKEN = "cvw_" + "1" * 32 + "." + "B" * 43
+
+
+def test_compiler_sets_webhook_url_only_when_given():
+    assert "webhook_url" not in compiled()["agent_config"]
+    url = agent_config.webhook_url(GATEWAY + "/", SYNTHETIC_WEBHOOK_TOKEN)
+    assert url == f"{GATEWAY}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}"
+    payload = compiled(webhook_url=url)
+    assert payload["agent_config"]["webhook_url"] == url
+    # redact() strips the webhook token as well as the tool tokens.
+    redacted = agent_config.redact(payload)
+    assert redacted["agent_config"]["webhook_url"] == (
+        f"{GATEWAY}/v1/webhooks/bolna/{agent_config.REDACTED}"
+    )
+    assert SYNTHETIC_WEBHOOK_TOKEN not in json.dumps(redacted)
+    assert payload["agent_config"]["webhook_url"] == url  # The original is intact.
+    review = agent_config.webhook_url(GATEWAY, agent_config.REDACTED)
+    assert review == f"{GATEWAY}/v1/webhooks/bolna/{agent_config.REDACTED}"
+    local = agent_config.webhook_url("http://127.0.0.1:8000", SYNTHETIC_WEBHOOK_TOKEN)
+    assert compiled(webhook_url=local)["agent_config"]["webhook_url"] == local
+
+
+def test_compiler_rejects_unsafe_webhook_urls():
+    # Only a webhook-scope token builds a webhook URL (never the tool token).
+    for token in (SYNTHETIC_TOKEN, "cvb_" + "1" * 32 + "." + "B" * 43, "cvw_short", ""):
+        with pytest.raises(ValueError):
+            agent_config.webhook_url(GATEWAY, token)
+    with pytest.raises(ValueError):
+        agent_config.webhook_url("http://voice.example.test", SYNTHETIC_WEBHOOK_TOKEN)
+    for url in (
+        f"http://voice.example.test/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}",
+        f"{GATEWAY}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}?x=1",
+        f"{GATEWAY}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}#f",
+        f"voice.example.test/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}",
+        "",
+    ):
+        with pytest.raises(ValueError):
+            compiled(webhook_url=url)
+
+
 def test_cli_compile_agent_prints_redacted(env, capsys, monkeypatch):
     monkeypatch.setenv("BOLNA_GATEWAY_BASE_URL", GATEWAY)
     get_settings.cache_clear()
     cli.main(["bolna", "compile-agent", "--clinic", str(CLINIC)])
-    out = json.loads(capsys.readouterr().out)
-    assert out == json.loads((FIXTURES / "agent_synthetic_clinic.json").read_text())
+    printed = capsys.readouterr().out
+    out = json.loads(printed)
+    expected = json.loads((FIXTURES / "agent_synthetic_clinic.json").read_text())
+    # Provisioning sets webhook_url; the review output shows it with the token redacted.
+    expected["agent_config"]["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{agent_config.REDACTED}"
+    assert out == expected
+    for prefix in ("cvt_", "cvb_", "cvw_"):
+        assert prefix not in printed
     with pytest.raises(SystemExit):
         cli.main(["bolna", "compile-agent", "--clinic", str(uuid4())])
 

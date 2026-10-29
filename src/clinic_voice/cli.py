@@ -242,8 +242,10 @@ def worker_command(url, args, settings):
 
 
 def bolna_command(url, args, settings):
-    """Print a compiled agent payload for review. The tool token is never needed or printed:
-    the payload is compiled with a redaction placeholder. Nothing is sent to Bolna."""
+    """Print a compiled agent payload for review. No token is ever needed or printed: the
+    payload is compiled with a redaction placeholder for the tool token and the webhook
+    URL's token (provisioning sets webhook_url; a hand-configured agent needs its own
+    credential, docs/OPERATIONS.md). Nothing is sent to Bolna."""
     import json
 
     from clinic_voice.bolna import agent_config
@@ -258,7 +260,10 @@ def bolna_command(url, args, settings):
             raise SystemExit(str(error)) from None
     try:
         payload = agent_config.compile_agent(
-            clinic, gateway_base_url=base, tool_token=agent_config.REDACTED
+            clinic,
+            gateway_base_url=base,
+            tool_token=agent_config.REDACTED,
+            webhook_url=agent_config.webhook_url(base, agent_config.REDACTED),
         )
     except ValueError as error:
         raise SystemExit(str(error)) from None
@@ -374,7 +379,7 @@ def main(argv=None):
     bolna = commands.add_parser("bolna", help="Bolna agent configuration (offline only)")
     bolna_actions = bolna.add_subparsers(dest="action", required=True)
     compile_agent = bolna_actions.add_parser(
-        "compile-agent", help="Print the agent payload with the tool token redacted"
+        "compile-agent", help="Print the agent payload with its tokens redacted"
     )
     compile_agent.add_argument("--clinic", type=UUID, required=True)
     compile_agent.add_argument("--gateway-url", help="Public base URL (default from settings)")
