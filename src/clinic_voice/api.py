@@ -117,7 +117,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "013_webhook_inbox.sql"
+REQUIRED_MIGRATION = "014_reminders.sql"
 
 
 @app.get("/health/live")

@@ -265,7 +265,8 @@ class BolnaPort(Protocol):
         user_data: dict | None = None,
     ) -> str:
         """POST /call. Returns the execution id. Requires explicit owner authorization to use
-        against the live API (AGENTS.md); nothing in this repository calls it yet."""
+        against the live API (AGENTS.md). Only the reminder.call handler calls it, and only
+        for a clinic with outbound_enabled (off by default)."""
 
     def stop_scheduled_call(self, execution_id: str) -> None:
         """POST /call/{execution_id}/stop: stop a queued or scheduled call."""
@@ -279,11 +280,17 @@ def _safe_id(value: str) -> str:
 
 
 class FakeBolna:
-    """Deterministic in-memory BolnaPort. `calls` records (method, args) for assertions."""
+    """Deterministic in-memory BolnaPort. `calls` records (method, args) for assertions.
+
+    Fault injection: fail_next(op, n, error_type) makes the next n calls of that method raise
+    error_type (recorded in `calls`, nothing changed); timeout_after_call makes the next
+    start_outbound_call queue the call and then raise ProviderTimeout (outcome unknown)."""
 
     def __init__(self, phone_numbers: list[PhoneNumber] | None = None):
         self._lock = Lock()
         self._counter = 0
+        self._failures: dict[str, list[type[ProviderError]]] = {}
+        self.timeout_after_call = False
         self.calls: list[tuple[str, tuple]] = []
         self.agents: dict[str, dict] = {}
         self.executions: dict[str, Execution] = {}
@@ -291,6 +298,17 @@ class FakeBolna:
 
     def __repr__(self):
         return f"FakeBolna(agents={len(self.agents)}, executions={len(self.executions)})"
+
+    def fail_next(
+        self, op: str, n: int = 1, error_type: type[ProviderError] = ProviderTimeout
+    ) -> None:
+        with self._lock:
+            self._failures.setdefault(op, []).extend([error_type] * n)
+
+    def _injected(self, op):
+        pending = self._failures.get(op)
+        if pending:
+            raise pending.pop(0)()
 
     def _next_id(self, kind):
         self._counter += 1
@@ -347,14 +365,19 @@ class FakeBolna:
                     (agent_id, recipient_phone_number, from_phone_number, scheduled_at, user_data),
                 )
             )
+            self._injected("start_outbound_call")
             execution_id = self._next_id("execution")
             status = "scheduled" if scheduled_at else "queued"
             self.executions[execution_id] = Execution(execution_id, agent_id, status)
+            if self.timeout_after_call:
+                self.timeout_after_call = False
+                raise ProviderTimeout()
             return execution_id
 
     def stop_scheduled_call(self, execution_id):
         with self._lock:
             self.calls.append(("stop_scheduled_call", (execution_id,)))
+            self._injected("stop_scheduled_call")
             current = self.executions.get(execution_id)
             if current is None or current.status not in ("queued", "scheduled", "rescheduled"):
                 raise ProviderPermanent("http_400")

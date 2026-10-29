@@ -189,13 +189,38 @@ def build_bolna(choice, url, settings):
     return BolnaClient(key.get_secret_value(), http, settings.bolna_api_base)
 
 
+def build_messaging(choice, url, settings):
+    """The patient messaging port for notification.send, or None. Only the fake exists: no
+    live messaging provider has been chosen (an owner action, docs/ROADMAP.md)."""
+    if choice is None:
+        return None
+    from clinic_voice.providers.messaging import FakeMessaging
+
+    if not fake_calendar_allowed(url, settings):
+        raise SystemExit(
+            "Refusing --messaging fake: it would mark confirmations and reminders as sent"
+            " without sending anything. Use a database whose name ends in _test or _dev, or set"
+            " APP_ENV=development."
+        )
+    print(
+        "WARNING: --messaging fake uses an in-process FakeMessaging. No message reaches any"
+        " patient; development only.",
+        file=sys.stderr,
+    )
+    return FakeMessaging()
+
+
 def worker_command(url, args, settings):
     from dataclasses import replace
 
     from clinic_voice.outbox import run_loop, run_once
 
     ports = build_ports(args.calendar, url, settings)
-    ports = replace(ports, bolna=build_bolna(args.bolna, url, settings))
+    ports = replace(
+        ports,
+        bolna=build_bolna(args.bolna, url, settings),
+        messaging=build_messaging(args.messaging, url, settings),
+    )
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -304,7 +329,14 @@ def main(argv=None):
     worker.add_argument(
         "--bolna",
         choices=["fake", "live"],
-        help="Bolna port for call reconciliation (fake: dev only; live: BOLNA_API_KEY)",
+        help="Bolna port for call reconciliation and reminder calls (fake: dev only; live:"
+        " BOLNA_API_KEY)",
+    )
+    worker.add_argument(
+        "--messaging",
+        choices=["fake"],
+        help="Messaging port for confirmations and reminder messages (fake: dev only; no live"
+        " provider exists)",
     )
     worker.add_argument("--worker-id", help="Lease owner name (default host:pid)")
     worker.add_argument("--interval", type=float, default=2.0, help="Idle poll seconds")

@@ -4,7 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import AwareDatetime
 
-from clinic_voice import admin, schedule_exceptions
+from clinic_voice import admin, reminders, schedule_exceptions
 from clinic_voice.deps import database, require_role
 from clinic_voice.schemas import (
     ClinicConfig,
@@ -19,6 +19,8 @@ from clinic_voice.schemas import (
     HoursWindow,
     OutboxJobOut,
     OutboxStatus,
+    ReminderOut,
+    ReminderStatus,
     ServiceCreate,
     ServiceOut,
     ServiceUpdate,
@@ -144,3 +146,15 @@ def list_outbox(
 def requeue_outbox(job_id: UUID, staff=Depends(writer)):
     with database() as conn:
         return admin.requeue_outbox(conn, staff, job_id)
+
+
+@router.get("/reminders", response_model=list[ReminderOut])
+def list_reminders(
+    status: ReminderStatus | None = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    staff=Depends(writer),
+):
+    """Planned and attempted contacts (confirmations, reminder calls and messages), e.g.
+    status=needs_review for contacts whose outcome is unknown."""
+    with database() as conn:
+        return reminders.list_reminders(conn, staff["clinic_id"], status, limit)

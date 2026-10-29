@@ -23,6 +23,7 @@ from uuid import uuid4
 from fastapi import HTTPException
 from psycopg.types.json import Jsonb
 
+from clinic_voice import reminders
 from clinic_voice.audit import audit
 from clinic_voice.domain import ACTIVE_STATUSES
 from clinic_voice.patients import decrypt_field
@@ -39,8 +40,9 @@ def lock_appointment(conn, clinic_id, appointment_id):
 
 def cancel_locked(conn, row):
     """Cancel a locked, active appointment row in the caller's transaction: status
-    'cancelled', version + 1, and a calendar.cancel job for the old version's event. Returns
-    the updated row."""
+    'cancelled', version + 1, a calendar.cancel job for the old version's event, the old
+    version's unsent contacts cancelled and, if it has any contact, a reminder.stop job
+    (reminders.on_cancelled). Returns the updated row."""
     clinic_id = row["clinic_id"]
     updated = conn.execute(
         "UPDATE appointments SET status='cancelled', version=version + 1, updated_at=now()"
@@ -63,6 +65,8 @@ def cancel_locked(conn, row):
         " VALUES (%s,%s,%s,'calendar.cancel',%s,%s)",
         (uuid4(), clinic_id, row["id"], row["version"], Jsonb(payload)),
     )
+    # Unsent contacts of the old version are cancelled now; reminder.stop stops a placed call.
+    reminders.on_cancelled(conn, clinic_id, row["id"], row["version"])
     return updated
 
 
@@ -217,3 +221,23 @@ def resolve(conn, staff, appointment_id, action):
     requeue_outbox(conn, staff, job["id"])
     audit(conn, clinic_id, staff["id"], "appointment.resolved_requeue", appointment_id)
     return _staff_row(conn, clinic_id, appointment_id)
+
+
+def staff_opt_out(conn, staff, appointment_id, purpose, channel):
+    """Record an opt-out for the patient of one appointment of the staff member's clinic
+    (any status) and suppress that patient's unsent contacts. Audited with the appointment
+    id as target; no patient data is returned or recorded."""
+    clinic_id = staff["clinic_id"]
+    row = conn.execute(
+        "SELECT patient_id FROM appointments WHERE clinic_id=%s AND id=%s",
+        (clinic_id, appointment_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, NOT_FOUND)
+    if row["patient_id"] is None:
+        raise HTTPException(409, "Appointment has no patient record")
+    suppressed = reminders.opt_out(
+        conn, clinic_id, row["patient_id"], purpose, channel, "staff", staff_user_id=staff["id"]
+    )
+    audit(conn, clinic_id, staff["id"], "patient.opted_out", appointment_id)
+    return {"purpose": purpose, "channel": channel, "suppressed": suppressed}

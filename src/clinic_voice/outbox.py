@@ -45,6 +45,7 @@ from clinic_voice.providers.calendar import (
     ProviderRetryable,
     ProviderTimeout,
 )
+from clinic_voice.providers.messaging import FakeMessaging, MessagingPort
 
 log = logging.getLogger("clinic_voice.worker")
 
@@ -88,13 +89,17 @@ class Ports:
     clinic_id, account_id) when the provider rejected the account's credentials, and
     revoke_grant(conn, clinic_id, account_id) for calendar.revoke_grant jobs.
 
-    `bolna` is the Bolna platform port for bolna.reconcile (FakeBolna or BolnaClient). None:
-    reconciliation is not enqueued, and a reconcile job is dead-lettered
-    ('bolna_unconfigured')."""
+    `bolna` is the Bolna platform port for bolna.reconcile and reminder calls (FakeBolna or
+    BolnaClient). None: reconciliation and reminder calls are not enqueued by this worker's
+    housekeeping, and the worker claims neither bolna.reconcile nor reminder.call jobs.
+
+    `messaging` is the patient messaging port for notification.send (FakeMessaging only; no
+    live provider exists). None: the worker does not claim notification.send jobs."""
 
     calendar: CalendarPort | None = None
     calendar_for: Callable[..., tuple[CalendarPort, UUID | None] | None] | None = None
     bolna: BolnaPort | None = None
+    messaging: MessagingPort | None = None
 
     def __post_init__(self):
         if (self.calendar is None) == (self.calendar_for is None):
@@ -143,14 +148,18 @@ def _check_timeout(name, adapter, lease):
 
 
 def check_ports(ports, lease=DEFAULT_LEASE):
-    """Every adapter (or resolver) except the in-process FakeCalendar and FakeBolna must
-    declare a numeric `timeout_seconds` (not a bool), at most lease / LEASE_TIMEOUT_RATIO."""
+    """Every adapter (or resolver) except the in-process FakeCalendar, FakeBolna and
+    FakeMessaging must declare a numeric `timeout_seconds` (not a bool), at most
+    lease / LEASE_TIMEOUT_RATIO."""
     adapter = ports.calendar if ports.calendar is not None else ports.calendar_for
     if not isinstance(adapter, FakeCalendar):
         _check_timeout("calendar", adapter, lease)
     bolna = getattr(ports, "bolna", None)
     if bolna is not None and not isinstance(bolna, FakeBolna):
         _check_timeout("bolna", bolna, lease)
+    messaging = getattr(ports, "messaging", None)
+    if messaging is not None and not isinstance(messaging, FakeMessaging):
+        _check_timeout("messaging", messaging, lease)
 
 
 def backoff(attempts: int) -> timedelta:
@@ -191,13 +200,20 @@ def _run_on_dead(conn, job):
 
 
 # Kinds a worker claims only when it has the port they need.
-BOLNA_KINDS = ("bolna.reconcile",)
+BOLNA_KINDS = ("bolna.reconcile", "reminder.call")
+MESSAGING_KINDS = ("notification.send",)
 
 
 def excluded_kinds(ports) -> tuple[str, ...] | None:
-    """Kinds this worker must leave to another worker: bolna.reconcile without a Bolna
-    port (so it is neither attempted nor dead-lettered here)."""
-    return BOLNA_KINDS if getattr(ports, "bolna", None) is None else None
+    """Kinds this worker must leave to another worker (neither attempted nor dead-lettered
+    here): bolna.reconcile and reminder.call without a Bolna port, notification.send without
+    a messaging port."""
+    excluded = ()
+    if getattr(ports, "bolna", None) is None:
+        excluded += BOLNA_KINDS
+    if getattr(ports, "messaging", None) is None:
+        excluded += MESSAGING_KINDS
+    return excluded or None
 
 
 def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None, exclude=None) -> list[Job]:
@@ -281,6 +297,18 @@ def renew(conn, job) -> bool:
     return row is not None
 
 
+def extend_lease(conn, job) -> bool:
+    """renew() inside the caller's transaction (no commit), so a handler can check its fence
+    and extend its lease atomically with the write that precedes provider I/O. False: the
+    lease was lost and the caller must roll back."""
+    row = conn.execute(
+        "UPDATE outbox SET lease_expires_at=now() + %s, updated_at=now()"
+        f" WHERE {FENCE} RETURNING id",  # noqa: S608
+        (job.lease, *_fence(job)),
+    ).fetchone()
+    return row is not None
+
+
 def remember(conn, job, **values):
     """Merge values into the job's payload and renew its lease, fenced, and commit. Returns
     the updated Job, or None if the lease was lost. Used to record write intent (such as the
@@ -344,6 +372,21 @@ def retry(conn, job, error_code, delay=None) -> bool:
     conn.commit()
     if row is not None:
         log.info("job retry scheduled id=%s kind=%s code=%s", job.id, job.kind, error_code)
+    return row is not None
+
+
+def defer(conn, job, until, code) -> bool:
+    """Return the job to pending until `until` (an aware datetime) without spending an
+    attempt: max_attempts grows by one, like release(). For waits the handler chose (quiet
+    hours, a not-yet-due contact, the daily budget), not for failures. Fenced; commits."""
+    row = conn.execute(
+        "UPDATE outbox SET status='pending', max_attempts=max_attempts + 1, lease_expires_at=NULL,"
+        f" last_error=%s, available_at=%s, updated_at=now() WHERE {FENCE} RETURNING id",  # noqa: S608
+        (code, until, *_fence(job)),
+    ).fetchone()
+    conn.commit()
+    if row is not None:
+        log.info("job deferred id=%s kind=%s code=%s", job.id, job.kind, code)
     return row is not None
 
 
@@ -434,11 +477,14 @@ HOUSEKEEPING_INTERVAL = 600.0
 
 
 def _default_housekeeping(conn, ports=None):
-    """Prune expired OAuth states; with a Bolna port, also enqueue (bounded) reconciliation
-    of call sessions that have no final provider status."""
+    """Prune expired OAuth states; backfill reminders of confirmed appointments
+    (reminders.schedule_due, outbound-enabled clinics only); with a Bolna port, also enqueue
+    (bounded) reconciliation of call sessions that have no final provider status."""
+    from clinic_voice import reminders
     from clinic_voice.calendar_accounts import prune_oauth_states
 
     prune_oauth_states(conn)
+    reminders.schedule_due(conn)
     if ports is not None and getattr(ports, "bolna", None) is not None:
         from clinic_voice.bolna.webhooks import enqueue_reconciles
         from clinic_voice.config import get_settings
@@ -468,7 +514,8 @@ def run_loop(
 
     One connection is reused across idle polls. Database errors close it and back off
     exponentially (1 s doubling to 30 s) before reconnecting. When idle, `housekeeping(conn)`
-    (default: prune expired OAuth states and, with ports.bolna, enqueue reconciliation) runs
+    (default: prune expired OAuth states, backfill reminders and, with ports.bolna, enqueue
+    reconciliation) runs
     at most every HOUSEKEEPING_INTERVAL seconds.
     """
     check_ports(ports, lease)

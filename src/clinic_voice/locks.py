@@ -40,6 +40,15 @@ with SKIP LOCKED, so it never waits on a processor. Retention deletes inbox rows
 locks call sessions. Housekeeping's reconciliation enqueue locks call session rows with
 SKIP LOCKED and only inserts new outbox rows.
 
+Contacts (T9, reminders.py and handlers/reminders.py) extend level 5: appointment row
+(FOR UPDATE by a change, FOR SHARE by a send or the housekeeping planner, or the row the
+confirming calendar.create transaction updated), then the contact-budget advisory lock of a
+clinic-local day ("contact-budget:<clinic>:<date>"; a planner may take several days, always
+in ascending order), then reminder rows, then the job's own fenced outbox row. A cancel
+updates reminder rows after its appointment row; an opt-out updates only reminder rows (no
+appointment lock), and a send re-reads consent and opt-out only after locking its reminder
+row, so an opt-out committed before that lock always suppresses the send.
+
 No provider or network I/O may run while these are held.
 
 Separate namespace: calendar_sync takes "busy:<clinic>:<doctor>" (advisory, per doctor) while

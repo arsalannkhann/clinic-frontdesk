@@ -140,12 +140,23 @@ class PatchModel(StrictModel):
         return self
 
 
+ReminderLead = Annotated[int, Field(ge=60, le=10080)]
+ContactBudget = Annotated[int, Field(ge=0, le=100000)]
+
+
 class ClinicConfig(StrictModel):
     id: UUID
     name: str
     timezone: str
     lead_time_minutes: int
     horizon_days: int
+    # Contact policy (T9). outbound_enabled is false by default: no confirmations, reminder
+    # calls or messages are sent for the clinic until an owner or admin enables it.
+    outbound_enabled: bool
+    quiet_hours_start: str  # Clinic-local HH:MM; a window with start > end wraps midnight.
+    quiet_hours_end: str
+    reminder_lead_minutes: int
+    daily_contact_budget: int
 
 
 class ClinicUpdate(PatchModel):
@@ -153,6 +164,17 @@ class ClinicUpdate(PatchModel):
     timezone: Timezone | None = None
     lead_time_minutes: LeadTime | None = None
     horizon_days: HorizonDays | None = None
+    outbound_enabled: bool | None = None
+    quiet_hours_start: ClockTime | None = None
+    quiet_hours_end: ClockTime | None = None
+    reminder_lead_minutes: ReminderLead | None = None
+    daily_contact_budget: ContactBudget | None = None
+
+    @model_validator(mode="after")
+    def _quiet_window(self):
+        if self.quiet_hours_start is not None and self.quiet_hours_start == self.quiet_hours_end:
+            raise ValueError("quiet hours start and end must differ")
+        return self
 
 
 class DoctorCreate(StrictModel):
@@ -460,6 +482,21 @@ class BolnaStatusQuery(BolnaCallContext):
     appointment_id: UUID
 
 
+def _opt_out_scope(value):
+    # Rendered template value; empty means everything.
+    if isinstance(value, str):
+        value = value.strip().casefold() or "all"
+    return value
+
+
+class BolnaOptOut(BolnaCallContext):
+    """Opt the patient of a booking verified on this call out of reminders and confirmations
+    on the given channels ("all", "calls" or "messages")."""
+
+    booking_reference: SpokenReference
+    scope: Annotated[Literal["all", "calls", "messages"], BeforeValidator(_opt_out_scope)] = "all"
+
+
 class BolnaSlotsOut(StrictModel):
     slots: list[AwareDatetime]
     spoken: str
@@ -499,6 +536,12 @@ class BolnaChangeOut(StrictModel):
     previous_booking_reference: str | None = None
     status: str
     starts_at: AwareDatetime
+    spoken: str
+
+
+class BolnaOptOutOut(StrictModel):
+    opted_out: bool
+    scope: str
     spoken: str
 
 
@@ -543,6 +586,44 @@ class StaffAppointmentOut(StrictModel):
 
 class AppointmentResolve(StrictModel):
     action: Literal["requeue", "cancel"]
+
+
+class StaffOptOut(StrictModel):
+    """Opt the appointment's patient out; 'all' covers every purpose or channel."""
+
+    purpose: Literal["all", "booking_confirmation", "reminder"] = "all"
+    channel: Literal["all", "call", "message"] = "all"
+
+
+class StaffOptOutOut(StrictModel):
+    purpose: str
+    channel: str
+    suppressed: int  # Unsent contacts suppressed by this request.
+
+
+ReminderStatus = Literal[
+    "scheduled", "sending", "sent", "unknown", "needs_review", "cancelled", "suppressed", "failed"
+]
+
+
+class ReminderOut(StrictModel):
+    """Operational view of a planned contact: ids, times and codes only. No patient data,
+    message text or provider message id."""
+
+    id: UUID
+    appointment_id: UUID
+    appointment_version: int
+    channel: str
+    purpose: str
+    scheduled_for: AwareDatetime
+    status: str
+    attempts: int
+    last_error: str | None
+    provider_execution_id: str | None
+    stop_outcome: str | None
+    sent_at: AwareDatetime | None
+    created_at: AwareDatetime
+    updated_at: AwareDatetime
 
 
 # Bolna execution webhooks (routes_webhooks.py). The request body is read and minimized by

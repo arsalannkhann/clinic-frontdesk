@@ -175,9 +175,12 @@ def verified_in_session(conn, clinic_id, session_id, patient_id) -> bool:
 
 def record_consents(
     conn, clinic_id, patient_id, consents: dict[str, bool], source, allow_revoke: bool
-) -> None:
+) -> list[str]:
     """Grants are always recorded. A decline revokes an active grant only with
-    allow_revoke; without it the decline is ignored (nothing is stored)."""
+    allow_revoke; without it the decline is ignored (nothing is stored). Returns the purposes
+    whose active grant was kept although the caller declined (so the agent can say that
+    changing an existing preference needs verification or staff)."""
+    kept = []
     for purpose, granted in consents.items():
         if purpose not in PURPOSES:
             raise ValueError("unknown consent purpose")
@@ -195,6 +198,13 @@ def record_consents(
                 " AND purpose=%s AND revoked_at IS NULL",
                 (clinic_id, patient_id, purpose),
             )
+        elif conn.execute(
+            "SELECT 1 FROM consents WHERE clinic_id=%s AND patient_id=%s AND purpose=%s"
+            " AND revoked_at IS NULL",
+            (clinic_id, patient_id, purpose),
+        ).fetchone():
+            kept.append(purpose)
+    return kept
 
 
 def attach(
@@ -204,10 +214,12 @@ def attach(
     session_id,
     details: PatientDetails,
     retention_until: datetime,
+    kept_grants: list[str] | None = None,
 ) -> UUID | None:
     """Create or attach the patient for a gateway reservation inside its transaction and
     record consent. Returns None (no patient row) when neither a caller number nor a name is
-    known. Lock order 4 (locks.py): a per-(clinic, phone hash) advisory lock, after the
+    known. kept_grants, if given, receives the purposes whose declines could not be applied
+    (record_consents). Lock order 4 (locks.py): a per-(clinic, phone hash) advisory lock, after the
     doctor rows, so concurrent bookings from one phone attach consistently."""
     phone = caller_number(conn, keyring, clinic_id, session_id)
     if phone is None and not details.name:
@@ -235,7 +247,9 @@ def attach(
                 " WHERE clinic_id=%s AND id=%s",
                 (authorized, details.language, details.language, clinic_id, patient_id),
             )
-    record_consents(
+    kept = record_consents(
         conn, clinic_id, patient_id, details.consents, "voice_call", allow_revoke=authorized
     )
+    if kept_grants is not None:
+        kept_grants.extend(kept)
     return patient_id

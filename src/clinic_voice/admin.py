@@ -1,6 +1,7 @@
 from uuid import uuid4
 
 from fastapi import HTTPException
+from psycopg.errors import CheckViolation
 
 from clinic_voice.audit import audit
 from clinic_voice.domain import as_uuid
@@ -23,30 +24,72 @@ def _update(conn, table, columns, clinic_id, row_id, changes):
     return row
 
 
+CLINIC_COLUMNS = (
+    "id,name,timezone,lead_time_minutes,horizon_days,outbound_enabled,quiet_hours_start,"
+    "quiet_hours_end,reminder_lead_minutes,daily_contact_budget"
+)
+
+
+def _clinic_out(row):
+    if row is None:
+        return None
+    return {
+        **row,
+        "quiet_hours_start": row["quiet_hours_start"].strftime("%H:%M"),
+        "quiet_hours_end": row["quiet_hours_end"].strftime("%H:%M"),
+    }
+
+
 def get_clinic(conn, clinic_id):
-    return conn.execute(
-        "SELECT id,name,timezone,lead_time_minutes,horizon_days FROM clinics WHERE id=%s",
-        (clinic_id,),
-    ).fetchone()
+    return _clinic_out(
+        conn.execute(
+            f"SELECT {CLINIC_COLUMNS} FROM clinics WHERE id=%s",  # noqa: S608
+            (clinic_id,),
+        ).fetchone()
+    )
 
 
 def update_clinic(conn, staff, changes):
-    """Update clinic settings.
+    """Update clinic settings (owner/admin; routes_admin enforces the role).
 
     Timezone and horizon changes are not serialized with in-flight reservations; a booking
-    validated against the old value may commit just after the change (low risk).
+    validated against the old value may commit just after the change (low risk). Contact
+    settings apply to contacts planned or attempted afterwards: each send re-checks
+    outbound_enabled, quiet hours and the budget. A change of outbound_enabled is audited
+    separately ('clinic.outbound_enabled' / 'clinic.outbound_disabled').
     """
     clinic_id = staff["clinic_id"]
-    columns = ("name", "timezone", "lead_time_minutes", "horizon_days")
+    columns = (
+        "name",
+        "timezone",
+        "lead_time_minutes",
+        "horizon_days",
+        "outbound_enabled",
+        "quiet_hours_start",
+        "quiet_hours_end",
+        "reminder_lead_minutes",
+        "daily_contact_budget",
+    )
     if not changes or not set(changes) <= set(columns):
         raise ValueError("invalid update columns")
-    row = conn.execute(
-        f"UPDATE clinics SET {', '.join(f'{k}=%s' for k in changes)} WHERE id=%s"  # noqa: S608
-        " RETURNING id,name,timezone,lead_time_minutes,horizon_days",
-        (*changes.values(), clinic_id),
-    ).fetchone()
+    try:
+        row = conn.execute(
+            f"UPDATE clinics SET {', '.join(f'{k}=%s' for k in changes)} WHERE id=%s"  # noqa: S608
+            f" RETURNING {CLINIC_COLUMNS}",
+            (*changes.values(), clinic_id),
+        ).fetchone()
+    except CheckViolation:
+        # The only clinic CHECK the request model cannot see: start = end after a
+        # one-sided change.
+        conn.rollback()
+        raise HTTPException(422, "quiet hours start and end must differ") from None
     audit(conn, clinic_id, staff["id"], "clinic.updated", clinic_id)
-    return row
+    if "outbound_enabled" in changes:
+        action = (
+            "clinic.outbound_enabled" if changes["outbound_enabled"] else "clinic.outbound_disabled"
+        )
+        audit(conn, clinic_id, staff["id"], action, clinic_id)
+    return _clinic_out(row)
 
 
 DOCTOR_COLUMNS = "id,name,active,booking_calendar_id,busy_calendar_ids,calendar_account_id"

@@ -17,6 +17,7 @@ from datetime import datetime
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
+from clinic_voice import reminders
 from clinic_voice.calendar_sync import refresh_external_busy
 from clinic_voice.domain import as_uuid
 from clinic_voice.errors import LeaseLost, NotFound
@@ -147,8 +148,10 @@ def _confirm(conn, job, ports, target, calendar_id, event_id) -> bool:
     """Confirm the appointment and complete the job in one transaction (both roll back if the
     lease was lost; the new owner reaches the same idempotent outcome).
 
-    If the appointment stopped being pending_sync at this version while the event was being
-    written: at the same version (confirmed elsewhere or moved to review by staff) the event id
+    The confirming transaction also plans the confirmation message and reminders
+    (reminders.on_confirmed; nothing unless the clinic has outbound_enabled and the patient
+    consented). If the appointment stopped being pending_sync at this version while the
+    event was being written: at the same version (confirmed elsewhere or moved to review by staff) the event id
     is recorded and the job completes; if it was cancelled or rescheduled, the job withdraws
     its own event.
     """
@@ -160,7 +163,10 @@ def _confirm(conn, job, ports, target, calendar_id, event_id) -> bool:
         " WHERE clinic_id=%s AND id=%s AND status='pending_sync' AND version=%s RETURNING id",
         (event_id, calendar_id, account_id, *scope),
     ).fetchone()
-    if confirmed is None:
+    if confirmed is not None:
+        # Same transaction: the confirmation message and reminders exist iff it commits.
+        reminders.on_confirmed(conn, *scope)
+    else:
         current = conn.execute(
             "SELECT status, version FROM appointments WHERE clinic_id=%s AND id=%s",
             scope[:2],

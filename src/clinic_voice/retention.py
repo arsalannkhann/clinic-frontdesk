@@ -2,8 +2,8 @@
 nothing schedules it.
 
 - Patients whose retention_until has passed, and who hold no active appointment that has not
-  ended, are deleted with their consent rows. Their appointments stay (they carry no patient
-  data) with patient_id cleared.
+  ended, are deleted with their consent and opt-out rows. Their appointments (and planned
+  contacts) stay, as they carry no patient data, with patient_id cleared.
 - Webhook inbox events received more than `session_days` ago are deleted (before call
   sessions are locked; lock order in locks.py). They hold minimized codes only.
 - Call sessions that started more than `session_days` ago are deleted with their
@@ -48,6 +48,11 @@ def purge(conn, session_days: int, dry_run: bool = False) -> dict[str, int]:
         ),
         "consents": _count(
             conn, "DELETE FROM consents WHERE " + PAIRS.format(column="patient_id"), patient_pairs
+        ),
+        "contact_preferences": _count(
+            conn,
+            "DELETE FROM contact_preferences WHERE " + PAIRS.format(column="patient_id"),
+            patient_pairs,
         ),
     }
     conn.execute("DELETE FROM patients WHERE " + PAIRS.format(column="id"), patient_pairs)

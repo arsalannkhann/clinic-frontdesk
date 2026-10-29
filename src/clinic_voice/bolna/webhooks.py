@@ -222,3 +222,18 @@ def enqueue_reconciles(conn, after: timedelta, limit: int) -> int:
     if rows:
         log.info("reconciliation enqueued count=%d", len(rows))
     return len(rows)
+
+
+# Opt-out from a call disposition (T9): a documented hook, deliberately inert. Bolna documents
+# no opt-out field or disposition value: termination_reason, hangup_reason and hangup_by are
+# not documented as fixed codes (docs/SOURCE_REVIEW.md), and the free-text and
+# extracted_data fields are never stored. Nothing is inferred from them. Once Bolna documents
+# such a field (or the owner approves a contract-tested extraction schema), map it here and
+# record it with reminders.opt_out(..., source="webhook") in the webhook.process transaction.
+OPT_OUT_DISPOSITIONS: frozenset[str] = frozenset()
+
+
+def disposition_opts_out(minimized: dict) -> bool:
+    """Whether a minimized execution says the callee opted out. Always False today (see
+    OPT_OUT_DISPOSITIONS)."""
+    return minimized.get("termination_reason") in OPT_OUT_DISPOSITIONS

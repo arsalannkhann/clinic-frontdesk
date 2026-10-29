@@ -193,6 +193,12 @@ def check_slots(conn, clinic_id, query):
     return {"slots": available, "spoken": spoken_slots(available, zone, query.day)}
 
 
+# Said when a decline could not revoke an existing grant (unverified caller, ADR 0006).
+PREFERENCE_KEPT = (
+    "Your existing contact preferences were not changed: changing them needs your booking"
+    " reference verified on this call, or clinic staff can help."
+)
+
 CONSENT_WORDS = {
     "booking_confirmation": "confirming this booking",
     "reminder_call": "reminder calls",
@@ -238,10 +244,14 @@ def reserve(url, clinic_id, session_id, request, doctor_id, service_id, crypto, 
     key = derive_key(request.execution_id, "reserve-slot", args)
     keyring = crypto[0]
     details = patient_details(request)
+    kept: list[str] = []
 
     def attach(conn, starts_at):
+        kept.clear()  # Only the attempt that commits counts.
         retention_until = starts_at + timedelta(days=retention_days)
-        return patients.attach(conn, keyring, clinic_id, session_id, details, retention_until)
+        return patients.attach(
+            conn, keyring, clinic_id, session_id, details, retention_until, kept_grants=kept
+        )
 
     result = service.reserve(
         url,
@@ -261,7 +271,8 @@ def reserve(url, clinic_id, session_id, request, doctor_id, service_id, crypto, 
         "status": result["status"],
         "starts_at": result["starts_at"],
         "spoken": service.spoken_status(result["status"])
-        + f" Your booking reference is {spoken_reference(reference)}.",
+        + f" Your booking reference is {spoken_reference(reference)}."
+        + (f" {PREFERENCE_KEPT}" if kept else ""),
     }
 
 

@@ -18,6 +18,8 @@ from clinic_voice.schemas import (
     BolnaCancel,
     BolnaChangeOut,
     BolnaContextOut,
+    BolnaOptOut,
+    BolnaOptOutOut,
     BolnaReschedule,
     BolnaReservation,
     BolnaReservationOut,
@@ -159,3 +161,14 @@ def reschedule_booking(request: BolnaReschedule, response: Response, clinic_id=D
         request,
         settings.patient_retention_days,
     )
+
+
+@router.post("/tools/opt-out", response_model=BolnaOptOutOut)
+def opt_out(request: BolnaOptOut, response: Response, clinic_id=Depends(tenant)):
+    """Stop confirmations and reminders for the patient of a booking verified on this call
+    (verify-booking first). Never applies to an unverified caller or by caller number."""
+    response.headers.update(NO_STORE)
+    crypto = gateway.session_crypto(get_settings())
+    with database() as conn:
+        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        return bookings.opt_out(conn, clinic_id, session_id, request)

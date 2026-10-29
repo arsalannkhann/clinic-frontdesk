@@ -11,7 +11,13 @@ from clinic_voice import appointments
 from clinic_voice.config import get_settings
 from clinic_voice.crypto import CryptoError, Keyring
 from clinic_voice.deps import database, require_role
-from clinic_voice.schemas import AppointmentResolve, AppointmentState, StaffAppointmentOut
+from clinic_voice.schemas import (
+    AppointmentResolve,
+    AppointmentState,
+    StaffAppointmentOut,
+    StaffOptOut,
+    StaffOptOutOut,
+)
 
 log = logging.getLogger("clinic_voice.appointments")
 
@@ -57,3 +63,12 @@ def cancel_appointment(appointment_id: UUID, staff=Depends(writer)):
 def resolve_appointment(appointment_id: UUID, request: AppointmentResolve, staff=Depends(writer)):
     with database() as conn:
         return appointments.resolve(conn, staff, appointment_id, request.action)
+
+
+@router.post("/{appointment_id}/opt-out", response_model=StaffOptOutOut)
+def opt_out(appointment_id: UUID, request: StaffOptOut, staff=Depends(writer)):
+    """Opt the appointment's patient out of confirmations and/or reminders."""
+    with database() as conn:
+        return appointments.staff_opt_out(
+            conn, staff, appointment_id, request.purpose, request.channel
+        )

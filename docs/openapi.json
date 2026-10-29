@@ -950,6 +950,98 @@
         }
       }
     },
+    "/v1/admin/reminders": {
+      "get": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "List Reminders",
+        "description": "Planned and attempted contacts (confirmations, reminder calls and messages), e.g.\nstatus=needs_review for contacts whose outcome is unknown.",
+        "operationId": "list_reminders_v1_admin_reminders_get",
+        "parameters": [
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "scheduled",
+                    "sending",
+                    "sent",
+                    "unknown",
+                    "needs_review",
+                    "cancelled",
+                    "suppressed",
+                    "failed"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Status"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "maximum": 500,
+              "minimum": 1,
+              "default": 100,
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ReminderOut"
+                  },
+                  "title": "Response List Reminders V1 Admin Reminders Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/admin/appointments": {
       "get": {
         "tags": [
@@ -1182,6 +1274,76 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StaffAppointmentOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/admin/appointments/{appointment_id}/opt-out": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Opt Out",
+        "description": "Opt the appointment's patient out of confirmations and/or reminders.",
+        "operationId": "opt_out_v1_admin_appointments__appointment_id__opt_out_post",
+        "parameters": [
+          {
+            "name": "appointment_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Appointment Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StaffOptOut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StaffOptOutOut"
                 }
               }
             }
@@ -1852,6 +2014,66 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/BolnaChangeOut"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/bolna/tools/opt-out": {
+      "post": {
+        "tags": [
+          "bolna"
+        ],
+        "summary": "Opt Out",
+        "description": "Stop confirmations and reminders for the patient of a booking verified on this call\n(verify-booking first). Never applies to an unverified caller or by caller number.",
+        "operationId": "opt_out_v1_bolna_tools_opt_out_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BolnaOptOut"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BolnaOptOutOut"
                 }
               }
             }
@@ -2746,6 +2968,74 @@
         ],
         "title": "BolnaDoctorOut"
       },
+      "BolnaOptOut": {
+        "properties": {
+          "execution_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Execution Id"
+          },
+          "from_number": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "From Number",
+            "default": ""
+          },
+          "agent_id": {
+            "type": "string",
+            "maxLength": 64,
+            "title": "Agent Id",
+            "default": ""
+          },
+          "booking_reference": {
+            "type": "string",
+            "maxLength": 32,
+            "title": "Booking Reference"
+          },
+          "scope": {
+            "type": "string",
+            "enum": [
+              "all",
+              "calls",
+              "messages"
+            ],
+            "title": "Scope",
+            "default": "all"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "execution_id",
+          "booking_reference"
+        ],
+        "title": "BolnaOptOut",
+        "description": "Opt the patient of a booking verified on this call out of reminders and confirmations\non the given channels (\"all\", \"calls\" or \"messages\")."
+      },
+      "BolnaOptOutOut": {
+        "properties": {
+          "opted_out": {
+            "type": "boolean",
+            "title": "Opted Out"
+          },
+          "scope": {
+            "type": "string",
+            "title": "Scope"
+          },
+          "spoken": {
+            "type": "string",
+            "title": "Spoken"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "opted_out",
+          "scope",
+          "spoken"
+        ],
+        "title": "BolnaOptOutOut"
+      },
       "BolnaReschedule": {
         "properties": {
           "execution_id": {
@@ -3212,6 +3502,26 @@
           "horizon_days": {
             "type": "integer",
             "title": "Horizon Days"
+          },
+          "outbound_enabled": {
+            "type": "boolean",
+            "title": "Outbound Enabled"
+          },
+          "quiet_hours_start": {
+            "type": "string",
+            "title": "Quiet Hours Start"
+          },
+          "quiet_hours_end": {
+            "type": "string",
+            "title": "Quiet Hours End"
+          },
+          "reminder_lead_minutes": {
+            "type": "integer",
+            "title": "Reminder Lead Minutes"
+          },
+          "daily_contact_budget": {
+            "type": "integer",
+            "title": "Daily Contact Budget"
           }
         },
         "additionalProperties": false,
@@ -3221,7 +3531,12 @@
           "name",
           "timezone",
           "lead_time_minutes",
-          "horizon_days"
+          "horizon_days",
+          "outbound_enabled",
+          "quiet_hours_start",
+          "quiet_hours_end",
+          "reminder_lead_minutes",
+          "daily_contact_budget"
         ],
         "title": "ClinicConfig"
       },
@@ -3278,6 +3593,67 @@
               }
             ],
             "title": "Horizon Days"
+          },
+          "outbound_enabled": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Outbound Enabled"
+          },
+          "quiet_hours_start": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quiet Hours Start"
+          },
+          "quiet_hours_end": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^([01]\\d|2[0-3]):[0-5]\\d$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Quiet Hours End"
+          },
+          "reminder_lead_minutes": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 10080.0,
+                "minimum": 60.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reminder Lead Minutes"
+          },
+          "daily_contact_budget": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 100000.0,
+                "minimum": 0.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Contact Budget"
           }
         },
         "additionalProperties": false,
@@ -3778,6 +4154,120 @@
         ],
         "title": "PasswordChange"
       },
+      "ReminderOut": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "appointment_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Appointment Id"
+          },
+          "appointment_version": {
+            "type": "integer",
+            "title": "Appointment Version"
+          },
+          "channel": {
+            "type": "string",
+            "title": "Channel"
+          },
+          "purpose": {
+            "type": "string",
+            "title": "Purpose"
+          },
+          "scheduled_for": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Scheduled For"
+          },
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "attempts": {
+            "type": "integer",
+            "title": "Attempts"
+          },
+          "last_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Error"
+          },
+          "provider_execution_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider Execution Id"
+          },
+          "stop_outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stop Outcome"
+          },
+          "sent_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sent At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "appointment_id",
+          "appointment_version",
+          "channel",
+          "purpose",
+          "scheduled_for",
+          "status",
+          "attempts",
+          "last_error",
+          "provider_execution_id",
+          "stop_outcome",
+          "sent_at",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ReminderOut",
+        "description": "Operational view of a planned contact: ids, times and codes only. No patient data,\nmessage text or provider message id."
+      },
       "ReservationRequest": {
         "properties": {
           "doctor_id": {
@@ -4144,6 +4634,58 @@
         ],
         "title": "StaffAppointmentOut",
         "description": "Minimal fields. patient_name and phone_last2 are filled for owner/admin only (null for\nviewer, and when the patient record is missing or cannot be decrypted)."
+      },
+      "StaffOptOut": {
+        "properties": {
+          "purpose": {
+            "type": "string",
+            "enum": [
+              "all",
+              "booking_confirmation",
+              "reminder"
+            ],
+            "title": "Purpose",
+            "default": "all"
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "all",
+              "call",
+              "message"
+            ],
+            "title": "Channel",
+            "default": "all"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "StaffOptOut",
+        "description": "Opt the appointment's patient out; 'all' covers every purpose or channel."
+      },
+      "StaffOptOutOut": {
+        "properties": {
+          "purpose": {
+            "type": "string",
+            "title": "Purpose"
+          },
+          "channel": {
+            "type": "string",
+            "title": "Channel"
+          },
+          "suppressed": {
+            "type": "integer",
+            "title": "Suppressed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "purpose",
+          "channel",
+          "suppressed"
+        ],
+        "title": "StaffOptOutOut"
       },
       "StaffUser": {
         "properties": {

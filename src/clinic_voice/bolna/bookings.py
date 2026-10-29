@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 from psycopg.errors import ExclusionViolation, UniqueViolation
 
-from clinic_voice import appointments, patients, service
+from clinic_voice import appointments, patients, reminders, service
 from clinic_voice.bolna.gateway import derive_key
 from clinic_voice.db import connect
 from clinic_voice.domain import ACTIVE_STATUSES, normalize_reference, spoken_reference
@@ -52,6 +52,17 @@ NOT_ACTIVE = "That booking is no longer active, so nothing was changed."
 STARTED = "That appointment time has already passed, so I cannot change it. Clinic staff can help."
 SAME_TIME = "That is already the time of this appointment, so nothing was changed."
 UNAVAILABLE = "That new time is not available. Your original appointment is unchanged."
+OPT_OUT_NOT_VERIFIED = (
+    "To stop reminders I first need to verify your booking reference on this call."
+    " Clinic staff can also do this for you. Nothing was changed."
+)
+OPT_OUT_NO_PATIENT = "I cannot change contact preferences for that booking. Clinic staff can help."
+OPT_OUT_SCOPES = {"all": "all", "calls": "call", "messages": "message"}
+OPT_OUT_WORDS = {
+    "all": "calls or messages",
+    "call": "calls",
+    "message": "messages",
+}
 
 
 def _zone(conn, clinic_id) -> ZoneInfo:
@@ -322,3 +333,29 @@ def _replayed(conn, clinic_id, key, request_hash, row, zone):
     if new_row["request_hash"] != request_hash:
         raise HTTPException(409, "Idempotency key reused with different request")
     return _rescheduled(new_row, row["booking_reference"], zone)
+
+
+def opt_out(conn, clinic_id, session_id, request):
+    """Opt the patient of a booking this session verified (reference + caller number) out
+    of reminders and confirmations on the requested channels. Requires that verification:
+    caller ID alone is spoofable, and an opt-out by caller number could silence another
+    patient's reminders (ADR 0008). Unverified (or handoff) sessions get a speakable 403.
+    Idempotent; suppresses that patient's unsent contacts at once."""
+    try:
+        row = _verified(conn, clinic_id, session_id, request.booking_reference)
+    except HTTPException as error:
+        if error.detail == NOT_VERIFIED:
+            raise HTTPException(403, OPT_OUT_NOT_VERIFIED) from None
+        raise
+    if row["patient_id"] is None:
+        raise HTTPException(409, OPT_OUT_NO_PATIENT)
+    channel = OPT_OUT_SCOPES[request.scope]
+    reminders.opt_out(conn, clinic_id, row["patient_id"], "all", channel, "tool")
+    return {
+        "opted_out": True,
+        "scope": request.scope,
+        "spoken": (
+            f"Done. The clinic will not send you appointment {OPT_OUT_WORDS[channel]}"
+            " about your bookings. Clinic staff can change this if you want them again."
+        ),
+    }
