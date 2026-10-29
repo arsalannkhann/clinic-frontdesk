@@ -47,7 +47,9 @@ def credential_command(url, args):
     with connect(url) as conn:
         if args.action == "issue":
             try:
-                credential_id, token = credentials.issue(conn, args.clinic, args.label)
+                credential_id, token = credentials.issue(
+                    conn, args.clinic, args.label, scope=args.scope
+                )
             except ForeignKeyViolation:
                 raise SystemExit("Clinic not found") from None
         elif args.action == "rotate":
@@ -68,6 +70,10 @@ def credential_command(url, args):
     # Printed exactly once, to stdout only; store it in the gateway's secret manager.
     print(f"credential_id={credential_id}")
     print(f"token={token}")
+    if credentials.parse(token, scope="webhook") is not None:
+        # The webhook credential is a URL path segment: Bolna's webhook_url is
+        # <public base>/v1/webhooks/bolna/<token>. Treat the whole URL as a secret.
+        print(f"webhook_path=/v1/webhooks/bolna/{token}")
 
 
 def read_password():
@@ -153,10 +159,43 @@ def build_ports(calendar, url, settings):
     )
 
 
+def build_bolna(choice, url, settings):
+    """The Bolna port for reconciliation (bolna.reconcile), or None when not requested."""
+    if choice is None:
+        return None
+    if choice == "fake":
+        from clinic_voice.providers.bolna import FakeBolna
+
+        if not fake_calendar_allowed(url, settings):
+            raise SystemExit(
+                "Refusing --bolna fake: it would reconcile call sessions against a fake"
+                " provider. Use a database whose name ends in _test or _dev, or set"
+                " APP_ENV=development."
+            )
+        print(
+            "WARNING: --bolna fake uses an in-process FakeBolna that knows no executions;"
+            " development only.",
+            file=sys.stderr,
+        )
+        return FakeBolna()
+    key = settings.bolna_api_key
+    if key is None or not key.get_secret_value():
+        raise SystemExit("Set BOLNA_API_KEY to use --bolna live.")
+    import httpx
+
+    from clinic_voice.providers.bolna import DEFAULT_TIMEOUT, BolnaClient
+
+    http = httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=False)
+    return BolnaClient(key.get_secret_value(), http, settings.bolna_api_base)
+
+
 def worker_command(url, args, settings):
+    from dataclasses import replace
+
     from clinic_voice.outbox import run_loop, run_once
 
     ports = build_ports(args.calendar, url, settings)
+    ports = replace(ports, bolna=build_bolna(args.bolna, url, settings))
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     for noisy in ("httpx", "httpcore"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
@@ -199,6 +238,20 @@ def bolna_command(url, args, settings):
     print(json.dumps(agent_config.redact(payload), indent=2, ensure_ascii=False))
 
 
+def bolna_agent_command(url, args):
+    """Record (or clear) the clinic's Bolna agent id. Webhooks naming another agent are
+    then refused. Nothing is sent to Bolna."""
+    agent_id = None if args.clear else str(args.agent_id)
+    with connect(url) as conn:
+        row = conn.execute(
+            "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s RETURNING id",
+            (agent_id, args.clinic),
+        ).fetchone()
+    if row is None:
+        raise SystemExit("Clinic not found")
+    print(f"bolna_agent_id={agent_id or ''}")
+
+
 def retention_command(url, args, settings):
     """Purge expired patient records and old call sessions. Prints counts only."""
     from clinic_voice.retention import purge
@@ -223,6 +276,12 @@ def main(argv=None):
     issue = actions.add_parser("issue")
     issue.add_argument("--clinic", type=UUID, required=True)
     issue.add_argument("--label", required=True)
+    issue.add_argument(
+        "--scope",
+        choices=["tools", "webhook"],
+        default="tools",
+        help="tools: Bolna tool/API bearer token; webhook: Bolna webhook URL credential",
+    )
     rotate = actions.add_parser("rotate")
     rotate.add_argument("credential", type=UUID)
     rotate.add_argument("--grace-minutes", type=int, default=60, help="0 to 10080")
@@ -242,6 +301,11 @@ def main(argv=None):
     worker.add_argument(
         "--calendar", choices=["fake", "google"], help="Calendar provider (fake: dev only)"
     )
+    worker.add_argument(
+        "--bolna",
+        choices=["fake", "live"],
+        help="Bolna port for call reconciliation (fake: dev only; live: BOLNA_API_KEY)",
+    )
     worker.add_argument("--worker-id", help="Lease owner name (default host:pid)")
     worker.add_argument("--interval", type=float, default=2.0, help="Idle poll seconds")
     bolna = commands.add_parser("bolna", help="Bolna agent configuration (offline only)")
@@ -251,6 +315,13 @@ def main(argv=None):
     )
     compile_agent.add_argument("--clinic", type=UUID, required=True)
     compile_agent.add_argument("--gateway-url", help="Public base URL (default from settings)")
+    set_agent = bolna_actions.add_parser(
+        "set-agent", help="Record the clinic's Bolna agent id (webhook cross-check)"
+    )
+    set_agent.add_argument("--clinic", type=UUID, required=True)
+    agent_choice = set_agent.add_mutually_exclusive_group(required=True)
+    agent_choice.add_argument("--agent-id", type=UUID)
+    agent_choice.add_argument("--clear", action="store_true")
     retention = commands.add_parser("retention", help="Data retention (operator-run only)")
     retention_actions = retention.add_subparsers(dest="action", required=True)
     purge = retention_actions.add_parser(
@@ -290,6 +361,8 @@ def main(argv=None):
         staff_command(url, args)
     elif args.command == "worker":
         worker_command(url, args, settings)
+    elif args.command == "bolna" and args.action == "set-agent":
+        bolna_agent_command(url, args)
     elif args.command == "bolna":
         bolna_command(url, args, settings)
     elif args.command == "retention":

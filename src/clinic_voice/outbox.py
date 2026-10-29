@@ -10,7 +10,7 @@ later claim.
 
 The lease is renewed just before a job starts and by handlers between provider calls
 (renew()). Adapter timeouts must therefore stay well under the lease: check_ports() rejects a
-calendar adapter whose `timeout_seconds` exceeds lease / LEASE_TIMEOUT_RATIO.
+calendar or Bolna adapter whose `timeout_seconds` exceeds lease / LEASE_TIMEOUT_RATIO.
 
 Provider I/O always runs with the connection idle (no open transaction). `last_error` holds
 fixed short codes from this package, never provider text, and logs carry job id, kind and a
@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import timedelta
+from functools import partial
 from threading import Event
 from typing import Any
 from uuid import UUID
@@ -35,6 +36,7 @@ from psycopg.pq import TransactionStatus
 from psycopg.types.json import Jsonb
 
 from clinic_voice.db import connect
+from clinic_voice.providers.bolna import BolnaPort, FakeBolna
 from clinic_voice.providers.calendar import (
     CalendarPort,
     FakeCalendar,
@@ -84,10 +86,15 @@ class Ports:
     (committed), since provider I/O follows. It must declare `timeout_seconds` for its
     adapters (checked by check_ports). Optional resolver methods: mark_error(conn,
     clinic_id, account_id) when the provider rejected the account's credentials, and
-    revoke_grant(conn, clinic_id, account_id) for calendar.revoke_grant jobs."""
+    revoke_grant(conn, clinic_id, account_id) for calendar.revoke_grant jobs.
+
+    `bolna` is the Bolna platform port for bolna.reconcile (FakeBolna or BolnaClient). None:
+    reconciliation is not enqueued, and a reconcile job is dead-lettered
+    ('bolna_unconfigured')."""
 
     calendar: CalendarPort | None = None
     calendar_for: Callable[..., tuple[CalendarPort, UUID | None] | None] | None = None
+    bolna: BolnaPort | None = None
 
     def __post_init__(self):
         if (self.calendar is None) == (self.calendar_for is None):
@@ -125,19 +132,25 @@ def _handlers() -> dict[str, Handler]:
     return HANDLERS
 
 
-def check_ports(ports, lease=DEFAULT_LEASE):
-    """Every adapter (or resolver) except the in-process FakeCalendar must declare a numeric
-    `timeout_seconds` (not a bool), and it must be at most lease / LEASE_TIMEOUT_RATIO."""
-    adapter = ports.calendar if ports.calendar is not None else ports.calendar_for
-    if isinstance(adapter, FakeCalendar):
-        return
+def _check_timeout(name, adapter, lease):
     timeout = getattr(adapter, "timeout_seconds", None)
     if isinstance(timeout, bool) or not isinstance(timeout, int | float) or timeout <= 0:
-        raise ValueError("calendar adapter must declare a positive timeout_seconds")
+        raise ValueError(f"{name} adapter must declare a positive timeout_seconds")
     if timeout * LEASE_TIMEOUT_RATIO > lease.total_seconds():
         raise ValueError(
-            f"calendar timeout {timeout}s is too long for a {lease.total_seconds():.0f}s lease"
+            f"{name} timeout {timeout}s is too long for a {lease.total_seconds():.0f}s lease"
         )
+
+
+def check_ports(ports, lease=DEFAULT_LEASE):
+    """Every adapter (or resolver) except the in-process FakeCalendar and FakeBolna must
+    declare a numeric `timeout_seconds` (not a bool), at most lease / LEASE_TIMEOUT_RATIO."""
+    adapter = ports.calendar if ports.calendar is not None else ports.calendar_for
+    if not isinstance(adapter, FakeCalendar):
+        _check_timeout("calendar", adapter, lease)
+    bolna = getattr(ports, "bolna", None)
+    if bolna is not None and not isinstance(bolna, FakeBolna):
+        _check_timeout("bolna", bolna, lease)
 
 
 def backoff(attempts: int) -> timedelta:
@@ -404,10 +417,22 @@ def run_once(url, worker_id, ports, limit=10, lease=DEFAULT_LEASE, kinds=None) -
 HOUSEKEEPING_INTERVAL = 600.0
 
 
-def _default_housekeeping(conn):
+def _default_housekeeping(conn, ports=None):
+    """Prune expired OAuth states; with a Bolna port, also enqueue (bounded) reconciliation
+    of call sessions that have no final provider status."""
     from clinic_voice.calendar_accounts import prune_oauth_states
 
     prune_oauth_states(conn)
+    if ports is not None and getattr(ports, "bolna", None) is not None:
+        from clinic_voice.bolna.webhooks import enqueue_reconciles
+        from clinic_voice.config import get_settings
+
+        settings = get_settings()
+        enqueue_reconciles(
+            conn,
+            timedelta(minutes=settings.bolna_reconcile_after_minutes),
+            settings.bolna_reconcile_batch,
+        )
 
 
 def run_loop(
@@ -427,11 +452,12 @@ def run_loop(
 
     One connection is reused across idle polls. Database errors close it and back off
     exponentially (1 s doubling to 30 s) before reconnecting. When idle, `housekeeping(conn)`
-    (default: prune expired OAuth states) runs at most every HOUSEKEEPING_INTERVAL seconds.
+    (default: prune expired OAuth states and, with ports.bolna, enqueue reconciliation) runs
+    at most every HOUSEKEEPING_INTERVAL seconds.
     """
     check_ports(ports, lease)
     wait = wait or stop.wait
-    housekeeping = housekeeping or _default_housekeeping
+    housekeeping = housekeeping or partial(_default_housekeeping, ports=ports)
     conn, failures, last_housekeeping = None, 0, None
     try:
         while not stop.is_set():

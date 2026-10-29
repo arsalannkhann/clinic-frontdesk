@@ -1,4 +1,4 @@
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
@@ -6,6 +6,13 @@ from clinic_voice.audit import audit
 from clinic_voice.locks import lock_doctor_set, lock_doctors
 
 NOT_FOUND = "Not found"
+
+
+def _uuid(value):
+    try:
+        return None if value is None else UUID(str(value))
+    except ValueError:
+        return None
 
 
 def _update(conn, table, columns, clinic_id, row_id, changes):
@@ -210,18 +217,31 @@ def requeue_outbox(conn, staff, job_id):
     from clinic_voice.outbox import DEFAULT_MAX_ATTEMPTS
 
     clinic_id = staff["clinic_id"]
-    # Lock order (locks.py): appointment row (5) before outbox row (6), as in the worker and
-    # appointments.resolve. The appointment id of a job never changes, so read it unlocked,
-    # lock the appointment, then lock the job and re-check its state.
+    # Lock order (locks.py): appointment row (5), then a webhook.process job's inbox row,
+    # then the outbox row (6). The job's appointment id and payload never change, so read
+    # them unlocked first. Return 409 before locking anything unless the job is already dead:
+    # a job being dead-lettered still reads 'processing' here until that transaction (which
+    # locks the outbox row before its on_dead hook updates the appointment) commits, so this
+    # request never holds the appointment while waiting for that outbox row.
     peek = conn.execute(
-        "SELECT appointment_id FROM outbox WHERE clinic_id=%s AND id=%s", (clinic_id, job_id)
+        "SELECT status, kind, appointment_id, payload->>'inbox_id' AS inbox_id FROM outbox"
+        " WHERE clinic_id=%s AND id=%s",
+        (clinic_id, job_id),
     ).fetchone()
     if not peek:
         raise HTTPException(404, NOT_FOUND)
+    if peek["status"] != "dead":
+        raise HTTPException(409, "Only dead jobs can be requeued")
     if peek["appointment_id"] is not None:
         conn.execute(
             "SELECT id FROM appointments WHERE clinic_id=%s AND id=%s FOR UPDATE",
             (clinic_id, peek["appointment_id"]),
+        )
+    inbox_id = _uuid(peek["inbox_id"]) if peek["kind"] == "webhook.process" else None
+    if inbox_id is not None:
+        conn.execute(
+            "SELECT id FROM webhook_inbox WHERE clinic_id=%s AND id=%s FOR UPDATE",
+            (clinic_id, inbox_id),
         )
     job = conn.execute(
         "SELECT o.status, o.kind, o.last_error, o.appointment_id, o.appointment_version,"
@@ -247,6 +267,13 @@ def requeue_outbox(conn, staff, job_id):
             "UPDATE appointments SET status='pending_sync', updated_at=now()"
             " WHERE clinic_id=%s AND id=%s AND status='needs_review' AND version=%s",
             (clinic_id, job["appointment_id"], job["appointment_version"]),
+        )
+    if inbox_id is not None:
+        # The dead-letter hook marked the event failed; the requeued job processes it again.
+        conn.execute(
+            "UPDATE webhook_inbox SET status='received', outcome=NULL, processed_at=NULL"
+            " WHERE clinic_id=%s AND id=%s AND status='failed'",
+            (clinic_id, inbox_id),
         )
     audit(conn, clinic_id, staff["id"], "outbox.requeued", job_id)
     return row

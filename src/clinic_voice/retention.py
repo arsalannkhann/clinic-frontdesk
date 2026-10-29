@@ -4,6 +4,8 @@ nothing schedules it.
 - Patients whose retention_until has passed, and who hold no active appointment that has not
   ended, are deleted with their consent rows. Their appointments stay (they carry no patient
   data) with patient_id cleared.
+- Webhook inbox events received more than `session_days` ago are deleted (before call
+  sessions are locked; lock order in locks.py). They hold minimized codes only.
 - Call sessions that started more than `session_days` ago are deleted with their
   verification records (ON DELETE CASCADE). appointments.call_session_id and
   appointment_changes.call_session_id are cleared first: those foreign keys have no ON
@@ -49,6 +51,11 @@ def purge(conn, session_days: int, dry_run: bool = False) -> dict[str, int]:
         ),
     }
     conn.execute("DELETE FROM patients WHERE " + PAIRS.format(column="id"), patient_pairs)
+    result["webhook_events"] = _count(
+        conn,
+        "DELETE FROM webhook_inbox WHERE received_at < now() - make_interval(days => %s)",
+        (session_days,),
+    )
     sessions = conn.execute(
         """SELECT clinic_id, id FROM call_sessions
         WHERE started_at < now() - make_interval(days => %s)

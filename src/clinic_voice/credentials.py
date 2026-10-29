@@ -4,8 +4,15 @@ import secrets
 from datetime import timedelta
 from uuid import UUID, uuid4
 
-# Format: cvt_<credential id hex>.<43-char urlsafe secret>. The id is a lookup handle, not a secret.
-TOKEN_PATTERN = re.compile(r"^cvt_([0-9a-f]{32})\.([A-Za-z0-9_-]{43})$")
+# Format: <prefix>_<credential id hex>.<43-char urlsafe secret>. The id is a lookup handle,
+# not a secret. The prefix names the scope: cvt_ tool credentials (Authorization header of
+# the tool APIs), cvw_ webhook credentials (path segment of /v1/webhooks/bolna/{token}).
+PREFIXES = {"tools": "cvt", "webhook": "cvw"}
+PATTERNS = {
+    scope: re.compile(rf"^{prefix}_([0-9a-f]{{32}})\.([A-Za-z0-9_-]{{43}})$")
+    for scope, prefix in PREFIXES.items()
+}
+TOKEN_PATTERN = PATTERNS["tools"]
 LAST_USED_RESOLUTION = timedelta(minutes=5)
 
 
@@ -14,32 +21,36 @@ def digest(secret: str) -> bytes:
     return hashlib.sha256(secret.encode()).digest()
 
 
-def parse(token: str):
-    match = TOKEN_PATTERN.fullmatch(token)
+def parse(token: str, scope: str = "tools"):
+    if not isinstance(token, str):
+        return None
+    match = PATTERNS[scope].fullmatch(token)
     if not match:
         return None
     return UUID(match.group(1)), match.group(2)
 
 
-def _insert(conn, clinic_id, label, rotated_from=None, expires_at=None):
+def _insert(conn, clinic_id, label, rotated_from=None, expires_at=None, scope="tools"):
+    prefix = PREFIXES[scope]
     credential_id, secret = uuid4(), secrets.token_urlsafe(32)
     conn.execute(
         """INSERT INTO tenant_credentials (id,clinic_id,scope,label,secret_hash,rotated_from,expires_at)
-        VALUES (%s,%s,'tools',%s,%s,%s,%s)""",
-        (credential_id, clinic_id, label, digest(secret), rotated_from, expires_at),
+        VALUES (%s,%s,%s,%s,%s,%s,%s)""",
+        (credential_id, clinic_id, scope, label, digest(secret), rotated_from, expires_at),
     )
-    return credential_id, f"cvt_{credential_id.hex}.{secret}"
+    return credential_id, f"{prefix}_{credential_id.hex}.{secret}"
 
 
-def issue(conn, clinic_id, label, expires_at=None):
+def issue(conn, clinic_id, label, expires_at=None, scope="tools"):
     """Return (credential_id, token). The token is not recoverable after this call."""
-    return _insert(conn, clinic_id, label, expires_at=expires_at)
+    return _insert(conn, clinic_id, label, expires_at=expires_at, scope=scope)
 
 
 def rotate(conn, credential_id, grace: timedelta):
-    """Issue a replacement; the old credential stays valid for at most `grace`."""
+    """Issue a replacement of the same scope; the old credential stays valid for at most
+    `grace`."""
     old = conn.execute(
-        """SELECT clinic_id, label FROM tenant_credentials WHERE id=%s AND revoked_at IS NULL
+        """SELECT clinic_id, label, scope FROM tenant_credentials WHERE id=%s AND revoked_at IS NULL
         AND (expires_at IS NULL OR expires_at > now()) FOR UPDATE""",
         (credential_id,),
     ).fetchone()
@@ -50,7 +61,9 @@ def rotate(conn, credential_id, grace: timedelta):
         WHERE id=%s""",
         (grace, credential_id),
     )
-    return _insert(conn, old["clinic_id"], old["label"], rotated_from=credential_id)
+    return _insert(
+        conn, old["clinic_id"], old["label"], rotated_from=credential_id, scope=old["scope"]
+    )
 
 
 def revoke(conn, credential_id) -> bool:
@@ -61,18 +74,19 @@ def revoke(conn, credential_id) -> bool:
     return row is not None
 
 
-def authenticate(conn, token: str):
-    """Return the clinic for an active tools credential, else None. Callers must not say why."""
-    parsed = parse(token)
+def authenticate(conn, token: str, scope: str = "tools"):
+    """Return the clinic for an active credential of `scope`, else None. Callers must not say
+    why. A token of one scope never authenticates for another (prefix and stored scope)."""
+    parsed = parse(token, scope)
     if not parsed:
         return None
     credential_id, secret = parsed
     row = conn.execute(
         """SELECT clinic_id, secret_hash, last_used_at < now() - %s AS stale_use,
         last_used_at IS NULL AS never_used FROM tenant_credentials
-        WHERE id=%s AND scope='tools' AND revoked_at IS NULL
+        WHERE id=%s AND scope=%s AND revoked_at IS NULL
         AND (expires_at IS NULL OR expires_at > now())""",
-        (LAST_USED_RESOLUTION, credential_id),
+        (LAST_USED_RESOLUTION, credential_id, scope),
     ).fetchone()
     # Compare against a dummy digest on a miss so lookups and mismatches take similar work.
     expected = row["secret_hash"] if row else bytes(32)

@@ -1869,6 +1869,51 @@
         }
       }
     },
+    "/v1/webhooks/bolna/{webhook_token}": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Bolna Webhook",
+        "description": "Receive a Bolna execution status update. The path token is the clinic's webhook\ncredential; nothing in the body selects the clinic.",
+        "operationId": "bolna_webhook_v1_webhooks_bolna__webhook_token__post",
+        "parameters": [
+          {
+            "name": "webhook_token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Webhook Token"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WebhookReceipt"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials"
+          },
+          "403": {
+            "description": "Source address or agent not allowed"
+          },
+          "413": {
+            "description": "Request body too large"
+          },
+          "422": {
+            "description": "Unrecognized webhook event"
+          }
+        }
+      }
+    },
     "/health/live": {
       "get": {
         "summary": "Live",
@@ -4271,6 +4316,25 @@
           "type"
         ],
         "title": "ValidationError"
+      },
+      "WebhookReceipt": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "accepted",
+              "duplicate"
+            ],
+            "title": "Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "WebhookReceipt",
+        "description": "accepted: stored with a processing job. duplicate: this event was already stored."
       }
     }
   }

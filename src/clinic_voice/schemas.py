@@ -543,3 +543,12 @@ class StaffAppointmentOut(StrictModel):
 
 class AppointmentResolve(StrictModel):
     action: Literal["requeue", "cancel"]
+
+
+# Bolna execution webhooks (routes_webhooks.py). The request body is read and minimized by
+# the route itself (providers.bolna.minimize_execution), not modelled here: unknown fields
+# are expected and dropped rather than rejected.
+class WebhookReceipt(StrictModel):
+    """accepted: stored with a processing job. duplicate: this event was already stored."""
+
+    status: Literal["accepted", "duplicate"]

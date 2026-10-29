@@ -21,16 +21,22 @@ list phone numbers.
   (outcome unknown, never success). On reads, and for connection failures before anything
   was sent, ProviderRetryable.
 
+minimize_execution() is the single allowlist for execution data (webhook bodies and
+GET /executions alike); STATUS_RANK and FINAL_STATUSES define the monotonic status order
+used by the webhook processor and reconciliation.
+
 Exceptions carry fixed short codes only. Bodies (transcripts, numbers, provider messages)
 and the API key are never logged or raised; httpx errors are not chained.
 """
 
+import json
+import math
 import re
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from threading import Lock
 from typing import Protocol
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 
@@ -44,8 +50,8 @@ from clinic_voice.providers.http import MAX_RETRY_AFTER, retry_after
 
 DEFAULT_BASE = "https://api.bolna.ai"
 DEFAULT_TIMEOUT = 10.0
-# Statuses we treat as terminal (no further updates expected). This is our reading of the
-# documented status enum; Bolna does not document which statuses are final.
+# Statuses after which the call itself is over. call-disconnected means "ended, post-call
+# processing pending" and is normally followed by completed (docs/SOURCE_REVIEW.md).
 TERMINAL_STATUSES = frozenset(
     {
         "completed",
@@ -59,12 +65,126 @@ TERMINAL_STATUSES = frozenset(
         "error",
     }
 )
+# Statuses after which nothing changes. The call status page names only `completed` as the
+# final status of every conversation; the unanswered/unsuccessful statuses are treated as
+# final as well (our reading: the docs describe no transition out of them).
+FINAL_STATUSES = TERMINAL_STATUSES - {"call-disconnected"}
+# Monotonic progression used by the webhook processor and reconciliation: a status is
+# applied only if its rank is at least the current one, and nothing replaces a final one.
+# Equal ranks (scheduled/rescheduled, a repeated status) are lateral moves.
+STATUS_RANK = {
+    "scheduled": 1,
+    "rescheduled": 1,
+    "queued": 2,
+    "initiated": 3,
+    "ringing": 4,
+    "in-progress": 5,
+    "call-disconnected": 6,
+    **dict.fromkeys(FINAL_STATUSES, 7),
+}
+ENDED_RANK = 6
+FINAL_RANK = 7
 SAFE_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
+
+
+STATUS_PATTERN = re.compile(r"^[a-z][a-z-]{0,31}$")
+CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+NUMBER_PATTERN = re.compile(r"^[0-9]{1,9}(\.[0-9]{1,6})?$")
+MAX_NUMBER = 1e9
+
+
+def _uuid_text(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return str(UUID(value))
+    except ValueError:
+        return None
+
+
+def _code(value) -> str | None:
+    """A short machine code (termination or hangup reason); anything else, including free
+    text with spaces, is dropped."""
+    return value if isinstance(value, str) and CODE_PATTERN.fullmatch(value) else None
+
+
+def _number(value) -> float | None:
+    """A finite non-negative number (or numeric string), else None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and NUMBER_PATTERN.fullmatch(value):
+        value = float(value)
+    if isinstance(value, int | float) and math.isfinite(value) and 0 <= value <= MAX_NUMBER:
+        return float(value)
+    return None
+
+
+def _integer(value) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if -(2**31) < value < 2**31 else None
+
+
+def _timestamp(value) -> str | None:
+    """An offset-aware ISO 8601 timestamp, normalized to UTC; naive or invalid values are
+    dropped (the docs do not state the format)."""
+    if not isinstance(value, str) or len(value) > 40:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.astimezone(UTC).isoformat()
+
+
+def minimize_execution(body) -> dict | None:
+    """The allowlisted fields of an execution payload (webhook body or GET /executions),
+    or None if it has no UUID `id` or no well-formed `status`.
+
+    Kept: execution id, status, agent id, created/initiated/updated timestamps, conversation
+    and telephony durations, termination and hangup codes, hangup_by, the provider's numeric
+    hangup code, call type and numeric total cost. Everything else is dropped: transcript,
+    summary, extracted_data, recording_url, user_number/agent_number, to/from numbers,
+    context_details, error_message, smart_status and any field this list does not name.
+    Absent or invalid values are omitted, never guessed."""
+    if not isinstance(body, dict):
+        return None
+    execution_id = _uuid_text(body.get("id"))
+    status = body.get("status")
+    if execution_id is None or not isinstance(status, str) or not STATUS_PATTERN.fullmatch(status):
+        return None
+    telephony = body.get("telephony_data")
+    telephony = telephony if isinstance(telephony, dict) else {}
+    call_type = telephony.get("call_type")
+    fields = {
+        "execution_id": execution_id,
+        "status": status,
+        "agent_id": _uuid_text(body.get("agent_id")),
+        "created_at": _timestamp(body.get("created_at")),
+        "initiated_at": _timestamp(body.get("initiated_at")),
+        "updated_at": _timestamp(body.get("updated_at")),
+        "conversation_duration": _number(body.get("conversation_duration")),
+        "telephony_duration": _number(telephony.get("duration")),
+        "termination_reason": _code(body.get("termination_reason")),
+        "hangup_reason": _code(telephony.get("hangup_reason")),
+        "hangup_by": _code(telephony.get("hangup_by")),
+        "hangup_provider_code": _integer(telephony.get("hangup_provider_code")),
+        "call_type": call_type if call_type in ("inbound", "outbound") else None,
+        "total_cost": _number(body.get("total_cost")),
+    }
+    return {key: value for key, value in fields.items() if value is not None}
+
+
+def canonical(minimized: dict) -> str:
+    return json.dumps(minimized, sort_keys=True, separators=(",", ":"))
 
 
 @dataclass(frozen=True)
 class Execution:
-    """Minimized execution record: no transcript, numbers, recording or extracted data."""
+    """Minimized execution record: no transcript, numbers, recording or extracted data.
+    `details` holds the minimize_execution() fields when the adapter read them."""
 
     id: str
     agent_id: str | None
@@ -72,10 +192,29 @@ class Execution:
     termination_reason: str | None = None
     call_type: str | None = None
     conversation_duration: float | None = None
+    details: dict = field(default_factory=dict, compare=False, repr=False)
 
     @property
     def terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+    @property
+    def final(self) -> bool:
+        return self.status in FINAL_STATUSES
+
+    def minimized(self) -> dict:
+        """The same allowlisted shape a webhook produces."""
+        if self.details:
+            return dict(self.details)
+        fields = {
+            "execution_id": self.id,
+            "status": self.status,
+            "agent_id": _uuid_text(self.agent_id),
+            "termination_reason": _code(self.termination_reason),
+            "call_type": self.call_type if self.call_type in ("inbound", "outbound") else None,
+            "conversation_duration": _number(self.conversation_duration),
+        }
+        return {key: value for key, value in fields.items() if value is not None}
 
 
 @dataclass(frozen=True)
@@ -324,6 +463,7 @@ class BolnaClient:
             termination_reason=_optional_str(body.get("termination_reason")),
             call_type=_optional_str(telephony.get("call_type")),
             conversation_duration=float(duration) if duration is not None else None,
+            details=minimize_execution(body) or {},
         )
 
     def list_phone_numbers(self):

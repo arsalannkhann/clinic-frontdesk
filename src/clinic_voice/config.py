@@ -1,3 +1,4 @@
+import ipaddress
 from functools import lru_cache
 from urllib.parse import urlsplit
 
@@ -43,6 +44,21 @@ class Settings(BaseSettings):
     # Public base URL of this API as Bolna reaches it; the agent compiler builds tool URLs
     # from it (e.g. https://voice.clinic.example). Unset: compile-agent needs --gateway-url.
     bolna_gateway_base_url: str | None = None
+    # Bolna execution webhooks (T8, POST /v1/webhooks/bolna/{token}).
+    # Largest accepted body; larger requests get 413 without being read further.
+    webhook_max_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
+    # Optional allowlist (comma-separated IPs or CIDR networks), defense in depth only: the
+    # webhook credential is the authentication. Unset: any source address.
+    bolna_webhook_allowed_ips: str | None = None
+    # Number of trusted reverse proxies in front of the API. 0: the socket peer is the
+    # client and X-Forwarded-For is ignored. n: the n-th address from the right of
+    # X-Forwarded-For is the client (the address the outermost trusted proxy saw).
+    trusted_proxy_hops: int = Field(default=0, ge=0, le=5)
+    # Reconciliation: a session without a final provider status is polled through
+    # GET /executions/{id} this long after its start or last provider update (doubling
+    # after each poll, at most 24 h apart), at most this many sessions per housekeeping pass.
+    bolna_reconcile_after_minutes: int = Field(default=30, ge=1, le=1440)
+    bolna_reconcile_batch: int = Field(default=50, ge=1, le=1000)
 
     @field_validator("google_redirect_uri")
     @classmethod
@@ -58,6 +74,30 @@ class Settings(BaseSettings):
     @classmethod
     def _gateway(cls, value):
         return _https_or_loopback(value, "bolna_gateway_base_url")
+
+    @field_validator("bolna_webhook_allowed_ips")
+    @classmethod
+    def _allowed_ips(cls, value):
+        if value is None or not value.strip():
+            return None
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        try:
+            for part in parts:
+                ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise ValueError(
+                "bolna_webhook_allowed_ips must list IP addresses or networks"
+            ) from None
+        return ",".join(parts)
+
+    def webhook_networks(self):
+        """The allowlist as ip_network objects, or None when unset (allow any)."""
+        if not self.bolna_webhook_allowed_ips:
+            return None
+        return [
+            ipaddress.ip_network(part, strict=False)
+            for part in self.bolna_webhook_allowed_ips.split(",")
+        ]
 
     def google_configured(self) -> bool:
         return bool(

@@ -9,9 +9,12 @@ flowchart LR
   Bolna --> Gateway[Bolna tool gateway; tests only]
   Staff[Staff dashboard planned] --> API[FastAPI]
   Gateway --> API
+  Bolna --> Webhooks[Execution webhook inbox; tests only]
+  Webhooks --> API
   API --> DB[(PostgreSQL)]
   DB --> Worker[Durable worker]
   Worker --> Calendar[Google Calendar adapter; contract-tested only]
+  Worker --> Executions[Bolna execution reconciliation; contract-tested only]
   Worker --> Delivery[Messaging and reminders planned]
 ```
 
@@ -63,7 +66,9 @@ Booking lifecycle (implemented, T7, ADR 0006): pending_sync → confirmed or nee
 
 ## Webhook and data boundaries
 
-Plan a dedicated authenticated inbox: validate custom secret header, map agent/execution to tenant on the server, enforce body size, redact/minimize payload, persist before 2xx, process asynchronously. Deduplicate by provider event ID or execution+status+payload hash; execution ID alone drops later state updates. Reject regressions after terminal state. Poll executions to reconcile missing deliveries; do not rely on vendor retries.
+Implemented in T8 (migration 013, ADR 0007; tests only, no live Bolna delivery received). `POST /v1/webhooks/bolna/{webhook_token}` authenticates the clinic's `cvw_` webhook credential carried in the path (Bolna documents no signature and no API-settable webhook header), optionally checks the source address against an allowlist (X-Forwarded-For only with `TRUSTED_PROXY_HOPS`), streams the body with a size limit, minimizes it to an explicit allowlist (`providers.bolna.minimize_execution`), cross-checks the payload agent id against the clinic's configured `clinics.bolna_agent_id`, and stores the event in `webhook_inbox` with a `webhook.process` outbox job in one transaction before returning 2xx. Events carry no provider id, so the dedupe key is execution id + status + SHA-256 of the canonical minimized payload, unique per clinic; every distinct event is kept in order of receipt (`received_seq`).
+
+The `webhook.process` handler (`handlers/bolna.py`) locks the inbox row, then the call session, then its own fenced outbox row, and applies the status monotonically (`providers.bolna.STATUS_RANK`): lower ranks and anything after a different final status are `stale`, a repeated final status only fills empty disposition fields, and `call-disconnected` or a final status ends the session. Events for unknown executions are kept as ignored. Reconciliation does not rely on vendor retries: worker housekeeping (only with `--bolna fake|live`) enqueues `bolna.reconcile` for at most `BOLNA_RECONCILE_BATCH` sessions without a final status whose start and last provider update are older than `BOLNA_RECONCILE_AFTER_MINUTES`, with doubling backoff up to 24 h and at most 6 polls per session. The job calls `BolnaPort.get_execution` with the connection idle and applies the same rule; a timeout retries and changes nothing.
 
 No clinical notes in calendar titles, prompt variables, logs, or analytics. Use opaque booking references and minimum operational information. Encrypt refresh tokens with managed keys; separate retention for appointment metadata, recordings, transcripts, and audit records. Recording storage is disabled by default in the planned integration.
 
@@ -75,4 +80,4 @@ No clinical notes in calendar titles, prompt variables, logs, or analytics. Use 
 
 `routes_bolna.py` exposes `/v1/bolna/context` and `/v1/bolna/tools/{check-slots,reserve-slot,appointment-status}`; `bolna/gateway.py` holds the services. Each tool call upserts a `call_sessions` row (migration 011) keyed by clinic and Bolna `execution_id`, then delegates to `service.slots`, `service.reserve` (with a server-derived idempotency key and `call_session_id`) or a session-bound status query that reuses `service.spoken_status`. The gateway resolves doctor and service by exact (case- and whitespace-folded) name because the context endpoint publishes names only (ADR 0005).
 
-`bolna/agent_config.py` compiles a Bolna v2 agent payload from the clinic row, `agents/prompts/receptionist.md` and the gateway tool table: a `simple_llm_agent` (not a graph agent; `agents/flow.yaml` is not enforced by Bolna), Sarvam `saaras` transcriber and `bulbul` synthesizer, keyed `multilingual_config` for `en` and `hi`, and seven `custom_task` tools posting to the gateway (context, check/reserve slot, status, verify, cancel, reschedule). `clinic-voice bolna compile-agent --clinic <id>` prints it with the token redacted; nothing pushes it to Bolna. `providers/bolna.py` defines `BolnaPort` (create/update agent, get execution, list/assign numbers, start/stop calls), a deterministic `FakeBolna` and an httpx `BolnaClient`, tested only with `httpx.MockTransport`; nothing in the app or worker calls it yet. Number purchase is not implemented.
+`bolna/agent_config.py` compiles a Bolna v2 agent payload from the clinic row, `agents/prompts/receptionist.md` and the gateway tool table: a `simple_llm_agent` (not a graph agent; `agents/flow.yaml` is not enforced by Bolna), Sarvam `saaras` transcriber and `bulbul` synthesizer, keyed `multilingual_config` for `en` and `hi`, and seven `custom_task` tools posting to the gateway (context, check/reserve slot, status, verify, cancel, reschedule). `clinic-voice bolna compile-agent --clinic <id>` prints it with the token redacted; nothing pushes it to Bolna. `providers/bolna.py` defines `BolnaPort` (create/update agent, get execution, list/assign numbers, start/stop calls), a deterministic `FakeBolna` and an httpx `BolnaClient`, tested only with `httpx.MockTransport`. Since T8 the worker uses `get_execution` for reconciliation (`--bolna live`, never exercised against the live API); nothing calls the other methods yet. Number purchase is not implemented.

@@ -16,11 +16,29 @@ locks in this global order, and never in reverse, so the paths cannot deadlock:
 5. Appointment rows FOR UPDATE: cancel and reschedule (appointments.py, bolna/bookings.py).
    A reschedule locks the doctor row (3) first; the slot check of the new time runs under it.
 6. Outbox rows FOR UPDATE, after the appointment row: staff resolve(requeue) and
-   admin.requeue_outbox (which reads the job's appointment id unlocked, locks the
-   appointment, then locks and re-checks the job). The worker also updates an appointment
-   row before its own outbox row. Retention purge locks patient rows, then updates their
-   appointments; it only selects patients with no active, unfinished appointment, so it does
-   not meet a reschedule (appointment row, then that patient's retention update).
+   admin.requeue_outbox (which reads the job unlocked, returns 409 at once unless it is
+   already dead, locks the appointment, then locks and re-checks the job). Retention purge
+   locks patient rows, then updates their appointments; it only selects patients with no
+   active, unfinished appointment, so it does not meet a reschedule (appointment row, then
+   that patient's retention update).
+
+   The worker does not follow this order everywhere. Its success path (_confirm) updates
+   the appointment before its own fenced outbox row, but dead-lettering runs the other way:
+   fail_dead and claim()'s lease_expired path update the outbox row first and then the
+   on_dead hook updates the appointment (calendar.create -> needs_review). requeue cannot
+   meet these: until such a transaction commits the job still reads 'processing', and
+   requeue refuses it before taking any lock. Residual: claim()'s lease_expired path can
+   meet a stale worker's _confirm on the same appointment in reverse order; PostgreSQL's
+   deadlock detector aborts one, and both are retried (the job through its lease, the claim
+   batch through the worker loop's backoff).
+
+Webhooks (T8), outside the scheduling locks above: the webhook.process handler locks its
+webhook_inbox row, then the call session row FOR NO KEY UPDATE, then (fenced) its own outbox
+row. admin.requeue_outbox of a dead webhook.process job locks the inbox row before the
+outbox row. The dead-letter hook (outbox row already locked) updates the inbox row only
+with SKIP LOCKED, so it never waits on a processor. Retention deletes inbox rows before it
+locks call sessions. Housekeeping's reconciliation enqueue locks call session rows with
+SKIP LOCKED and only inserts new outbox rows.
 
 No provider or network I/O may run while these are held.
 

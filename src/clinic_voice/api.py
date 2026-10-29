@@ -1,4 +1,5 @@
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Annotated
 from uuid import UUID
@@ -18,6 +19,7 @@ from clinic_voice.routes_appointments import router as appointments_router
 from clinic_voice.routes_bolna import router as bolna_router
 from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
+from clinic_voice.routes_webhooks import router as webhooks_router
 from clinic_voice.schemas import (
     SLOT_SOURCE,
     AppointmentStatusRequest,
@@ -36,15 +38,25 @@ from clinic_voice.schemas import (
 )
 from clinic_voice.service import appointment_status, reserve, slots
 
+# Path segments that carry a credential: the webhook token of /v1/webhooks/bolna/{token}.
+SECRET_PATH = re.compile(r"^(/v1/webhooks/[^/?]+/)[^/?]+")
+REDACTED_SEGMENT = "<redacted>"
+
+
+def redact_path(path: str) -> str:
+    """The request path without its query string and with credential segments redacted."""
+    return SECRET_PATH.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path.split("?", 1)[0])
+
 
 class StripQuery(logging.Filter):
-    """Drop query strings from uvicorn access log lines: the OAuth callback's query holds an
-    authorization code, and no query string here needs to be logged."""
+    """Drop query strings from uvicorn access log lines (the OAuth callback's query holds an
+    authorization code, and no query string here needs to be logged) and redact the webhook
+    credential path segment."""
 
     def filter(self, record):
         args = record.args
         if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
-            record.args = (*args[:2], args[2].split("?", 1)[0], *args[3:])
+            record.args = (*args[:2], redact_path(args[2]), *args[3:])
         return True
 
 
@@ -73,6 +85,7 @@ app.include_router(appointments_router)
 app.include_router(calendar_admin_router)
 app.include_router(oauth_router)
 app.include_router(bolna_router)
+app.include_router(webhooks_router)
 
 
 @app.exception_handler(DatabaseError)
@@ -98,7 +111,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "012_patients.sql"
+REQUIRED_MIGRATION = "013_webhook_inbox.sql"
 
 
 @app.get("/health/live")
