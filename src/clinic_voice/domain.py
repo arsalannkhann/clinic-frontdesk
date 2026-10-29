@@ -1,6 +1,16 @@
 import re
 import secrets
 from datetime import UTC, datetime, time, timedelta
+from uuid import UUID
+
+
+def as_uuid(value) -> UUID | None:
+    """value as a UUID, or None when it is None or not a UUID (job payload fields)."""
+    try:
+        return None if value is None else UUID(str(value))
+    except ValueError:
+        return None
+
 
 # Appointment statuses that hold a doctor's time. Migration 005's exclusion constraint
 # repeats this list in SQL; keep them in step.

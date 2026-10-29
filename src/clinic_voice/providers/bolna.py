@@ -32,6 +32,7 @@ and the API key are never logged or raised; httpx errors are not chained.
 import json
 import math
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from threading import Lock
@@ -50,6 +51,13 @@ from clinic_voice.providers.http import MAX_RETRY_AFTER, retry_after
 
 DEFAULT_BASE = "https://api.bolna.ai"
 DEFAULT_TIMEOUT = 10.0
+# Largest response body read from the API; larger bodies are cut off like a timeout.
+MAX_RESPONSE_BYTES = 1024 * 1024
+# httpx timeouts apply per operation (connect, write, each read), so
+# each gets timeout_seconds / 3 and the whole call is also checked against timeout_seconds
+# while the body streams. A call therefore ends within about 4/3 of timeout_seconds, which
+# check_ports keeps under a quarter of the lease (times 4/3).
+HTTP_DEADLINE_PHASES = 3
 # Statuses after which the call itself is over. call-disconnected means "ended, post-call
 # processing pending" and is normally followed by completed (docs/SOURCE_REVIEW.md).
 TERMINAL_STATUSES = frozenset(
@@ -88,7 +96,11 @@ SAFE_ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
 
 
 STATUS_PATTERN = re.compile(r"^[a-z][a-z-]{0,31}$")
-CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+# Disposition codes (termination_reason, hangup_reason, hangup_by): letters, underscore and
+# hyphen, starting with a letter. No digits at all, so no phone number or other number
+# can pass; no dots or spaces, so no free text. Bolna does not document these values as
+# fixed codes (unverified); anything else is dropped. Migration 013 repeats the pattern.
+CODE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z_-]{0,63}$")
 NUMBER_PATTERN = re.compile(r"^[0-9]{1,9}(\.[0-9]{1,6})?$")
 MAX_NUMBER = 1e9
 
@@ -132,11 +144,11 @@ def _timestamp(value) -> str | None:
         return None
     try:
         moment = datetime.fromisoformat(value)
-    except ValueError:
+        if moment.tzinfo is None:
+            return None
+        return moment.astimezone(UTC).isoformat()
+    except (ValueError, OverflowError):  # e.g. 0001-01-01T00:00+05:30 leaves the range.
         return None
-    if moment.tzinfo is None:
-        return None
-    return moment.astimezone(UTC).isoformat()
 
 
 def minimize_execution(body) -> dict | None:
@@ -387,6 +399,12 @@ def _optional_str(value) -> str | None:
     return value if isinstance(value, str) else None
 
 
+class _Overrun(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 class BolnaClient:
     """BolnaPort over the Bolna REST API with a bearer API key."""
 
@@ -396,26 +414,61 @@ class BolnaClient:
         http: httpx.Client,
         base_url: str = DEFAULT_BASE,
         timeout_seconds: float = DEFAULT_TIMEOUT,
+        clock=time.monotonic,
     ):
         if not api_key:
             raise ValueError("Bolna API key is required")
         self._api_key = api_key
         self._http = http
         self._base = base_url.rstrip("/")
+        self._clock = clock
         self.timeout_seconds = timeout_seconds
 
     def __repr__(self):
         return "BolnaClient()"
 
+    def _request(self, method, path, json) -> httpx.Response:
+        """One request with a total deadline of timeout_seconds over the streamed body (see
+        HTTP_DEADLINE_PHASES). Raises _Overrun when the deadline or MAX_RESPONSE_BYTES is
+        exceeded; the returned response holds the decoded body."""
+        started = self._clock()
+        with self._http.stream(
+            method,
+            self._base + path,
+            json=json,
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=httpx.Timeout(self.timeout_seconds / HTTP_DEADLINE_PHASES),
+        ) as response:
+            body = bytearray()
+            for chunk in response.iter_bytes():
+                body += chunk
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise _Overrun("too_large")
+                if self._clock() - started > self.timeout_seconds:
+                    raise _Overrun("deadline")
+            if self._clock() - started > self.timeout_seconds:
+                raise _Overrun("deadline")
+            # iter_bytes() already decoded the body: drop the framing headers that described
+            # the encoded form.
+            headers = [
+                (key, value)
+                for key, value in response.headers.multi_items()
+                if key.lower() not in ("content-encoding", "content-length", "transfer-encoding")
+            ]
+            return httpx.Response(
+                response.status_code,
+                headers=headers,
+                content=bytes(body),
+                request=response.request,
+            )
+
     def _send(self, method, path, *, write, json=None) -> httpx.Response:
         try:
-            return self._http.request(
-                method,
-                self._base + path,
-                json=json,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                timeout=self.timeout_seconds,
-            )
+            return self._request(method, path, json)
+        except _Overrun as error:
+            if write:
+                raise ProviderTimeout(error.code) from None  # The request was sent.
+            raise ProviderRetryable(error.code) from None
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
             raise ProviderRetryable("network") from None  # Nothing was sent.
         except httpx.TimeoutException:

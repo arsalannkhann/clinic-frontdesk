@@ -1,18 +1,12 @@
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 from fastapi import HTTPException
 
 from clinic_voice.audit import audit
+from clinic_voice.domain import as_uuid
 from clinic_voice.locks import lock_doctor_set, lock_doctors
 
 NOT_FOUND = "Not found"
-
-
-def _uuid(value):
-    try:
-        return None if value is None else UUID(str(value))
-    except ValueError:
-        return None
 
 
 def _update(conn, table, columns, clinic_id, row_id, changes):
@@ -237,7 +231,7 @@ def requeue_outbox(conn, staff, job_id):
             "SELECT id FROM appointments WHERE clinic_id=%s AND id=%s FOR UPDATE",
             (clinic_id, peek["appointment_id"]),
         )
-    inbox_id = _uuid(peek["inbox_id"]) if peek["kind"] == "webhook.process" else None
+    inbox_id = as_uuid(peek["inbox_id"]) if peek["kind"] == "webhook.process" else None
     if inbox_id is not None:
         conn.execute(
             "SELECT id FROM webhook_inbox WHERE clinic_id=%s AND id=%s FOR UPDATE",

@@ -23,7 +23,7 @@ execution with no call session are kept in the inbox and marked ignored
 
 import hashlib
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from uuid import uuid4
 
 from psycopg.types.json import Jsonb
@@ -43,7 +43,8 @@ MAX_RECONCILES = 6
 MAX_RECONCILE_DELAY = timedelta(hours=24)
 
 SESSION_COLUMNS = (
-    "id, execution_id, agent_id, provider_status, provider_final, termination_reason,"
+    "id, execution_id, agent_id, provider_status, provider_final, provider_event_at,"
+    " termination_reason,"
     " hangup_reason, hangup_by, hangup_provider_code, call_type, conversation_seconds,"
     " total_cost"
 )
@@ -64,12 +65,20 @@ def event_key(minimized: dict) -> str:
     return f"{minimized['execution_id']}:{minimized['status']}:{digest}"
 
 
-def agent_mismatch(conn, clinic_id, minimized) -> bool:
-    """True when the clinic has a configured Bolna agent id and the payload names another."""
+def clinic_agent(conn, clinic_id) -> str | None:
+    """The clinic's configured Bolna agent id, or None."""
     row = conn.execute("SELECT bolna_agent_id FROM clinics WHERE id=%s", (clinic_id,)).fetchone()
-    configured = row["bolna_agent_id"] if row else None
-    named = minimized.get("agent_id")
-    return bool(configured and named and named != configured)
+    return row["bolna_agent_id"] if row else None
+
+
+def agent_refused(configured, named) -> bool:
+    """With a configured agent id, an event must name exactly that agent (a missing agent id
+    is refused too). Without one, nothing is refused here."""
+    return configured is not None and named != configured
+
+
+def agent_mismatch(conn, clinic_id, minimized) -> bool:
+    return agent_refused(clinic_agent(conn, clinic_id), minimized.get("agent_id"))
 
 
 def record(conn, clinic_id, minimized) -> bool:
@@ -107,17 +116,32 @@ def lock_session(conn, clinic_id, execution_id):
     ).fetchone()
 
 
-def apply(conn, clinic_id, session, minimized) -> str:
+def _event_at(minimized):
+    value = minimized.get("updated_at")
+    try:
+        return datetime.fromisoformat(value) if isinstance(value, str) else None
+    except ValueError:
+        return None
+
+
+def apply(conn, clinic_id, session, minimized, configured_agent=None) -> str:
     """Apply a minimized status to a call session locked by the caller (FOR NO KEY UPDATE);
-    does not commit. Returns an outcome code: applied, stale, unknown_status or
-    agent_mismatch."""
+    does not commit. `configured_agent` is the clinic's bolna_agent_id. Returns an outcome
+    code: applied, stale, unknown_status or agent_mismatch.
+
+    Equal-rank non-final events (a repeated or lateral status) apply only when their
+    updated_at is at least the latest one applied (provider_event_at); one without
+    updated_at applies only if none was recorded yet."""
     status = minimized.get("status")
     rank = STATUS_RANK.get(status)
     if rank is None:
         return "unknown_status"
     named = minimized.get("agent_id")
+    if agent_refused(configured_agent, named):
+        return "agent_mismatch"
     if session["agent_id"] and named and named != session["agent_id"]:
         return "agent_mismatch"
+    event_at = _event_at(minimized)
     if session["provider_final"]:
         if status != session["provider_status"]:
             return "stale"
@@ -130,6 +154,9 @@ def apply(conn, clinic_id, session, minimized) -> str:
         current = STATUS_RANK.get(session["provider_status"], 0)
         if rank < current:
             return "stale"
+        last = session["provider_event_at"]
+        if rank == current and last is not None and (event_at is None or event_at < last):
+            return "stale"
         sets = [
             f"{column}=COALESCE(%({key})s::{kind}, {column})"
             for key, (column, kind) in DISPOSITION.items()
@@ -138,6 +165,7 @@ def apply(conn, clinic_id, session, minimized) -> str:
             "provider_status=%(status)s",
             "provider_final=%(final)s",
             "provider_updated_at=now()",
+            "provider_event_at=GREATEST(provider_event_at, %(event_at)s::timestamptz)",
             "status=CASE WHEN %(ended)s THEN 'ended' ELSE status END",
             "ended_at=CASE WHEN %(ended)s THEN COALESCE(ended_at, now()) ELSE ended_at END",
             "next_reconcile_at=CASE WHEN %(final)s THEN NULL ELSE next_reconcile_at END",
@@ -145,6 +173,7 @@ def apply(conn, clinic_id, session, minimized) -> str:
     params = {key: minimized.get(key) for key in DISPOSITION}
     params |= {
         "status": status,
+        "event_at": event_at,
         "final": rank >= FINAL_RANK,
         "ended": rank >= ENDED_RANK,
         "clinic": clinic_id,
@@ -162,16 +191,20 @@ def enqueue_reconciles(conn, after: timedelta, limit: int) -> int:
     """Housekeeping: enqueue a bolna.reconcile job for at most `limit` sessions without a
     final status whose start and last provider update are both older than `after` and whose
     previous poll's backoff has passed; and commit. Each poll doubles the next delay (capped
-    at 24 h) and at most MAX_RECONCILES polls are made per session. Cross-tenant like the
-    worker; each job carries its session's clinic_id. Sessions locked elsewhere are skipped."""
+    at 24 h) and at most MAX_RECONCILES polls are made per session. Only clinics with a
+    configured bolna_agent_id are reconciled: the shared Bolna account answers for any
+    execution id, so the agent id is what ties a polled execution to the clinic. Cross-tenant
+    like the worker; each job carries its session's clinic_id. Sessions locked elsewhere are
+    skipped."""
     rows = conn.execute(
         """WITH due AS (
-            SELECT clinic_id, id FROM call_sessions
-            WHERE NOT provider_final AND reconcile_count < %(max)s
-            AND GREATEST(started_at + %(after)s, provider_updated_at + %(after)s,
-                next_reconcile_at) <= now()
-            ORDER BY started_at LIMIT %(limit)s
-            FOR NO KEY UPDATE SKIP LOCKED
+            SELECT s.clinic_id, s.id FROM call_sessions s
+            JOIN clinics c ON c.id = s.clinic_id AND c.bolna_agent_id IS NOT NULL
+            WHERE NOT s.provider_final AND s.reconcile_count < %(max)s
+            AND GREATEST(s.started_at + %(after)s, s.provider_updated_at + %(after)s,
+                s.next_reconcile_at) <= now()
+            ORDER BY s.started_at LIMIT %(limit)s
+            FOR NO KEY UPDATE OF s SKIP LOCKED
         ), bumped AS (
             UPDATE call_sessions s SET reconcile_count = s.reconcile_count + 1,
                 next_reconcile_at = now()

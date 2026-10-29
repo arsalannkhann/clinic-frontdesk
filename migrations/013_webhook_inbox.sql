@@ -28,8 +28,10 @@ $$;
 ALTER TABLE tenant_credentials
     ADD CONSTRAINT tenant_credentials_scope_check CHECK (scope IN ('tools', 'webhook'));
 
--- Provider-reported call state, from webhooks or reconciliation. Codes only: no transcript,
--- recording, extracted data, numbers or free text. provider_final is set once a final
+-- Provider-reported call state, from webhooks or reconciliation. Codes only (letters,
+-- underscore and hyphen; no digits, so no phone numbers): no transcript, recording,
+-- extracted data, numbers or free text. provider_event_at is the latest provider
+-- updated_at applied; an equal-rank event older than it is stale. provider_final is set once a final
 -- status (completed, balance-low, busy, no-answer, canceled, failed, stopped, error) is
 -- applied; the status then never changes. Reconciliation polls unfinished sessions with
 -- backoff (next_reconcile_at, reconcile_count).
@@ -38,11 +40,12 @@ ALTER TABLE call_sessions
         CHECK (provider_status IS NULL OR provider_status ~ '^[a-z][a-z-]{0,31}$'),
     ADD COLUMN provider_final boolean NOT NULL DEFAULT false,
     ADD COLUMN provider_updated_at timestamptz,
+    ADD COLUMN provider_event_at timestamptz,
     ADD COLUMN termination_reason text
-        CHECK (termination_reason IS NULL OR termination_reason ~ '^[A-Za-z0-9_.:-]{1,64}$'),
+        CHECK (termination_reason IS NULL OR termination_reason ~ '^[A-Za-z][A-Za-z_-]{0,63}$'),
     ADD COLUMN hangup_reason text
-        CHECK (hangup_reason IS NULL OR hangup_reason ~ '^[A-Za-z0-9_.:-]{1,64}$'),
-    ADD COLUMN hangup_by text CHECK (hangup_by IS NULL OR hangup_by ~ '^[A-Za-z0-9_.:-]{1,64}$'),
+        CHECK (hangup_reason IS NULL OR hangup_reason ~ '^[A-Za-z][A-Za-z_-]{0,63}$'),
+    ADD COLUMN hangup_by text CHECK (hangup_by IS NULL OR hangup_by ~ '^[A-Za-z][A-Za-z_-]{0,63}$'),
     ADD COLUMN hangup_provider_code integer,
     ADD COLUMN call_type text CHECK (call_type IS NULL OR call_type IN ('inbound', 'outbound')),
     ADD COLUMN conversation_seconds double precision
@@ -82,11 +85,12 @@ CREATE TABLE webhook_inbox (
 CREATE INDEX webhook_inbox_execution ON webhook_inbox (clinic_id, execution_id, received_seq);
 CREATE INDEX webhook_inbox_received ON webhook_inbox (received_at);
 
--- bolna.reconcile: poll GET /executions/{id} for a session without a final status.
+-- bolna.reconcile: poll GET /executions/{id} for a session without a final status. It
+-- replaces the reserved, never-used 'reconcile.execution' kind, which is dropped.
 ALTER TABLE outbox
     DROP CONSTRAINT outbox_kind_check,
     ADD CONSTRAINT outbox_kind_check CHECK (kind IN (
         'calendar.create', 'calendar.cancel', 'calendar.refresh_busy', 'calendar.revoke_grant',
         'notification.send', 'reminder.schedule', 'reminder.stop', 'reminder.call',
-        'webhook.process', 'bolna.reconcile', 'reconcile.execution', 'provision.step'
+        'webhook.process', 'bolna.reconcile', 'provision.step'
     ));

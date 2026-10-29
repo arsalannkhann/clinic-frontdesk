@@ -51,17 +51,23 @@ def unauthorized():
 
 def client_address(request: Request, hops: int):
     """The client IP: the socket peer, or with `hops` trusted proxies the hops-th address
-    from the right of X-Forwarded-For. None when it cannot be determined."""
+    from the right of X-Forwarded-For. Every X-Forwarded-For header line counts (lines are
+    joined in order, as RFC 9110 combines repeated fields), so a second line cannot hide the
+    proxy's append. IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) are compared as IPv4. None
+    when it cannot be determined."""
     if hops > 0:
-        forwarded = request.headers.get("x-forwarded-for", "")
+        forwarded = ",".join(request.headers.getlist("x-forwarded-for"))
         parts = [part.strip() for part in forwarded.split(",") if part.strip()]
         value = parts[-hops] if len(parts) >= hops else None
     else:
         value = request.client.host if request.client else None
     try:
-        return ipaddress.ip_address(value) if value else None
+        address = ipaddress.ip_address(value) if value else None
     except ValueError:
         return None
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is not None:
+        return address.ipv4_mapped
+    return address
 
 
 def source_allowed(request: Request, settings) -> bool:

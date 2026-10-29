@@ -190,8 +190,20 @@ def _run_on_dead(conn, job):
         handler.on_dead(conn, job)
 
 
-def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None) -> list[Job]:
+# Kinds a worker claims only when it has the port they need.
+BOLNA_KINDS = ("bolna.reconcile",)
+
+
+def excluded_kinds(ports) -> tuple[str, ...] | None:
+    """Kinds this worker must leave to another worker: bolna.reconcile without a Bolna
+    port (so it is neither attempted nor dead-lettered here)."""
+    return BOLNA_KINDS if getattr(ports, "bolna", None) is None else None
+
+
+def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None, exclude=None) -> list[Job]:
     """Lease up to `limit` due jobs to worker_id and commit (database clock throughout).
+    `kinds` limits the claim to those kinds; `exclude` skips kinds (neither claimed nor
+    dead-lettered).
 
     Due: pending with available_at <= now(), or processing with an expired lease. An expired
     job that already used all its attempts is dead-lettered ('lease_expired') instead of
@@ -200,11 +212,15 @@ def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None) -> list[Jo
     require_idle(conn)
     params = {
         "kinds": list(kinds) if kinds is not None else None,
+        "exclude": list(exclude) if exclude else None,
         "limit": limit,
         "worker": worker_id,
         "lease": lease,
     }
-    kind_filter = "(%(kinds)s::text[] IS NULL OR kind = ANY(%(kinds)s::text[]))"
+    kind_filter = (
+        "(%(kinds)s::text[] IS NULL OR kind = ANY(%(kinds)s::text[]))"
+        " AND (%(exclude)s::text[] IS NULL OR kind <> ALL(%(exclude)s::text[]))"
+    )
     exhausted = conn.execute(
         f"""WITH stale AS (
             SELECT id FROM outbox
@@ -386,7 +402,7 @@ def run_batch(conn, worker_id, ports, limit=10, lease=DEFAULT_LEASE, kinds=None,
     """Claim and process one batch on an open connection; returns how many were claimed.
     If `stop` is set between jobs, the jobs not yet started are released. Raises if the
     connection breaks (the caller reconnects; leases expire and jobs are reclaimed)."""
-    jobs = claim(conn, worker_id, limit, lease, kinds)
+    jobs = claim(conn, worker_id, limit, lease, kinds, excluded_kinds(ports))
     for index, job in enumerate(jobs):
         if stop is not None and stop.is_set():
             for pending in jobs[index:]:

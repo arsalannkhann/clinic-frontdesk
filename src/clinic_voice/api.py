@@ -38,14 +38,20 @@ from clinic_voice.schemas import (
 )
 from clinic_voice.service import appointment_status, reserve, slots
 
-# Path segments that carry a credential: the webhook token of /v1/webhooks/bolna/{token}.
-SECRET_PATH = re.compile(r"^(/v1/webhooks/[^/?]+/)[^/?]+")
+# Credentials that can appear in a request path: any token of the credential shape (tool
+# cvt_, webhook cvw_, staff session cvs_) anywhere in it, and any segment after
+# /webhooks/<provider>/. Neither pattern is anchored, so root_path prefixes, repeated
+# slashes and unknown (404) paths are redacted too.
+TOKEN_SHAPE = re.compile(r"cv[tws]_[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{43}")
+WEBHOOK_SEGMENT = re.compile(r"(/webhooks/+[^/?#]+/+)[^/?#]+")
 REDACTED_SEGMENT = "<redacted>"
 
 
 def redact_path(path: str) -> str:
     """The request path without its query string and with credential segments redacted."""
-    return SECRET_PATH.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path.split("?", 1)[0])
+    path = path.split("?", 1)[0]
+    path = TOKEN_SHAPE.sub(REDACTED_SEGMENT, path)
+    return WEBHOOK_SEGMENT.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path)
 
 
 class StripQuery(logging.Filter):

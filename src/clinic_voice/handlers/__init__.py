@@ -1,7 +1,7 @@
 """Outbox handler registry: job kind -> Handler(run, on_dead).
 
 Kinds the outbox CHECK allows but that have no entry here (notification.send, reminder.*,
-reconcile.execution, provision.step) are reserved for later tasks; a job of such a kind is
+provision.step) are reserved for later tasks; a job of such a kind is
 dead-lettered with 'unknown_kind'. Nothing enqueues them yet.
 """
 

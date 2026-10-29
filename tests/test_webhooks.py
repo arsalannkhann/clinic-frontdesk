@@ -161,6 +161,11 @@ def add_session(url, clinic=CLINIC, execution=EXECUTION, agent=AGENT, age=None):
     return session_id
 
 
+def configure_agent(url, clinic=CLINIC, agent=AGENT):
+    with connect(url) as conn:
+        conn.execute("UPDATE clinics SET bolna_agent_id=%s WHERE id=%s", (agent, clinic))
+
+
 def session(url, clinic=CLINIC, execution=EXECUTION):
     with connect(url) as conn:
         return conn.execute(
@@ -411,15 +416,29 @@ def test_configured_agent_id_is_cross_checked(env):
     assert deliver(env, event("queued")).status_code == 200
     without = event("ringing")
     del without["agent_id"]
-    assert deliver(env, without).status_code == 200
+    assert deliver(env, without).status_code == 403  # A configured agent must be named.
+    assert len(inbox(env["url"])) == 1
     # The session's own agent id is checked by the processor too.
     with connect(env["url"]) as conn:
         conn.execute("UPDATE clinics SET bolna_agent_id=NULL WHERE id=%s", (CLINIC,))
+    assert deliver(env, without).status_code == 200
     add_session(env["url"], agent=OTHER_AGENT)
     deliver(env, completed())
     work(env["url"])
     assert inbox(env["url"])[-1]["outcome"] == "agent_mismatch"
     assert session(env["url"])["provider_status"] == "ringing"
+
+
+def test_agent_configured_after_intake_is_enforced_by_processor(env):
+    add_session(env["url"], agent=None)
+    without = completed()
+    del without["agent_id"]
+    deliver(env, without)
+    deliver(env, event("ringing", agent=OTHER_AGENT))
+    configure_agent(env["url"])
+    work(env["url"])
+    assert [r["outcome"] for r in inbox(env["url"])] == ["agent_mismatch", "agent_mismatch"]
+    assert session(env["url"])["provider_status"] is None
 
 
 def test_oversize_body_is_413(env, monkeypatch):
@@ -523,6 +542,48 @@ def test_allowlist_drops_transcript_phone_and_recording(env):
         assert secret not in dumped
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        "the caller said something private",
+        "+910000000123",
+        "9100000001",
+        "call-9876543",
+        "a.b",
+        "code1",
+        "_leading",
+        "x" * 65,
+    ],
+)
+def test_minimize_drops_codes_that_are_not_plain_words(value):
+    body = event("completed", termination_reason=value, telephony={"hangup_reason": value})
+    minimized = minimize_execution(body)
+    assert "termination_reason" not in minimized and "hangup_reason" not in minimized
+    assert (
+        minimize_execution(event("completed", termination_reason="Call_ended-by-user"))[
+            "termination_reason"
+        ]
+        == "Call_ended-by-user"
+    )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "0001-01-01T00:00:00+05:30",  # Before datetime.min in UTC.
+        "9999-12-31T23:59:59-05:00",  # After datetime.max in UTC.
+        "9999-12-31T23:59:59+99:00",  # Invalid offset.
+    ],
+)
+def test_minimize_drops_out_of_range_timestamps(value):
+    minimized = minimize_execution(event("queued", updated_at=value))
+    assert "updated_at" not in minimized
+    assert (
+        minimize_execution(event("queued", updated_at="9999-12-31T23:00:00+05:30"))["updated_at"]
+        == "9999-12-31T17:30:00+00:00"
+    )
+
+
 def test_minimize_rejects_free_text_codes_and_bad_numbers():
     body = event(
         "completed",
@@ -616,6 +677,7 @@ def test_dead_job_marks_event_failed_and_requeue_reprocesses(env):
 
 
 def test_reconciliation_fills_missed_final_status(env):
+    configure_agent(env["url"])
     add_session(env["url"], age=timedelta(hours=2))
     add_session(env["url"], execution=OTHER_EXECUTION, age=timedelta(minutes=5))  # Too recent.
     fake = FakeBolna()
@@ -643,6 +705,7 @@ def test_reconciliation_fills_missed_final_status(env):
 
 
 def test_reconciliation_is_bounded_and_backs_off(env):
+    configure_agent(env["url"])
     for index in range(3):
         add_session(env["url"], execution=str(uuid4()), age=timedelta(hours=1 + index))
     with connect(env["url"]) as conn:
@@ -666,6 +729,7 @@ def test_reconciliation_is_bounded_and_backs_off(env):
 
 
 def test_recent_webhook_activity_defers_reconciliation(env):
+    configure_agent(env["url"])
     add_session(env["url"], age=timedelta(hours=2))
     deliver(env, event("in-progress"))
     work(env["url"])
@@ -680,6 +744,7 @@ class TimingOutBolna(FakeBolna):
 
 
 def test_reconciliation_timeout_changes_nothing(env):
+    configure_agent(env["url"])
     add_session(env["url"], age=timedelta(hours=2))
     with connect(env["url"]) as conn:
         enqueue_reconciles(conn, timedelta(minutes=30), 50)
@@ -693,16 +758,10 @@ def test_reconciliation_timeout_changes_nothing(env):
 
 
 def test_reconciliation_edge_cases(env):
+    configure_agent(env["url"])
     add_session(env["url"], age=timedelta(hours=2))
     with connect(env["url"]) as conn:
         enqueue_reconciles(conn, timedelta(minutes=30), 50)
-    work(env["url"])  # No Bolna port configured.
-    [job] = jobs(env["url"], "bolna.reconcile")
-    assert (job["status"], job["last_error"]) == ("dead", "bolna_unconfigured")
-    with connect(env["url"]) as conn:
-        conn.execute(
-            "UPDATE outbox SET status='pending', max_attempts=99 WHERE id=%s", (job["id"],)
-        )
     work(env["url"], bolna=FakeBolna())  # Unknown at the provider: done, nothing changed.
     assert jobs(env["url"], "bolna.reconcile")[0]["status"] == "done"
     assert session(env["url"])["provider_status"] is None
@@ -717,6 +776,7 @@ def test_reconciliation_edge_cases(env):
 
 
 def test_housekeeping_enqueues_only_with_bolna_port(env):
+    configure_agent(env["url"])
     add_session(env["url"], age=timedelta(hours=2))
     with connect(env["url"]) as conn:
         outbox._default_housekeeping(conn, Ports(calendar=FakeCalendar()))
@@ -889,3 +949,231 @@ def test_concurrent_requeue_and_dead_lettering(env, monkeypatch):
             "SELECT status FROM appointments WHERE id=%s", (appointment_id,)
         ).fetchone()
     assert row["status"] == "pending_sync"
+
+
+# Security review follow-ups
+
+
+def test_second_forwarded_for_line_cannot_bypass_allowlist(env, monkeypatch):
+    settings_env(monkeypatch, BOLNA_WEBHOOK_ALLOWED_IPS="13.203.39.153", TRUSTED_PROXY_HOPS="1")
+    # The attacker sends an allowed address; the trusted proxy adds its own line with the
+    # real peer. Only the first line used to be read.
+    lines = [("X-Forwarded-For", "13.203.39.153"), ("X-Forwarded-For", "198.51.100.7")]
+    r = env["client"].post(f"/v1/webhooks/bolna/{env['hook']}", json=event("queued"), headers=lines)
+    assert r.status_code == 403
+    assert nothing_stored(env["url"])
+    lines = [("X-Forwarded-For", "198.51.100.7"), ("X-Forwarded-For", "13.203.39.153")]
+    r = env["client"].post(f"/v1/webhooks/bolna/{env['hook']}", json=event("queued"), headers=lines)
+    assert r.status_code == 200
+
+
+def test_ipv4_mapped_addresses_match_ipv4_allowlist(env, monkeypatch):
+    settings_env(monkeypatch, BOLNA_WEBHOOK_ALLOWED_IPS="13.203.39.153/32", TRUSTED_PROXY_HOPS="1")
+    ok = deliver(env, event("queued"), headers={"X-Forwarded-For": "::ffff:13.203.39.153"})
+    assert ok.status_code == 200
+    other = deliver(env, event("ringing"), headers={"X-Forwarded-For": "::ffff:13.203.39.154"})
+    assert other.status_code == 403
+
+
+def access_line(path):
+    record = logging.LogRecord(
+        "uvicorn.access",
+        logging.INFO,
+        __file__,
+        1,
+        '%s - "%s %s HTTP/%s" %d',
+        ("127.0.0.1:5000", "POST", path, "1.1", 404),
+        None,
+    )
+    StripQuery().filter(record)
+    return record.getMessage()
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "/v1/webhooks/bolna/{t}",
+        "/clinic-api/v1/webhooks/bolna/{t}",  # root_path prefix
+        "//v1/webhooks/bolna/{t}",
+        "/v1//webhooks/bolna/{t}",
+        "/v1/webhooks//bolna//{t}?q=1",
+        "/v1/webhooks/other/{t}/extra",
+        "/v1/unknown/{t}",  # 404 path carrying a token
+        "/{t}",
+    ],
+)
+def test_access_log_redacts_tokens_anywhere(env, template):
+    secret = env["hook"].split(".", 1)[1]
+    for token in (env["hook"], env["tool"], "cvs_" + "a" * 32 + "." + "b" * 43):
+        line = access_line(template.format(t=token))
+        assert token not in line and token.split(".", 1)[1] not in line
+    assert secret not in access_line("/v1/webhooks/bolna/not-a-token-but-secret-" + secret)
+
+
+def test_unrouted_paths_with_token_store_nothing(env):
+    for path in (f"//v1/webhooks/bolna/{env['hook']}", f"/v1/webhooks/bolna/{env['hook']}/x"):
+        assert env["client"].post(path, json=event("queued")).status_code in (404, 405)
+    assert nothing_stored(env["url"])
+
+
+OTHER_CLINIC_EXECUTION = "5f0c6f7e-1d1a-4c55-9a43-0b6f1b2a0199"
+
+
+def provider_view(row):
+    """A session without the reconciliation bookkeeping (which a poll legitimately bumps)."""
+    return {k: v for k, v in row.items() if k not in ("reconcile_count", "next_reconcile_at")}
+
+
+def test_reconcile_cannot_pull_another_clinics_execution(env):
+    configure_agent(env["url"])
+    configure_agent(env["url"], clinic=OTHER_CLINIC, agent=OTHER_AGENT)
+    # Clinic A's tool caller asserted clinic B's execution id for its session.
+    add_session(env["url"], execution=OTHER_CLINIC_EXECUTION, age=timedelta(hours=2))
+    add_session(
+        env["url"],
+        clinic=OTHER_CLINIC,
+        execution=OTHER_CLINIC_EXECUTION,
+        agent=OTHER_AGENT,
+        age=timedelta(minutes=1),
+    )
+    fake = FakeBolna()
+    fake.executions[OTHER_CLINIC_EXECUTION] = Execution(
+        OTHER_CLINIC_EXECUTION, OTHER_AGENT, "completed", "call_ended", "inbound", 99.0
+    )
+    with connect(env["url"]) as conn:
+        assert enqueue_reconciles(conn, timedelta(minutes=30), 50) == 1
+    before = session(env["url"], execution=OTHER_CLINIC_EXECUTION)
+    assert work(env["url"], bolna=fake) == 1
+    [job] = jobs(env["url"], "bolna.reconcile")
+    assert job["status"] == "done"
+    after = session(env["url"], execution=OTHER_CLINIC_EXECUTION)
+    # Nothing of clinic B's call was written into clinic A.
+    assert provider_view(after) == provider_view(before)
+    theirs = session(env["url"], clinic=OTHER_CLINIC, execution=OTHER_CLINIC_EXECUTION)
+    assert theirs["provider_status"] is None
+    # An execution without an agent id is refused the same way.
+    fake.executions[OTHER_CLINIC_EXECUTION] = Execution(OTHER_CLINIC_EXECUTION, None, "completed")
+    with connect(env["url"]) as conn:
+        conn.execute("UPDATE call_sessions SET next_reconcile_at = now() - interval '1 s'")
+        assert enqueue_reconciles(conn, timedelta(minutes=30), 50) == 1
+    work(env["url"], bolna=fake)
+    after = session(env["url"], execution=OTHER_CLINIC_EXECUTION)
+    assert provider_view(after) == provider_view(before)
+
+
+def test_clinic_without_agent_id_is_never_reconciled(env):
+    add_session(env["url"], age=timedelta(hours=2))
+    with connect(env["url"]) as conn:
+        assert enqueue_reconciles(conn, timedelta(minutes=30), 50) == 0
+    # A job that already exists (e.g. the agent id was cleared) does not ask the provider.
+    session_id = session(env["url"])["id"]
+    with connect(env["url"]) as conn:
+        conn.execute(
+            "INSERT INTO outbox (id,clinic_id,kind,payload) VALUES (%s,%s,'bolna.reconcile',%s)",
+            (uuid4(), CLINIC, json.dumps({"session_id": str(session_id)})),
+        )
+    fake = FakeBolna()
+    work(env["url"], bolna=fake)
+    assert fake.calls == []
+    assert jobs(env["url"], "bolna.reconcile")[0]["status"] == "done"
+
+
+def test_worker_without_bolna_does_not_claim_reconcile_jobs(env):
+    configure_agent(env["url"])
+    add_session(env["url"], age=timedelta(hours=2))
+    with connect(env["url"]) as conn:
+        enqueue_reconciles(conn, timedelta(minutes=30), 50)
+    deliver(env, event("queued"))
+    assert work(env["url"]) == 1  # Only the webhook job.
+    [job] = jobs(env["url"], "bolna.reconcile")
+    assert (job["status"], job["attempts"], job["last_error"]) == ("pending", 0, None)
+    with connect(env["url"]) as conn:  # An expired lease is not dead-lettered there either.
+        conn.execute(
+            "UPDATE outbox SET status='processing', lease_owner='gone', attempts=max_attempts,"
+            " lease_expires_at=now() - interval '1 s' WHERE id=%s",
+            (job["id"],),
+        )
+    assert work(env["url"]) == 0
+    assert jobs(env["url"], "bolna.reconcile")[0]["status"] == "processing"
+
+
+def test_equal_rank_events_apply_in_provider_time_order(env):
+    add_session(env["url"])
+    newer = event("in-progress", updated_at="2031-03-03T03:02:00+00:00", conversation_duration=20)
+    older = event("in-progress", updated_at="2031-03-03T03:01:00+00:00", conversation_duration=10)
+    same = event(
+        "in-progress",
+        updated_at="2031-03-03T03:02:00+00:00",
+        conversation_duration=20,
+        total_cost=3,
+    )
+    undated = event("in-progress", conversation_duration=30)
+    del undated["updated_at"]
+    for body in (newer, older, same, undated):
+        deliver(env, body)
+        work(env["url"])
+    assert [r["outcome"] for r in inbox(env["url"])] == ["applied", "stale", "applied", "stale"]
+    row = session(env["url"])
+    assert (row["conversation_seconds"], row["total_cost"]) == (20.0, 3.0)
+    assert row["provider_event_at"].isoformat() == "2031-03-03T03:02:00+00:00"
+    # Lateral moves follow provider time as well; a higher rank still wins regardless.
+    deliver(env, event("call-disconnected", updated_at="2031-03-03T03:00:00+00:00"))
+    work(env["url"])
+    assert session(env["url"])["provider_status"] == "call-disconnected"
+
+
+def test_bolna_client_enforces_total_deadline():
+    import httpx
+
+    now = [0.0]
+
+    def clock():
+        return now[0]
+
+    def slow_body():
+        for _ in range(5):
+            now[0] += 4.0  # Each chunk arrives within the per-read timeout.
+            yield b" "
+        yield b'{"id": "33333333-3333-4333-8333-333333333333", "status": "completed"}'
+
+    def handler(request):
+        return httpx.Response(200, content=slow_body())
+
+    client = BolnaClient(
+        "synthetic-key",
+        httpx.Client(transport=httpx.MockTransport(handler)),
+        timeout_seconds=10.0,
+        clock=clock,
+    )
+    from clinic_voice.providers.calendar import ProviderRetryable
+
+    with pytest.raises(ProviderRetryable) as caught:
+        client.get_execution("33333333-3333-4333-8333-333333333333")
+    assert caught.value.code == "deadline"
+    with pytest.raises(ProviderTimeout) as caught:  # A write's outcome is unknown.
+        now[0] = 0.0
+        client.update_agent("33333333-3333-4333-8333-333333333333", {})
+    assert caught.value.code == "deadline"
+    now[0] = 0.0
+    fast = BolnaClient(
+        "synthetic-key",
+        httpx.Client(
+            transport=httpx.MockTransport(
+                lambda r: httpx.Response(
+                    200,
+                    json={"id": "33333333-3333-4333-8333-333333333333", "status": "queued"},
+                )
+            )
+        ),
+        clock=clock,
+    )
+    assert fast.get_execution("33333333-3333-4333-8333-333333333333").status == "queued"
+    huge = BolnaClient(
+        "synthetic-key",
+        httpx.Client(
+            transport=httpx.MockTransport(lambda r: httpx.Response(200, content=b" " * 2_000_000))
+        ),
+    )
+    with pytest.raises(ProviderRetryable) as caught:
+        huge.get_execution("33333333-3333-4333-8333-333333333333")
+    assert caught.value.code == "too_large"

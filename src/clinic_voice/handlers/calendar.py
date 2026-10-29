@@ -18,6 +18,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from clinic_voice.calendar_sync import refresh_external_busy
+from clinic_voice.domain import as_uuid
 from clinic_voice.errors import LeaseLost, NotFound
 from clinic_voice.outbox import (
     complete,
@@ -102,13 +103,6 @@ def _matches(event, appointment) -> bool:
         and event.start == appointment["starts_at"]
         and event.end == appointment["ends_at"]
     )
-
-
-def _uuid(value):
-    try:
-        return None if value is None else UUID(str(value))
-    except ValueError:
-        return None
 
 
 def _port(conn, job, ports, doctor_id, account_id=None):
@@ -209,7 +203,7 @@ def create(conn, job, ports) -> bool:
     own_event = appointment["calendar_event_id"] == event_id
     recorded = appointment["calendar_id"] if own_event else None
     calendar_id = intended or recorded or appointment["booking_calendar_id"]
-    owner = _uuid(payload.get("calendar_account_id")) or (
+    owner = as_uuid(payload.get("calendar_account_id")) or (
         appointment["calendar_account_id"] if own_event else None
     )
     if _superseded(appointment, job):
@@ -322,12 +316,12 @@ def cancel(conn, job, ports) -> bool:
         if recorded:
             return fail_dead(conn, job, "calendar_unmapped")
         return complete(conn, job)
-    account_id = _uuid(payload.get("calendar_account_id"))
+    account_id = as_uuid(payload.get("calendar_account_id"))
     if account_id is None and row:
         if row["calendar_account_id"] and row["calendar_event_id"] == event_id:
             account_id = row["calendar_account_id"]
         else:
-            account_id = _uuid(row["intended_account"])
+            account_id = as_uuid(row["intended_account"])
     target, outcome = _port(conn, job, ports, row["doctor_id"] if row else None, account_id)
     if target is None:
         return outcome
@@ -395,7 +389,7 @@ def revoke_grant(conn, job, ports) -> bool:
     failures retry; after max_attempts the job is dead and the ciphertext stays, so staff
     can requeue (or remove the grant in the Google account and requeue: an already invalid
     token counts as revoked)."""
-    account_id = _uuid((job.payload or {}).get("account_id"))
+    account_id = as_uuid((job.payload or {}).get("account_id"))
     if account_id is None:
         return fail_dead(conn, job, "bad_payload")
     revoker = ports.grant_revoker()

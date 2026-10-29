@@ -8,15 +8,18 @@ longer 'received' (already settled, or deleted by retention) completes the job u
 so retries and duplicate jobs are harmless.
 
 bolna.reconcile (payload {session_id}) polls GET /executions/{id} through Ports.bolna with
-the connection idle, then applies the result with the same monotonic rule. Provider errors
+the connection idle, then applies the result with the same monotonic rule. The execution id
+is caller-asserted and the Bolna account is shared, so the result is applied only when its
+agent id equals the clinic's configured bolna_agent_id; a clinic without one is never
+polled, and a mismatch completes the job without writing anything ('agent_mismatch'). Provider errors
 follow the outbox rules (provider_failure): a timeout or retryable error retries with
 backoff and changes nothing; the read itself is safe to repeat.
 """
 
 import logging
-from uuid import UUID
 
 from clinic_voice.bolna import webhooks
+from clinic_voice.domain import as_uuid
 from clinic_voice.outbox import (
     complete,
     fail_dead,
@@ -27,13 +30,6 @@ from clinic_voice.outbox import (
 from clinic_voice.providers.calendar import ProviderError
 
 log = logging.getLogger("clinic_voice.worker")
-
-
-def _uuid(value):
-    try:
-        return None if value is None else UUID(str(value))
-    except ValueError:
-        return None
 
 
 def _settle(conn, job, outcome) -> bool:
@@ -49,7 +45,7 @@ def _settle(conn, job, outcome) -> bool:
 
 
 def process_webhook(conn, job, ports) -> bool:
-    inbox_id = _uuid((job.payload or {}).get("inbox_id"))
+    inbox_id = as_uuid((job.payload or {}).get("inbox_id"))
     if inbox_id is None:
         return fail_dead(conn, job, "bad_payload")
     counted = conn.execute(
@@ -72,7 +68,8 @@ def process_webhook(conn, job, ports) -> bool:
     if session is None:
         outcome = "unknown_execution"
     else:
-        outcome = webhooks.apply(conn, job.clinic_id, session, event["payload"])
+        configured = webhooks.clinic_agent(conn, job.clinic_id)
+        outcome = webhooks.apply(conn, job.clinic_id, session, event["payload"], configured)
     conn.execute(
         "UPDATE webhook_inbox SET status=%s, outcome=%s, processed_at=now()"
         " WHERE clinic_id=%s AND id=%s",
@@ -85,7 +82,7 @@ def webhook_failed_on_dead(conn, job):
     """Mark the event failed when its job is dead-lettered. Runs with the outbox row already
     locked, so it skips an inbox row a (stale) processor holds rather than wait on it; that
     event then stays 'received' and a requeue processes it."""
-    inbox_id = _uuid((job.payload or {}).get("inbox_id"))
+    inbox_id = as_uuid((job.payload or {}).get("inbox_id"))
     if inbox_id is None:
         return
     conn.execute(
@@ -100,16 +97,23 @@ def webhook_failed_on_dead(conn, job):
 
 
 def reconcile(conn, job, ports) -> bool:
-    session_id = _uuid((job.payload or {}).get("session_id"))
+    session_id = as_uuid((job.payload or {}).get("session_id"))
     if session_id is None:
         return fail_dead(conn, job, "bad_payload")
     row = conn.execute(
-        "SELECT execution_id, provider_final FROM call_sessions WHERE clinic_id=%s AND id=%s",
+        "SELECT s.execution_id, s.provider_final, c.bolna_agent_id FROM call_sessions s"
+        " JOIN clinics c ON c.id = s.clinic_id WHERE s.clinic_id=%s AND s.id=%s",
         (job.clinic_id, session_id),
     ).fetchone()
     conn.commit()
     if row is None or row["provider_final"]:
         return complete(conn, job)  # Purged, or a webhook already delivered the final status.
+    configured = row["bolna_agent_id"]
+    if configured is None:
+        # The Bolna account is shared: without the clinic's agent id nothing ties the
+        # (caller-asserted) execution id to this clinic, so do not ask the provider.
+        log.info("bolna job done id=%s kind=%s outcome=agent_unconfigured", job.id, job.kind)
+        return complete(conn, job)
     port = getattr(ports, "bolna", None)
     if port is None:
         return fail_dead(conn, job, "bolna_unconfigured")
@@ -126,9 +130,13 @@ def reconcile(conn, job, ports) -> bool:
     minimized = execution.minimized()
     if minimized.get("execution_id") != row["execution_id"]:
         return fail_dead(conn, job, "execution_mismatch")
+    if webhooks.agent_refused(configured, minimized.get("agent_id")):
+        # Another clinic's (or an unknown agent's) execution: write nothing.
+        log.warning("bolna job done id=%s kind=%s outcome=agent_mismatch", job.id, job.kind)
+        return complete(conn, job)
     session = webhooks.lock_session(conn, job.clinic_id, row["execution_id"])
     if session is None:
         conn.rollback()
         return complete(conn, job)
-    outcome = webhooks.apply(conn, job.clinic_id, session, minimized)
+    outcome = webhooks.apply(conn, job.clinic_id, session, minimized, configured)
     return _settle(conn, job, outcome)
