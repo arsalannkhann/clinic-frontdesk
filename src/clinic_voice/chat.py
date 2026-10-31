@@ -70,18 +70,57 @@ DEFAULT_EMERGENCY = (
     " For urgent dental pain, please call the clinic directly."
 )
 
-# Life-threatening or urgent signs in English, Hindi and Hinglish. Deliberately narrow: an
-# "emergency pain visit" booking request is not itself an emergency.
-EMERGENCY = re.compile(
-    r"(can'?t|cannot|unable to|difficulty|trouble)\s+(breathe|breathing|swallow)"
-    r"|bleeding\s+(won'?t|will not|does not|doesn'?t|not)\s+stop|heavy bleeding"
-    r"|non[- ]?stop bleeding|(swelling|swollen).{0,40}\b(eye|neck|throat)\b"
-    r"|\b(unconscious|fainted|passed out|seizure)\b|chest pain"
-    r"|\b(accident|road accident)\b|broken jaw|jaw (is )?broken|knocked out"
-    r"|\b(it'?s|this is|i have|having) an? emergency\b|\bemergency (hai|he|h)\b"
-    r"|khoon (ruk )?nahi|khoon band nahi|saans (nahi|lene)|behosh",
-    re.I,
+# Life-threatening or urgent signs in English, Hindi (Devanagari) and Hinglish. Deliberately
+# narrow: an "emergency pain visit" booking request is not itself an emergency, and neither is
+# a bare "accident" ("I booked the wrong day by accident"); only injury phrasings count.
+# Devanagari has no \b word boundaries in Python's re, so those patterns are plain phrases.
+_STOP = r"(stop|stops|stopped|stopping)"
+_NOT = (
+    r"(won'?t|will not|wont|does not|doesn'?t|did not|didn'?t|has not|hasn'?t|have not"
+    r"|haven'?t|is not|isn'?t|not|never|can'?t|cannot)"
 )
+EMERGENCY_PATTERNS = [
+    # Breathing or swallowing.
+    r"\b(can'?t|cannot|unable to|difficulty|trouble|hard to|struggling to)\s+"
+    r"(breathe|breathing|swallow|swallowing)\b",
+    # Bleeding that will not stop: "bleeding" and the negated "stop" within about 30
+    # characters, either order ("bleeding from the socket hasn't stopped", "won't stop
+    # bleeding"), plus heavy or non-stop bleeding.
+    rf"\bbleed(ing|s)?\b.{{0,30}}?\b{_NOT}\s+(yet\s+)?{_STOP}\b",
+    rf"\b{_NOT}\s+{_STOP}\s+bleeding\b",
+    r"\b(heavy|heavily|lots of|a lot of|profuse|severe) bleeding\b|\bbleeding (heavily|a lot)\b",
+    r"\bnon[- ]?stop bleeding\b",
+    # Swelling reaching the eye, neck or throat, or with a high fever.
+    r"\b(swelling|swollen)\b.{0,40}\b(eye|eyes|neck|throat)\b",
+    r"\b(high|very high) fever\b.{0,40}\b(swelling|swollen)\b"
+    r"|\b(swelling|swollen)\b.{0,40}\b(high|very high) fever\b",
+    # Fainting, seizures, chest pain.
+    r"\b(unconscious|fainted|fainting|passed out|seizure|seizures)\b|\bchest pain\b",
+    # Injuries and trauma (never a bare "accident").
+    r"\bknocked[- ]out (a |my |his |her |the )?(tooth|teeth)\b",
+    r"\b(tooth|teeth) (got |was |were |has been |have been |is |are )?knocked out\b",
+    r"\bknocked (my |his |her |a |the )?(tooth|teeth) out\b",
+    r"\bjaw (injury|injured|is broken|broken|fracture|fractured|dislocated)\b",
+    r"\b(broken|broke|fractured|injured|dislocated) (my |his |her |the )?jaw\b",
+    r"\bfell (down )?and (broke|broken|hit|cracked|knocked|injured|smashed)\b",
+    r"\b(road|car|bike|scooter|motorbike|traffic) accident\b",
+    r"\b(face|facial) (injury|trauma)\b",
+    # Saying so.
+    r"\b(it'?s|this is|i have|i'?m having|having|we have) an? (medical |dental )?emergency\b",
+    r"\bemergency (hai|he|h)\b",
+    # Hinglish.
+    r"\bkhoon (ruk )?nahi\b|\bkhoon band nahi\b|\bsaans (nahi|lene)\b|\bbehosh\b",
+    # Hindi (Devanagari). Both spellings of saans (सांस / साँस), and tez with or without the
+    # nukta (precomposed or combining, or plain तेज); khoon and jabda likewise.
+    "(\u0916\u0942\u0928|\u0959\u0942\u0928|\u0916\u093c\u0942\u0928) (बंद|रुक) (नहीं|नही)",
+    r"(सांस|साँस|श्वास) (नहीं|नही|लेने में (तकलीफ|दिक्कत|परेशानी))",
+    r"बेहोश",
+    r"सूजन.{0,40}ते(\u095b|\u091c\u093c?) ?बुखार|ते(\u095b|\u091c\u093c?) ?बुखार.{0,40}सूजन",
+    r"चेहरा सूज|चेहरे पर सूजन|सूजन.{0,30}(आंख|आँख|गले|गला|गर्दन)",
+    r"जब(\u095c|\u0921\u093c)ा (टूट|टूटा)|जब(\u095c|\u0921\u093c)े (में|पर) चोट",
+    r"(यह|ये) (इमरजेंसी|आपातकाल) (है|हैं)",
+]
+EMERGENCY = re.compile("|".join(f"(?:{p})" for p in EMERGENCY_PATTERNS), re.I)
 
 
 def fail(code: str, status: int = 404, message: str = "Not found") -> PublicError:

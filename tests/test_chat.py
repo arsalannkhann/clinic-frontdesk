@@ -419,13 +419,88 @@ def test_malformed_tool_arguments_are_refused_to_the_model(env):
     assert results == [{"error": "invalid_arguments"}, {"error": "unknown_tool"}]
 
 
+EMERGENCY_POSITIVES = [
+    # English: bleeding, with "stop" up to about 30 characters away, in either order.
+    "My gum bleeding won't stop after extraction",
+    "The bleeding from the extraction socket hasn't stopped",
+    "bleeding since this morning and it has not stopped",
+    "It won't stop bleeding",
+    "Bleeding still doesn't stop",
+    "heavy bleeding from my tooth",
+    "non-stop bleeding",
+    # Breathing, swelling, fever, fainting.
+    "I can't breathe properly and my face is swollen",
+    "trouble swallowing since yesterday",
+    "Swelling is spreading to my eye",
+    "my cheek is swollen down to my neck",
+    "high fever and the swelling is getting worse",
+    "She fainted after the injection",
+    "chest pain right now",
+    # Injuries and trauma.
+    "My son knocked out a tooth playing cricket",
+    "his front tooth got knocked out",
+    "I knocked my tooth out",
+    "jaw injury from a fall",
+    "I think I broke my jaw",
+    "she fell and broke her front teeth",
+    "road accident, my face is bleeding",
+    # Saying so.
+    "This is an emergency",
+    "it's a dental emergency",
+    "emergency hai please",
+    # Hinglish.
+    "khoon band nahi ho raha",
+    "saans nahi aa rahi",
+    "wo behosh ho gaya",
+    # Hindi (Devanagari), including both nukta forms.
+    "दांत निकालने के बाद खून बंद नहीं हो रहा",
+    "खून रुक नहीं रहा है",
+    "मुझे सांस नहीं आ रही",
+    "साँस लेने में तकलीफ हो रही है",
+    "वह बेहोश हो गया",
+    "गाल पर सूजन है और तेज़ बुखार भी है",
+    "सूजन और तेज़ बुखार",
+    "तेज बुखार के साथ सूजन",
+    "मेरा चेहरा सूज गया है",
+    "सूजन आंख तक पहुंच गई",
+    "जबड़ा टूट गया",
+    "यह इमरजेंसी है",
+]
+EMERGENCY_NEGATIVES = [
+    "I booked the wrong day by accident",
+    "Sorry, I clicked that by accident",
+    "Can I book an emergency pain visit tomorrow?",
+    "Do you take emergency appointments on Sunday?",
+    "My gums bleed a little when I brush",
+    "The bleeding stopped after an hour, can I eat now?",
+    "How long does swelling last after a filling?",
+    "Is Tuesday 10am free? It fits my schedule",
+    "I want to book teeth whitening",
+    "मुझे कल का अपॉइंटमेंट चाहिए",
+    "दांत में हल्का दर्द है",
+    "kal appointment mil sakta hai?",
+]
+
+
+@pytest.mark.parametrize("text", EMERGENCY_POSITIVES)
+def test_emergency_matcher_positives(text):
+    assert chat.EMERGENCY.search(text), text
+
+
+@pytest.mark.parametrize("text", EMERGENCY_NEGATIVES)
+def test_emergency_matcher_negatives(text):
+    assert not chat.EMERGENCY.search(text), text
+
+
 @pytest.mark.parametrize(
     "text",
     [
         "My gum bleeding won't stop after extraction",
-        "I can't breathe properly and my face is swollen",
+        "The bleeding from the socket hasn't stopped",
         "Swelling is spreading to my eye",
         "khoon band nahi ho raha",
+        "गाल पर सूजन है और तेज़ बुखार भी है",
+        "his front tooth got knocked out",
         "This is an emergency",
     ],
 )
@@ -455,6 +530,14 @@ def test_a_booking_request_for_an_emergency_visit_is_not_an_emergency(env):
     env["fake"].script = [LLMReply("Which day would you like?")]
     body = say(env, session, "Can I book an emergency pain visit tomorrow?").json()
     assert body["messages"][0]["text"] == "Which day would you like?"
+
+
+def test_an_accidental_booking_is_not_an_emergency(env):
+    session = start(env)
+    env["fake"].script = [LLMReply("Which day would you like instead?")]
+    body = say(env, session, "I booked the wrong day by accident").json()
+    assert body["messages"][0]["text"] == "Which day would you like instead?"
+    assert len(env["fake"].calls) == 1
 
 
 # --- Tools -----------------------------------------------------------------------------------
