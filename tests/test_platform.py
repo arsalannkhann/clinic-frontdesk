@@ -480,6 +480,14 @@ def test_tick_runs_due_jobs_and_returns_counts_only(env):
     assert status == "confirmed"
 
 
+@pytest.mark.parametrize("scheme", ["bearer", "BEARER", "Bearer"])
+def test_tick_bearer_scheme_is_case_insensitive(env, scheme):
+    r = env["client"].post(
+        "/v1/internal/worker/tick", headers={"Authorization": f"{scheme} {TICK_SECRET}"}
+    )
+    assert r.status_code == 200
+
+
 def test_tick_short_secret_is_a_configuration_error(monkeypatch):
     with pytest.raises(ValueError):
         Settings(database_url="postgresql://u@h/d", worker_tick_secret="short")
