@@ -555,9 +555,9 @@ describe("chat launcher", () => {
     stubMatchMedia(true);
     const user = userEvent.setup();
     render(<ChatLauncher clinicName="Aster" timeZone={IST} callHref={null} enabled />);
-    const launcher = screen.getByRole("button", { name: "Chat with us" });
+    const launcher = screen.getByRole("button", { name: "Book with AI assistant" });
     await user.click(launcher);
-    const dialog = await screen.findByRole("dialog", { name: "Aster" });
+    const dialog = await screen.findByRole("dialog", { name: /AI booking assistant/ });
     expect(dialog).toHaveAttribute("aria-modal", "true");
     await screen.findByText("Hello");
     await waitFor(() => expect(screen.getByLabelText("Message")).toHaveFocus());
@@ -581,10 +581,10 @@ describe("chat launcher", () => {
     stubMatchMedia(false);
     const user = userEvent.setup();
     render(<ChatLauncher clinicName="Aster" timeZone={IST} callHref={null} enabled />);
-    await user.click(screen.getByRole("button", { name: "Chat with us" }));
-    const dialog = await screen.findByRole("dialog", { name: "Aster" });
+    await user.click(screen.getByRole("button", { name: "Book with AI assistant" }));
+    const dialog = await screen.findByRole("dialog", { name: /AI booking assistant/ });
     expect(dialog).toHaveAttribute("aria-modal", "false");
     await user.click(within(dialog).getByRole("button", { name: "Close chat" }));
-    await waitFor(() => expect(screen.getByRole("button", { name: "Chat with us" })).toHaveFocus());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Book with AI assistant" })).toHaveFocus());
   });
 });

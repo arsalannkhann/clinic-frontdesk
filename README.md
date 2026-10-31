@@ -1,87 +1,123 @@
 # Clinic Voice AI
 
-A multilingual AI receptionist for Indian clinics, built around Bolna Hosted API, Sarvam speech, and a FastAPI scheduling backend. Intended languages: Hindi, Hinglish, and Indian English.
+One booking platform for Indian dental and medical clinics, with three ways in for patients and one console for staff. Patients book on the clinic's website, ask the chat assistant, or call the voice receptionist (Bolna, with Sarvam or ElevenLabs speech) in Hindi, Hinglish or Indian English. All three channels write to the same PostgreSQL ledger, so a slot taken by phone disappears from the website at once and double-booking is impossible.
 
-**Status: tested development foundation, not a live receptionist.** Everything below runs locally against PostgreSQL and is tested with fakes and mocked HTTP. No Bolna agent, phone number, Google account, messaging provider or patient has ever been connected, and nothing may be until the owner actions in [docs/CLAUDE_HANDOFF.md](docs/CLAUDE_HANDOFF.md) are done. Reservations return `202 pending_sync` and are never presented as confirmed until the worker has verified the calendar event.
+**Status: a working pilot on synthetic data, not yet serving a real clinic.** A demo clinic, the fictional *Aster Dental Studio* in Bengaluru, runs on Vercel and Supabase. Its patients, phone numbers and appointments are made up. Before a real clinic goes live, the clinic owner has to: approve the scripts, connect a phone number, choose a messaging provider and set the hosting plan (see [Before a real clinic](#before-a-real-clinic)).
+
+## How it fits together
+
+```
+patients ── website + chat (Next.js, Vercel) ──┐  server-side proxy, httpOnly staff cookie
+staff ───── staff console (same app, /staff) ──┤
+callers ─── Bolna voice agent ─────────────────┤
+                                               ▼
+                        API (FastAPI on Vercel Python, dub1)
+                          /v1/public  /v1/chat  /v1/staff  /v1/admin  /v1/bolna  /v1/webhooks
+                                               │
+                        PostgreSQL (Supabase, transaction pooler)
+                          pg_cron ── every minute ──► /v1/internal/worker/tick
+```
+
+- **One booking core.** The web booking form, the chat confirmation card, staff bookings and the voice agent's tools all go through the same reservation code. That code follows the same lock order (`locks.py`) and relies on a PostgreSQL range exclusion, which rejects overlapping bookings at the database level.
+- **The chat assistant can only propose.** It finds real free slots through tools and shows a confirmation card. The booking happens only when the patient confirms in that card with their name, phone and consent. The model is OpenAI-compatible and configured by environment variables; the default is Sarvam `sarvam-105b`.
+- **Ledger calendar.** For clinics without Google Calendar, the platform itself is the calendar of record, and bookings confirm as soon as they are made. Google Calendar is supported for clinics that use it.
+- **Outbound callbacks are staff-initiated only.** Patients request a callback from the website, the chat or a call. Staff place it with "Call now", which only works when outbound calling is switched on, a calling number is set, and the call falls inside quiet hours and the daily budget. Nothing dials automatically, and the demo clinic's synthetic contacts can never be called.
+- **Tenant isolation.** The clinic is always derived from the credential or staff session, never from the request. Patient details and chat transcripts are encrypted at rest, and logs hold ids and codes only.
 
 ## What is implemented
 
-- Scheduling ledger: clinics, doctors, services, weekly hours, holidays/leave/breaks, lead time, buffers and a per-clinic booking horizon (`horizon_days`). PostgreSQL range exclusion prevents overlapping holds; idempotent reservations commit with their calendar job.
-- Tenant credentials (`tools`, `bolna`, `webhook` scopes) and staff users with owner/admin/viewer roles, sessions, lockout and an audit trail. The tenant always comes from the credential or session.
-- Durable outbox worker (leases, fencing, backoff, dead-letter review) with a fake calendar and a Google Calendar adapter (OAuth with PKCE, encrypted refresh tokens; contract-tested only).
-- Bolna tool gateway: call sessions, slot lookup, reservation, encrypted patient records with consent, booking-reference verification, verified cancel/reschedule and opt-out. A generic `/v1/tools` API for other trusted callers, line-gated the same way.
-- Bolna execution webhooks with an inbox and reconciliation polling; consented confirmations and reminders with quiet hours, budgets and opt-outs (off by default; fakes only).
-- Clinic provisioning state machine (agent, number, verification, activation; FakeBolna and MockTransport only) and a staff dashboard (`dashboard/`, TypeScript + Vite).
+- **Scheduling.** Clinics, doctors, services, weekly hours, holidays, leave and breaks, lead time, buffers and a booking horizon. Idempotent reservations commit together with their calendar job.
+- **Patient channels:**
+  - a public clinic API, with rate limits per IP and per phone;
+  - booking lookup by reference and phone, with a uniform 404 for any mismatch;
+  - callback requests;
+  - the chat assistant, with server-side encrypted history, an emergency script, turn and cost caps, and a graceful fallback.
+- **Voice.**
+  - **Bolna tool gateway:** check slots, reserve, status, verify, cancel, reschedule, opt-out.
+  - **Webhook inbox:** stores Bolna's call events, with reconciliation polling.
+  - **Agent compiler and provisioning:** builds the agent configuration and runs clinic setup as a state machine.
+- **Staff:**
+  - owner, admin and viewer roles, sessions, lockout and an audit trail;
+  - a calendar (day and week views) and appointments with a needs-review queue;
+  - a callback queue, chat and call transcripts, real stats, and clinic profile and outbound settings.
+- **Background work.** A durable outbox worker with leases, fencing, backoff and a dead-letter queue. It runs as a long-lived worker locally, or as a bounded tick triggered by Supabase `pg_cron` on serverless hosting.
+- **Reminders and confirmations.** Consent, quiet hours, budgets and opt-outs are implemented. They are off by default, and no messaging provider is connected yet.
 
-Not implemented: live provider validation, human call transfer, a messaging provider, the outbound reminder agent's design, cross-call verification and login rate limits, MFA, deployment. See [docs/ROADMAP.md](docs/ROADMAP.md).
+## Repository map
 
-## Quickstart (synthetic local data)
+- `src/clinic_voice/`: the API, scheduling, patients, chat, callbacks, Bolna gateway and provider ports, worker, provisioning and CLI.
+- `web/`: Next.js 15 app containing the clinic website, booking, chat widget and staff console, plus a dev mock mode used when `API_BASE_URL` is unset.
+- `dashboard/`: operator console for provisioning, the outbox and reminders (TypeScript and Vite). Its typed client is generated from `docs/openapi.json`.
+- `migrations/`: versioned PostgreSQL schema. Applied files are frozen, so changes go in a new numbered file. From 018 on, migrations enable row-level security and lock out Supabase's `anon` and `authenticated` roles.
+- `agents/`: the receptionist prompt, the conversation flow and synthetic evaluation scenarios.
+- `docs/`: the [platform plan](docs/plans/2026-10-31-platform.md), [architecture](docs/ARCHITECTURE.md), [API](docs/API.md), [operations](docs/OPERATIONS.md), [security](docs/SECURITY.md), [roadmap](docs/ROADMAP.md), [ADRs](docs/adr/), and the [Claude handoff](docs/CLAUDE_HANDOFF.md).
+- `index.py`, `vercel.json`, `.vercelignore`: the API's Vercel project (repository root). The web project uses `web/vercel.json`.
 
-Requires Python 3.12–3.14, Docker Compose, Node 20.19+ or 22.12+ (dashboard only) and Git. Run commands from the repository root.
+## Run it locally
+
+You need Python 3.12–3.14, Docker Compose, Node 20.19+ or 22.12+, and Git. Run commands from the repository root.
 
 ```sh
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements-dev.lock
 pip install --no-deps -e .
-cp .env.example .env            # DATABASE_URL points at clinic_voice_dev
+cp .env.example .env            # APP_ENV=development; DATABASE_URL points at clinic_voice_dev
 docker compose up -d --wait db
 docker compose exec db createdb -U clinic clinic_voice_dev
 clinic-voice migrate
-clinic-voice seed-demo
-clinic-voice credential issue --clinic 00000000-0000-4000-8000-000000000001 --label local-dev
-# Prints credential_id and token once. Keep the token in your shell or a secret manager only.
-clinic-voice staff create-owner --clinic 00000000-0000-4000-8000-000000000001 --email owner@example.test
-# Prompts for a 12+ character password; then POST /v1/staff/login returns a staff session token.
+clinic-voice seed-platform      # synthetic Aster Dental Studio (slug aster-dental)
+clinic-voice staff create-owner --clinic 2e8cac77-52f3-532f-b098-543a61318556 --email owner@example.test
+# The seed's ids are deterministic; this is Aster Dental Studio. Prompts for a 12+ character password.
 uvicorn clinic_voice.api:app --reload --no-access-log
-# In another shell: process outbox jobs against the in-process fake calendar (dev databases only).
-clinic-voice worker --calendar fake
 ```
 
-The `/v1/tools` API and the Bolna gateway serve a clinic only once its line is open (provisioning `active`, or `verified` with owner test calls). For the synthetic demo clinic, open the line by hand (development database only; real clinics go through provisioning or `clinic-voice provisioning activate-manual`, which check the calendar and approved scripts):
+Start the website and staff console in another shell:
 
 ```sh
-docker compose exec db psql -U clinic -d clinic_voice_dev -c \
-  "INSERT INTO provisioning (clinic_id,state,resume_state,agent_id) VALUES ('00000000-0000-4000-8000-000000000001','active','verified','00000000-0000-4000-8000-0000000000aa')"
+cd web && npm ci && npm run dev
 ```
 
-Open [API docs](http://127.0.0.1:8000/docs) or [readiness](http://127.0.0.1:8000/health/ready). The staff dashboard lives in [dashboard/](dashboard/README.md) (`cd dashboard && npm ci && npm run dev`, then sign in with the staff owner). Seed IDs: clinic `...0001`, doctor `...0002`, service `...0003` (full UUIDs in `cli.py`). Each credential record belongs to one clinic; a request cannot select its own tenant. Rotate with `clinic-voice credential rotate <id> --grace-minutes 60`, revoke with `clinic-voice credential revoke <id>`, and inspect usage with `clinic-voice credential list --clinic <uuid>`.
+Set `API_BASE_URL=http://127.0.0.1:8000` in `web/.env.local` to use the local API. Leave it unset to run the whole UI against built-in mock data, with no backend at all.
+
+The chat assistant needs `CHAT_LLM_API_KEY`. Without it, the chat answers with guided quick replies. Bolna, Google and messaging stay off unless you set their keys. `.env.example` lists every setting.
 
 ## Verify
 
 ```sh
-ruff check .
-ruff format --check .
-pytest -q
-(cd dashboard && npm ci && npm run typecheck && npm run build && npm test)
-# Integration tests MUST use the disposable database below, never production.
+ruff check . && ruff format --check .
 docker compose exec db createdb -U clinic clinic_voice_test
 TEST_DATABASE_URL=postgresql://clinic:clinic_local_only@localhost:55432/clinic_voice_test pytest -q
+(cd web && npm ci && npm run lint && npm run typecheck && npm test && npm run build)
+(cd dashboard && npm ci && npm run typecheck && npm run build && npm test)
 ```
 
-Without `TEST_DATABASE_URL`, PostgreSQL tests skip explicitly. Tests reject database names without a `_test` suffix and delete test table contents. Full CI runs PostgreSQL tests. Do not point tests at application data.
+The PostgreSQL tests refuse any database whose name does not end in `_test`, because they delete table contents. Never point them at real data. CI also checks that `docs/openapi.json` matches the code.
 
-## Example
+## Deploy (Vercel + Supabase)
 
-```sh
-# Set TOOL_TOKEN in this shell to the issued token; do not put secrets into tracked files.
-curl http://127.0.0.1:8000/v1/tools/check-slots \
-  -H "Authorization: Bearer $TOOL_TOKEN" -H 'Content-Type: application/json' \
-  -d '{"doctor_id":"00000000-0000-4000-8000-000000000002","service_id":"00000000-0000-4000-8000-000000000003","day":"2030-01-01"}'
-```
+The demo runs as two Vercel projects in one repository. Both run in region `dub1`, next to the Supabase project in `eu-west-1`.
 
-Replace `day` with a date from today (clinic time) through the clinic's `horizon_days` ahead (default 90; `GET /v1/admin/clinic`). Use an offered offset-aware timestamp in `POST /v1/tools/reserve-slot`, with the same IDs, `starts_at`, and an `Idempotency-Key` header of 8–128 safe ASCII characters. Retry the same logical action with the same key and body. A changed request under that key returns 409. The key must be generated/persisted by a trusted call gateway, not invented anew by the LLM on each retry.
+| Project | Root | Key settings |
+| --- | --- | --- |
+| API | repository root | `DATABASE_URL` (Supabase transaction pooler, port 6543), `DATABASE_POOLER=transaction`, `APP_ENV=production`, `TOKEN_ENCRYPTION_KEYS`, `PHONE_HASH_KEY`, `PUBLIC_PROXY_SECRET`, `WORKER_TICK_SECRET`, `BOLNA_API_KEY`, `BOLNA_GATEWAY_BASE_URL`, `CHAT_LLM_API_KEY` |
+| Web | `web/` | `API_BASE_URL`, `PUBLIC_PROXY_SECRET` (the same value as the API's), `CLINIC_SLUG`, `SITE_URL` |
 
-## Repository map
+1. Run `clinic-voice migrate` once against the Supabase session pooler (port 5432). Migrations never run when the app starts.
+2. Seed or onboard the clinic, then create its owner with `clinic-voice staff create-owner`.
+3. Schedule the worker tick with `pg_cron` and `pg_net`. Keep the bearer secret in Supabase Vault and set `timeout_milliseconds` to 25000. [OPERATIONS.md](docs/OPERATIONS.md) has the details.
+4. Create the clinic's Bolna agent against the API's public URL, then run `clinic-voice bolna set-agent` and `clinic-voice provisioning activate-manual`.
 
-- `src/clinic_voice/`: API, credentials and staff auth, scheduling domain and reservations, worker and handlers, Bolna gateway and provider ports, reminders, provisioning, CLI.
-- `dashboard/`: staff dashboard (TypeScript + Vite, no UI framework); typed client generated from `docs/openapi.json`.
-- `migrations/`: versioned PostgreSQL schema, applied atomically with checksums.
-- `agents/`: receptionist prompt (compiled into the agent), draft reminder prompt (owner review), conversation flow, synthetic evaluation scenarios.
-- `.claude/agents/`: focused reviewer definitions; `AGENTS.md` and `CLAUDE.md` govern agent work.
-- `docs/`: product scope, architecture, API contract, security, operations, roadmap, source review, Claude handoff.
-- `.github/`: CI, issue templates, PR checklist.
+In production, the API refuses public and chat traffic that doesn't carry the proxy secret, so only the web app can reach those routes.
 
-Start with [architecture](docs/ARCHITECTURE.md), [implementation backlog](docs/ROADMAP.md), and the [Claude handoff](docs/CLAUDE_HANDOFF.md). See [CONTRIBUTING.md](CONTRIBUTING.md) for the workflow.
+## Before a real clinic
 
-No license is granted by this initialization. The owner must choose a license before third-party redistribution. The original DOCX is intentionally excluded from this public repo; `docs/SOURCE_REVIEW.md` records its requirements and corrections.
+- **Scripts and disclosure.** The clinic approves its own emergency and handoff wording. Keep the AI disclosure in the voice prompt.
+- **Telephony.** Connect a Bolna phone number. Switch on `outbound_enabled` only after the owner authorizes patient contact.
+- **Messaging.** Choose a messaging provider that meets the idempotency criteria and DLT/TRAI rules.
+- **Hosting.** Vercel Hobby is non-commercial, so move to a paid plan. Consider a Mumbai (`ap-south-1`) database for lower voice latency.
+- **Security operations.** Rotate every key that was shared during setup. Agree a retention period with the clinic and schedule the purge. Run a restore drill.
+
+The full list is in [docs/ROADMAP.md](docs/ROADMAP.md) and [docs/CLAUDE_HANDOFF.md](docs/CLAUDE_HANDOFF.md).
+
+No license is granted yet; the owner must choose one before third-party redistribution.
