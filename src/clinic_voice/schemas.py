@@ -931,3 +931,221 @@ class PublicCallbackOut(StrictModel):
 class WorkerTickOut(StrictModel):
     claimed: int
     housekeeping: Literal["ran", "failed"]
+
+
+# Chat assistant (P2, ADR 0011)
+
+
+def _not_blank(value):
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("text must not be blank")
+    return value
+
+
+ChatText = Annotated[
+    str,
+    BeforeValidator(_form_text),
+    BeforeValidator(_not_blank),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
+]
+
+
+class ChatSessionOut(StrictModel):
+    session_id: str  # 32 hex characters: a bearer secret for this conversation only.
+    greeting: str
+    quick_replies: list[str]
+
+
+class ChatMessageRequest(StrictModel):
+    text: ChatText
+
+
+class ChatMessageOut(StrictModel):
+    role: Literal["user", "assistant"]
+    text: str
+
+
+class ChatProposalOut(StrictModel):
+    id: UUID
+    doctor_name: str
+    service_name: str
+    starts_at: AwareDatetime
+    expires_at: AwareDatetime
+
+
+class ChatTurnOut(StrictModel):
+    messages: list[ChatMessageOut]
+    proposal: ChatProposalOut | None = None
+    quick_replies: list[str]
+
+
+class ChatConfirmRequest(StrictModel):
+    name: PersonName
+    phone: E164Phone
+    consent_contact: StrictBool
+
+
+# Staff platform (P2): calendar, bookings, callbacks, conversations, stats
+
+
+SyncState = Literal["synced", "pending", "failed", "not_applicable"]
+Channel = Literal["voice", "web", "chat", "staff"]
+
+
+class StaffCalendarDoctor(StrictModel):
+    id: UUID
+    name: str
+    colour: str | None
+
+
+class StaffCalendarAppointment(StrictModel):
+    id: UUID
+    doctor_id: UUID
+    service_id: UUID
+    service_name: str
+    colour: str | None
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    status: AppointmentState
+    sync_state: SyncState
+    channel: Channel
+    patient_name: str | None = None
+    reference: str | None = None
+
+
+class StaffCalendarException(StrictModel):
+    id: UUID
+    doctor_id: UUID | None
+    kind: Literal["holiday", "leave", "break"]
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    label: str
+
+
+class StaffCalendarOut(StrictModel):
+    timezone: str
+    doctors: list[StaffCalendarDoctor]
+    appointments: list[StaffCalendarAppointment]
+    exceptions: list[StaffCalendarException]
+
+
+class StaffBookingRequest(StrictModel):
+    service_id: UUID  # Catalogue id or service row id.
+    doctor_id: UUID
+    starts_at: AwareDatetime
+    name: PersonName
+    phone: E164Phone
+    notes: FormText | None = None
+    # Whether the patient agreed to booking confirmations and reminders (default: no).
+    consent_contact: StrictBool = False
+
+
+CallbackStatus = Literal["open", "calling", "done", "dismissed"]
+
+
+class StaffCallbackOut(StrictModel):
+    id: UUID
+    name: str | None
+    phone_masked: str | None
+    reason: str | None
+    source: Literal["web", "chat", "voice"]
+    status: CallbackStatus
+    created_at: AwareDatetime
+    resolved_at: AwareDatetime | None
+    execution_id: str | None
+    call_requested_at: AwareDatetime | None
+    synthetic: bool
+
+
+class StaffCallbackCallOut(StrictModel):
+    status: Literal["calling"]
+    execution_id: str | None
+
+
+class StaffCallbackResolve(StrictModel):
+    status: Literal["done", "dismissed"]
+
+
+class StaffCallbackResolved(StrictModel):
+    id: UUID
+    status: Literal["done", "dismissed"]
+    resolved_at: AwareDatetime
+
+
+class StaffOutboundStatus(StrictModel):
+    enabled: bool
+    has_from_number: bool
+    has_outbound_agent: bool
+
+
+class StaffConversationOut(StrictModel):
+    id: UUID
+    channel: Literal["chat", "voice"]
+    started_at: AwareDatetime
+    status: str
+    turns: int
+    patient_name: str | None = None
+    outcome: str | None
+
+
+class StaffTranscriptMessage(StrictModel):
+    role: Literal["user", "assistant", "tool", "system"]
+    text: str | None
+    tool_name: str | None = None
+    created_at: AwareDatetime
+
+
+class StaffLinkedAppointment(StrictModel):
+    id: UUID
+    reference: str | None
+    status: AppointmentState
+    starts_at: AwareDatetime
+    channel: Channel
+
+
+class StaffConversationDetail(StrictModel):
+    id: UUID
+    channel: Literal["chat", "voice"]
+    started_at: AwareDatetime
+    last_active_at: AwareDatetime | None = None
+    ended_at: AwareDatetime | None = None
+    status: str
+    turns: int
+    outcome: str | None
+    patient_name: str | None = None
+    messages: list[StaffTranscriptMessage] = []
+    # Voice: the call session summary (no raw provider payloads).
+    provider_status: str | None = None
+    call_type: str | None = None
+    duration_seconds: float | None = None
+    hangup_by: str | None = None
+    appointments: list[StaffLinkedAppointment] = []
+
+
+class StaffChannelCounts(StrictModel):
+    voice: int
+    web: int
+    chat: int
+    staff: int
+
+
+class StaffStatsOut(StrictModel):
+    today: int
+    week: int
+    needs_review: int
+    open_callbacks: int
+    by_channel: StaffChannelCounts
+
+
+class StaffClinicRef(StrictModel):
+    id: UUID
+    name: str
+    timezone: str
+    public_slug: str | None
+
+
+class StaffMe(StrictModel):
+    id: UUID
+    email: str
+    role: Role
+    clinic: StaffClinicRef

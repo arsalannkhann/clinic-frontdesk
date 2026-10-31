@@ -94,6 +94,7 @@ CLINIC = {
         " nervous patients and dental emergencies the same day whenever we can. Book online,"
         " chat with our virtual assistant, or call the front desk."
     ),
+    "public_chat_enabled": True,
 }
 
 # key, name, colour, bio, weekly hours {weekday: [(opens, closes), ...]} (0 = Monday)
@@ -252,6 +253,48 @@ LAST_NAMES = [
 CHANNELS = {"voice": "voice_call", "web": "web", "chat": "chat", "staff": "staff"}
 CHANNEL_WEIGHTS = (("voice", 35), ("web", 35), ("chat", 15), ("staff", 15))
 CONTACT_PURPOSES = ("booking_confirmation", "reminder_call", "reminder_message")
+# Short synthetic conversations for the staff conversations screen: (hours ago, messages).
+CHATS = [
+    (
+        30,
+        [
+            ("user", "Hi, are you open on Saturday?"),
+            ("assistant", "Yes, we are open on Saturdays from 10 am to 8 pm."),
+            ("user", "Great, thanks"),
+        ],
+    ),
+    (
+        20,
+        [
+            ("user", "Kya aap bacchon ka check-up karte hain?"),
+            ("assistant", "Haan, hum kids' check-up karte hain. Kaunsa din theek rahega?"),
+        ],
+    ),
+    (
+        6,
+        [
+            ("user", "How much does whitening cost?"),
+            (
+                "assistant",
+                "Prices are confirmed at the consultation. I can find you a time for one,"
+                " or ask the clinic to call you back.",
+            ),
+            ("user", "Please ask them to call me"),
+            ("assistant", "Done, the clinic will call you back."),
+        ],
+    ),
+    (
+        2,
+        [
+            ("user", "My tooth is sensitive to cold after a filling"),
+            (
+                "assistant",
+                "I cannot give medical advice, but a doctor can take a look. Would you like"
+                " a check-up appointment?",
+            ),
+        ],
+    ),
+]
 CALLBACKS = [
     ("web", "Asked about the cost of clear aligners for a teenager.", "open"),
     ("voice", "Wants to move a check-up to a Saturday.", "open"),
@@ -668,6 +711,46 @@ def _callbacks(conn, keyring, hash_key, people) -> int:
     return max(0, len(CALLBACKS) - existing)
 
 
+def _chats(conn, keyring) -> int:
+    """Top the synthetic chat sessions up to CHATS (marked synthetic, random tokens that
+    nobody holds, so they can only be read by staff)."""
+    import secrets
+
+    from clinic_voice.chat import append, token_hash
+
+    existing = _count(
+        conn,
+        "SELECT count(*) AS n FROM chat_sessions WHERE clinic_id=%s AND synthetic",
+        (CLINIC_ID,),
+    )
+    for hours, messages in CHATS[existing:]:
+        session = {"id": uuid4(), "clinic_id": CLINIC_ID}
+        started = utc_now() - timedelta(hours=hours)
+        conn.execute(
+            "INSERT INTO chat_sessions (id,clinic_id,token_hash,created_at,last_active_at,"
+            "turn_count,synthetic) VALUES (%s,%s,%s,%s,%s,%s,true)",
+            (
+                session["id"],
+                CLINIC_ID,
+                token_hash(secrets.token_hex(16)),
+                started,
+                started,
+                sum(1 for role, _ in messages if role == "user"),
+            ),
+        )
+        for role, text in messages:
+            append(conn, keyring, session, role, {"text": text})
+        conn.execute(
+            "UPDATE chat_messages SET created_at=%s WHERE session_id=%s",
+            (started, session["id"]),
+        )
+        conn.execute(
+            "UPDATE chat_sessions SET last_active_at=%s WHERE id=%s", (started, session["id"])
+        )
+        conn.commit()
+    return max(0, len(CHATS) - existing)
+
+
 def _check_and_upsert(conn) -> None:
     """The refusal check and catalogue upsert, atomically (see the module docstring)."""
     conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('seed-platform', 0))")
@@ -697,7 +780,7 @@ def seed(url, settings) -> dict[str, int]:
     keyring, hash_key = _crypto(settings)
     zone = ZoneInfo(ZONE_NAME)
     today = utc_now().astimezone(zone).date()
-    counts = {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "jobs": 0}
+    counts = {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "chats": 0, "jobs": 0}
     with connect(url) as conn:
         _check_and_upsert(conn)
         _exceptions(conn, today)
@@ -729,5 +812,6 @@ def seed(url, settings) -> dict[str, int]:
         counts["jobs"] += _run_calendar_jobs(conn)
         counts["cancelled"] = _cancel_some(conn, rng, today)
         counts["callbacks"] = _callbacks(conn, keyring, hash_key, people)
+        counts["chats"] = _chats(conn, keyring)
         counts["jobs"] += _run_calendar_jobs(conn)
     return counts

@@ -8,6 +8,9 @@ nothing schedules it.
 - Callback requests (migration 018) linked to a purged patient are unlinked. Callback
   requests created more than `session_days` ago are deleted (they hold an encrypted name,
   phone and reason, like a call session's caller number).
+- Chat sessions (migration 019) linked to a purged patient are unlinked. Chat sessions last
+  active more than `session_days` ago are deleted with their encrypted transcript and
+  proposals (ON DELETE CASCADE); a proposal's booked appointment stays.
 - Webhook inbox events received more than `session_days` ago are deleted (before call
   sessions are locked; lock order in locks.py). They hold minimized codes only.
 - Call sessions that started more than `session_days` ago are deleted with their
@@ -63,10 +66,19 @@ def purge(conn, session_days: int, dry_run: bool = False) -> dict[str, int]:
         "UPDATE callback_requests SET patient_id=NULL WHERE " + PAIRS.format(column="patient_id"),
         patient_pairs,
     )
+    conn.execute(
+        "UPDATE chat_sessions SET patient_id=NULL WHERE " + PAIRS.format(column="patient_id"),
+        patient_pairs,
+    )
     conn.execute("DELETE FROM patients WHERE " + PAIRS.format(column="id"), patient_pairs)
     result["callback_requests"] = _count(
         conn,
         "DELETE FROM callback_requests WHERE created_at < now() - make_interval(days => %s)",
+        (session_days,),
+    )
+    result["chat_sessions"] = _count(
+        conn,
+        "DELETE FROM chat_sessions WHERE last_active_at < now() - make_interval(days => %s)",
         (session_days,),
     )
     result["webhook_events"] = _count(

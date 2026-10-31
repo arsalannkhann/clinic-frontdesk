@@ -1111,12 +1111,17 @@ def test_seed_platform_is_synthetic_consistent_and_idempotent(empty):
         assert local.date() != date(2026, 11, 8) or row["status"] == "cancelled"
     # Idempotent: nothing is added or duplicated.
     again = seed_platform.seed(empty, get_settings())
-    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "jobs": 0}
+    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "chats": 0, "jobs": 0}
     with connect(empty) as conn:
         assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == len(rows)
         assert conn.execute("SELECT count(*) AS n FROM doctors").fetchone()["n"] == 5
         assert conn.execute("SELECT count(*) AS n FROM schedule_exceptions").fetchone()["n"] == 2
         assert conn.execute("SELECT count(*) AS n FROM callback_requests").fetchone()["n"] == 4
+        chats = conn.execute("SELECT * FROM chat_sessions").fetchall()
+        assert len(chats) == len(seed_platform.CHATS) and all(c["synthetic"] for c in chats)
+        assert conn.execute("SELECT public_chat_enabled FROM clinics").fetchone()[
+            "public_chat_enabled"
+        ]
         conn.execute("INSERT INTO clinics (id,name) VALUES (%s,'Real clinic')", (uuid4(),))
     with pytest.raises(seed_platform.SeedRefused):
         seed_platform.seed(empty, get_settings())
@@ -1156,7 +1161,7 @@ def test_interrupted_seed_is_completed_by_the_next_run(empty, monkeypatch, stage
     monkeypatch.setattr(seed_platform, stage, original)
     seed_platform.seed(empty, get_settings())
     again = seed_platform.seed(empty, get_settings())
-    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "jobs": 0}
+    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "chats": 0, "jobs": 0}
     with connect(empty) as conn:
         kinds = conn.execute(
             """SELECT count(*) FILTER (WHERE request_hash='seed') AS past,

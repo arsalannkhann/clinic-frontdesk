@@ -144,16 +144,19 @@ def list_doctors(conn, clinic_id) -> list[dict]:
     return [{**row, "service_ids": sorted(row["service_ids"], key=str)} for row in rows]
 
 
-def offerings(conn, clinic_id, service_id, doctor_id=None) -> list[dict]:
-    """(doctor_id, service row id, names) of each doctor offering a public service."""
+def offerings(conn, clinic_id, service_id, doctor_id=None, public_only=True) -> list[dict]:
+    """(doctor_id, service row id, names) of each doctor offering a public service.
+    public_only=False (staff bookings): any active service of an active doctor, named by
+    its catalogue id or its own row id."""
+    offered = OFFERED if public_only else "s.active AND d.active"
     return conn.execute(
         f"""SELECT DISTINCT ON (s.doctor_id) s.doctor_id, s.id AS service_row_id,
         d.name AS doctor_name, s.name AS service_name
         FROM services s JOIN doctors d ON d.clinic_id=s.clinic_id AND d.id=s.doctor_id
-        WHERE s.clinic_id=%s AND COALESCE(s.catalog_id, s.id)=%s AND {OFFERED}
-        AND (%s::uuid IS NULL OR s.doctor_id=%s::uuid)
+        WHERE s.clinic_id=%s AND (COALESCE(s.catalog_id, s.id)=%s OR (NOT %s AND s.id=%s))
+        AND {offered} AND (%s::uuid IS NULL OR s.doctor_id=%s::uuid)
         ORDER BY s.doctor_id, s.id""",  # noqa: S608
-        (clinic_id, service_id, doctor_id, doctor_id),
+        (clinic_id, service_id, public_only, service_id, doctor_id, doctor_id),
     ).fetchall()
 
 
@@ -255,78 +258,71 @@ def booking_out(row, zone) -> dict:
     }
 
 
-def book(url, settings, clinic, request, address, idempotency_key=None, ports=None) -> dict:
-    """A web booking (channel web). Order: consent (422), crypto (503), IP and phone rate
-    limits (429, counted before any booking work), offering (404), then service.reserve and,
-    after its commit, the inline confirm. idempotency_key (optional, client-chosen) makes a
-    retried submission replay the first booking."""
-    if request.consent_contact is not True:
-        raise PublicError(422, "consent_required", "Consent to be contacted is required to book")
-    keyring, hash_key = crypto(settings)
-    clinic_id = clinic["id"]
-    digest = phone_hash(hash_key, request.phone)
-    with connect(url) as conn:
-        limit(
-            conn,
-            hash_key,
-            "booking-ip",
-            settings.public_booking_ip_per_hour,
-            HOUR,
-            client_value(address),
-        )
-        limit(
-            conn,
-            hash_key,
-            "booking-phone",
-            settings.public_booking_phone_per_day,
-            DAY,
-            f"{clinic_id}:{request.phone}",
-        )
-        found = offerings(conn, clinic_id, request.service_id, request.doctor_id)
-    if not found:
-        raise fail(NOT_FOUND)
-    offer = found[0]
+def booking_key(prefix: str, idempotency_key: str | None) -> str:
+    """The stored idempotency key: the channel prefix plus a SHA-256 of the client's key,
+    or a fresh random one (no replay) without it."""
     if idempotency_key:
-        key = KEY_PREFIX + hashlib.sha256(idempotency_key.encode()).hexdigest()
-    else:
-        key = KEY_PREFIX + uuid4().hex
-    contact = ratelimit.key_hash(hash_key, "booking-contact", f"{digest.hex()}:{request.name}")
+        return prefix + hashlib.sha256(idempotency_key.encode()).hexdigest()
+    return prefix + uuid4().hex
+
+
+def create_booking(
+    url,
+    settings,
+    clinic,
+    offer,
+    *,
+    starts_at,
+    name,
+    phone,
+    notes,
+    channel,
+    consent: bool,
+    key,
+    keyring,
+    hash_key,
+    gate=None,
+    actor_id=None,
+    audit_action="public.booking_created",
+    after_insert=None,
+    ports=None,
+) -> dict:
+    """The booking core shared by the website, the chat confirm and staff bookings: a new
+    patient from the typed name and phone (patients.create_from_form, never a match), the
+    contact consents when `consent` (source = channel), encrypted notes, an audit row, all
+    inside service.reserve (offered slot re-validated under the doctor row lock, appointment
+    and calendar.create job in one commit), then the inline confirm after the commit.
+    `offer` is an offerings() row. Returns the public booking shape plus appointment_id."""
+    clinic_id = clinic["id"]
+    digest = phone_hash(hash_key, phone)
+    contact = ratelimit.key_hash(hash_key, "booking-contact", f"{digest.hex()}:{name}")
     reservation = WebReservation(
-        doctor_id=request.doctor_id,
+        doctor_id=offer["doctor_id"],
         service_id=offer["service_row_id"],
-        starts_at=request.starts_at,
+        starts_at=starts_at,
         contact=contact.hex(),
     )
     details = patients.PatientDetails(
-        name=request.name, consents={purpose: True for purpose in CONTACT_PURPOSES}
+        name=name, consents={purpose: True for purpose in CONTACT_PURPOSES} if consent else {}
     )
 
     def attach(conn, starts_at):
         retention_until = starts_at + timedelta(days=settings.patient_retention_days)
         return patients.create_from_form(
-            conn, keyring, clinic_id, details, (request.phone, digest), retention_until, "web"
+            conn, keyring, clinic_id, details, (phone, digest), retention_until, channel
         )
 
-    def after_insert(conn, appointment_id, patient_id):
-        if request.notes:
-            key_id, blob = keyring.encrypt(
-                request.notes.encode(), notes_aad(clinic_id, appointment_id)
-            )
+    def inserted(conn, appointment_id, patient_id):
+        if notes:
+            key_id, blob = keyring.encrypt(notes.encode(), notes_aad(clinic_id, appointment_id))
             conn.execute(
                 "UPDATE appointments SET notes_ciphertext=%s, notes_key_id=%s"
                 " WHERE clinic_id=%s AND id=%s",
                 (blob, key_id, clinic_id, appointment_id),
             )
-        audit(conn, clinic_id, None, "public.booking_created", appointment_id)
-
-    def gate(conn):
-        # Level 1b analogue (locks.py): the clinic row FOR SHARE, re-checking that the
-        # clinic still accepts public bookings inside the write transaction.
-        row = conn.execute(
-            "SELECT public_enabled FROM clinics WHERE id=%s FOR SHARE", (clinic_id,)
-        ).fetchone()
-        if row is None or not row["public_enabled"]:
-            raise fail(NOT_FOUND)
+        if after_insert is not None:
+            after_insert(conn, appointment_id, patient_id)
+        audit(conn, clinic_id, actor_id, audit_action, appointment_id)
 
     try:
         result = service.reserve(
@@ -335,9 +331,9 @@ def book(url, settings, clinic, request, address, idempotency_key=None, ports=No
             reservation,
             key,
             attach_patient=attach,
-            after_insert=after_insert,
+            after_insert=inserted,
             gate=gate,
-            channel="web",
+            channel=channel,
         )
     except HTTPException as error:
         raise _map_reserve_error(error) from None
@@ -349,18 +345,89 @@ def book(url, settings, clinic, request, address, idempotency_key=None, ports=No
             url, ports, clinic_id, result["appointment_id"], settings.inline_confirm_budget_seconds
         )
     log.info(
-        "public booking appointment=%s clinic=%s status=%s",
+        "%s booking appointment=%s clinic=%s status=%s",
+        "public" if channel == "web" else channel,
         result["appointment_id"],
         clinic_id,
         status,
     )
     return {
+        "appointment_id": result["appointment_id"],
         "reference": result["booking_reference"],
         "status": status,
         "starts_at": result["starts_at"].astimezone(ZoneInfo(clinic["timezone"])),
         "doctor_name": offer["doctor_name"],
         "service_name": offer["service_name"],
     }
+
+
+def public_booking(result: dict) -> dict:
+    """The public booking response shape (drops the internal appointment id)."""
+    return {key: value for key, value in result.items() if key != "appointment_id"}
+
+
+def book(url, settings, clinic, request, address, idempotency_key=None, ports=None) -> dict:
+    """A web booking (channel web). Order: consent (422), crypto (503), IP and phone rate
+    limits (429, counted before any booking work), offering (404), then create_booking.
+    idempotency_key (optional, client-chosen) makes a retried submission replay the first
+    booking."""
+    if request.consent_contact is not True:
+        raise PublicError(422, "consent_required", "Consent to be contacted is required to book")
+    keyring, hash_key = crypto(settings)
+    clinic_id = clinic["id"]
+    with connect(url) as conn:
+        booking_limits(conn, settings, hash_key, clinic_id, request.phone, address)
+        found = offerings(conn, clinic_id, request.service_id, request.doctor_id)
+    if not found:
+        raise fail(NOT_FOUND)
+
+    def gate(conn):
+        # Level 1b analogue (locks.py): the clinic row FOR SHARE, re-checking that the
+        # clinic still accepts public bookings inside the write transaction.
+        row = conn.execute(
+            "SELECT public_enabled FROM clinics WHERE id=%s FOR SHARE", (clinic_id,)
+        ).fetchone()
+        if row is None or not row["public_enabled"]:
+            raise fail(NOT_FOUND)
+
+    result = create_booking(
+        url,
+        settings,
+        clinic,
+        found[0],
+        starts_at=request.starts_at,
+        name=request.name,
+        phone=request.phone,
+        notes=request.notes,
+        channel="web",
+        consent=True,
+        key=booking_key(KEY_PREFIX, idempotency_key),
+        keyring=keyring,
+        hash_key=hash_key,
+        gate=gate,
+        ports=ports,
+    )
+    return public_booking(result)
+
+
+def booking_limits(conn, settings, hash_key, clinic_id, phone, address) -> None:
+    """The per-IP and per-phone booking limits (web and chat confirm share the buckets)."""
+    limit(
+        conn,
+        hash_key,
+        "booking-ip",
+        settings.public_booking_ip_per_hour,
+        HOUR,
+        client_value(address),
+    )
+    limit(
+        conn,
+        hash_key,
+        "booking-phone",
+        settings.public_booking_phone_per_day,
+        DAY,
+        f"{clinic_id}:{phone}",
+    )
 
 
 def lookup(url, settings, clinic, request, address) -> dict:
