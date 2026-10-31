@@ -95,6 +95,30 @@ class Settings(BaseSettings):
     # /v1/admin/* cross-origin (e.g. https://dash.clinic.example). Empty: no CORS headers at
     # all (serve the dashboard same-origin, or use the Vite dev-server proxy).
     dashboard_origins: str | None = None
+    # Serverless worker tick (P1, POST /v1/internal/worker/tick): bearer secret the
+    # scheduler (Supabase pg_cron + pg_net) sends. Unset: the endpoint answers 404.
+    worker_tick_secret: SecretStr | None = None
+    # Seconds a tick spends claiming and running outbox jobs before housekeeping. Keep it
+    # well under the function's maxDuration (vercel.json).
+    worker_tick_budget_seconds: float = Field(default=8.0, ge=1.0, le=50.0)
+    # Public and chat bookings run their own calendar.create job inline for at most this
+    # long (ledger-mapped doctors only); 0 leaves every booking to the tick.
+    inline_confirm_budget_seconds: float = Field(default=3.0, ge=0.0, le=10.0)
+    # Public API rate limits (fixed windows; keys are HMACs under PHONE_HASH_KEY).
+    public_booking_ip_per_hour: int = Field(default=5, ge=1, le=10000)
+    public_booking_phone_per_day: int = Field(default=3, ge=1, le=1000)
+    public_lookup_ip_per_hour: int = Field(default=10, ge=1, le=10000)
+    public_callback_ip_per_hour: int = Field(default=3, ge=1, le=10000)
+    public_callback_phone_per_day: int = Field(default=3, ge=1, le=1000)
+
+    @field_validator("worker_tick_secret")
+    @classmethod
+    def _tick_secret(cls, value):
+        if value is None or not value.get_secret_value():
+            return None
+        if len(value.get_secret_value()) < 32:
+            raise ValueError("worker_tick_secret must be at least 32 characters")
+        return value
 
     @field_validator("dashboard_origins")
     @classmethod

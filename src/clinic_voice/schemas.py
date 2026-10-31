@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    StrictBool,
     StringConstraints,
     model_validator,
 )
@@ -806,3 +807,127 @@ class ProvisioningAdvanced(StrictModel):
     job_id: UUID
     state: ProvisioningState
     step: Literal["calendar", "agent", "number", "verify"]
+
+
+# Public clinic API (P1, /v1/public/clinics/{slug}/...). Inputs are strict: unknown fields,
+# control characters and non-E.164 phones are refused (422 invalid_request).
+
+
+def _form_text(value):
+    # Free text from a public form: no control characters except line breaks and tabs.
+    if isinstance(value, str) and re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", value):
+        raise ValueError("control characters are not allowed")
+    return value
+
+
+PersonName = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+]
+E164Phone = Annotated[
+    str, StringConstraints(strip_whitespace=True, pattern=r"^\+[1-9][0-9]{6,14}$")
+]
+FormText = Annotated[
+    str, BeforeValidator(_form_text), StringConstraints(strip_whitespace=True, max_length=500)
+]
+
+
+class PublicErrorBody(StrictModel):
+    code: str
+    message: str
+
+
+class PublicErrorEnvelope(StrictModel):
+    error: PublicErrorBody
+
+
+class PublicClinicOut(StrictModel):
+    name: str
+    tagline: str
+    timezone: str
+    address: str
+    map_url: str | None
+    phone_display: str
+    email: str
+    hours_note: str
+    about: str
+    voice_number: str | None  # E.164; null until the clinic has a voice line.
+    chat_enabled: bool
+
+
+class PublicServiceOut(StrictModel):
+    id: UUID  # Catalogue id: the same offering at every doctor who provides it.
+    name: str
+    description: str
+    duration_minutes: int
+    colour: str | None
+
+
+class PublicDoctorOut(StrictModel):
+    id: UUID
+    name: str
+    public_bio: str
+    photo_url: str | None
+    colour: str | None
+    service_ids: list[UUID]
+
+
+class PublicSlot(StrictModel):
+    doctor_id: UUID
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+
+
+class PublicSlotsOut(StrictModel):
+    timezone: str
+    slots: list[PublicSlot]
+
+
+class PublicBookingRequest(StrictModel):
+    service_id: UUID
+    doctor_id: UUID
+    starts_at: AwareDatetime
+    name: PersonName
+    phone: E164Phone
+    # A JSON boolean, never a coerced string; must be true (422 consent_required otherwise).
+    consent_contact: StrictBool
+    notes: FormText | None = None
+
+
+# pending_sync or confirmed for a new booking; a replayed idempotency key or a lookup also
+# reports needs_review or cancelled.
+PublicBookingStatus = Literal["pending_sync", "confirmed", "needs_review", "cancelled"]
+
+
+class PublicBookingOut(StrictModel):
+    reference: str
+    status: PublicBookingStatus
+    starts_at: AwareDatetime
+    doctor_name: str
+    service_name: str
+
+
+class PublicLookupRequest(StrictModel):
+    reference: Annotated[
+        str,
+        BeforeValidator(_no_control_characters),
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=32),
+    ]
+    phone: E164Phone
+
+
+class PublicCallbackRequest(StrictModel):
+    name: PersonName
+    phone: E164Phone
+    reason: FormText | None = None
+
+
+class PublicCallbackOut(StrictModel):
+    id: UUID
+    status: Literal["open", "calling", "done", "dismissed"]
+
+
+class WorkerTickOut(StrictModel):
+    claimed: int
+    housekeeping: Literal["ran", "failed"]

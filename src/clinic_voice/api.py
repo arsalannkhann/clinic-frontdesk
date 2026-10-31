@@ -5,22 +5,27 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg import Error as DatabaseError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from clinic_voice import staff as staff_service
 from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
 from clinic_voice.bolna.gateway import refuse_context, require_line
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tool_caller
-from clinic_voice.errors import NotFound
+from clinic_voice.errors import NotFound, PublicError
+from clinic_voice.public import KEY_PREFIX as WEB_KEY_PREFIX
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.routes_appointments import router as appointments_router
 from clinic_voice.routes_bolna import router as bolna_router
 from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
+from clinic_voice.routes_internal import router as internal_router
+from clinic_voice.routes_public import router as public_router
 from clinic_voice.routes_webhooks import router as webhooks_router
 from clinic_voice.schemas import (
     CONTEXT_CODES,
@@ -187,10 +192,59 @@ app.include_router(calendar_admin_router)
 app.include_router(oauth_router)
 app.include_router(bolna_router)
 app.include_router(webhooks_router)
+app.include_router(public_router)
+app.include_router(internal_router)
+
+PUBLIC_PATH = "/v1/public/"
+PUBLIC_CODES = {
+    400: "invalid_request",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    413: "too_large",
+    422: "invalid_request",
+    429: "rate_limited",
+    503: "unavailable",
+}
+
+
+def _is_public(request) -> bool:
+    path = request.scope["path"]
+    root = request.scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root) :]
+    return path.startswith(PUBLIC_PATH)
+
+
+def envelope(status: int, code: str, message: str, headers=None) -> JSONResponse:
+    """The public API error body: {"error": {"code", "message"}}, never cached."""
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"code": code, "message": message}},
+        headers={**(headers or {}), "Cache-Control": "no-store"},
+    )
+
+
+@app.exception_handler(PublicError)
+async def public_error(request, exc):
+    return envelope(exc.status, exc.code, exc.message)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request, exc):
+    """HTTP errors on public paths (including unknown routes under them) use the
+    envelope with a code per status; every other path keeps FastAPI's {"detail"} body."""
+    if not _is_public(request):
+        return await http_exception_handler(request, exc)
+    code = PUBLIC_CODES.get(exc.status_code, "error")
+    message = exc.detail if isinstance(exc.detail, str) else code
+    return envelope(exc.status_code, code, message, getattr(exc, "headers", None))
 
 
 @app.exception_handler(DatabaseError)
 async def database_error(request, exc):
+    if _is_public(request):
+        return envelope(503, "unavailable", "Booking is unavailable; please try again later")
     return JSONResponse(
         status_code=503, content={"detail": "Scheduling unavailable; retry the same action later"}
     )
@@ -216,6 +270,11 @@ async def validation_error(request, exc):
             clinic_id = getattr(request.state, "bolna_clinic_id", None)
             return refuse_context(clinic_id, tool, code, fields)
     # Pydantic errors can echo sensitive submitted values. Return locations/types only.
+    if _is_public(request):
+        fields = ", ".join(
+            dict.fromkeys(".".join(str(part) for part in e["loc"][1:]) or "body" for e in errors)
+        )
+        return envelope(422, "invalid_request", f"Invalid request: {fields}"[:300])
     return JSONResponse(
         status_code=422,
         content={
@@ -224,7 +283,7 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "016_tool_scopes.sql"
+REQUIRED_MIGRATION = "018_platform.sql"
 
 
 @app.get("/health/live")
@@ -266,8 +325,9 @@ def reserve_slot(
     ],
     caller=Depends(tool_caller),
 ):
-    if idempotency_key.startswith(BOLNA_KEY_PREFIX):
-        # Reserved for keys the Bolna gateway derives, which bind appointments to a call session.
+    if idempotency_key.startswith((BOLNA_KEY_PREFIX, WEB_KEY_PREFIX)):
+        # Reserved for keys the Bolna gateway and the public booking API derive (Bolna keys
+        # bind appointments to a call session; web keys to a contact).
         raise HTTPException(422, "Idempotency key prefix is reserved")
     clinic_id = caller.clinic_id
     with database() as conn:
