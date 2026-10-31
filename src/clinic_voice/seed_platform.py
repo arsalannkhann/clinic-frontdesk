@@ -5,9 +5,14 @@ phone numbers, which all come from the reserved range +91 90000 0xxxx. The clini
 marked seed_tag='platform-seed'; the command refuses to run while the database holds any
 clinic without that mark, so it can never write into a real clinic's data.
 
-Idempotent. Clinic profile, doctors, catalogue, hours and exceptions are upserted on every
-run (deterministic ids). Appointments and callback requests are generated only while the
-clinic has no appointments, so a re-run never adds or duplicates them.
+Idempotent and resumable. Clinic profile, doctors, catalogue, hours and exceptions are
+upserted on every run (deterministic ids). Past appointments, future appointments,
+cancellations and callback requests are each topped up to their own target (counted from
+the seed's own rows), so a run interrupted half-way is completed by the next one and a
+complete seed is never added to or duplicated. The refusal check (no clinic without the
+seed tag) and the catalogue upsert run in one transaction that holds the clinics table in
+SHARE ROW EXCLUSIVE mode and a seed advisory lock, so no clinic can be inserted between the
+check and the upsert and two seeds cannot interleave there.
 
 Appointments (about 70, over the past 7 and next 14 clinic-local days) respect the same
 invariants as live bookings:
@@ -41,7 +46,7 @@ from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key
 from clinic_voice.db import connect
 from clinic_voice.domain import candidate_slots, utc_now
 from clinic_voice.locks import lock_doctors
-from clinic_voice.outbox import Ports, run_batch
+from clinic_voice.outbox import Ports, claim, process
 from clinic_voice.providers.calendar import event_id_for
 from clinic_voice.providers.ledger import LedgerResolver, ledger_calendar_id
 from clinic_voice.public import store_callback
@@ -359,9 +364,9 @@ def _exceptions(conn, today: date) -> None:
 class _People:
     """Synthetic patients: distinct names and numbers from +91 90000 0xxxx."""
 
-    def __init__(self, rng: random.Random):
+    def __init__(self, rng: random.Random, start: int = 1001):
         self._rng = rng
-        self._next = 1001
+        self._next = start
 
     def next(self) -> tuple[str, str]:
         name = f"{self._rng.choice(FIRST_NAMES)} {self._rng.choice(LAST_NAMES)}"
@@ -423,7 +428,7 @@ def _doctor_days(rng, conn, days) -> list[tuple[date, UUID]]:
     return pairs
 
 
-def _past(conn, rng, keyring, hash_key, people, settings, today) -> int:
+def _past(conn, rng, keyring, hash_key, people, settings, today, target) -> int:
     """Past appointments at free starts of each doctor's hours (see the module docstring)."""
     zone = ZoneInfo(ZONE_NAME)
     now = utc_now()
@@ -431,7 +436,7 @@ def _past(conn, rng, keyring, hash_key, people, settings, today) -> int:
     created = 0
     pairs = _doctor_days(rng, conn, [today - timedelta(days=n) for n in range(7, 0, -1)])
     for day, doctor in pairs + pairs:  # Second pass adds a second visit to some days.
-        if created >= PAST_TARGET:
+        if created >= target:
             break
         service_id = rng.choice(services[doctor])
         lock_doctors(conn, CLINIC_ID, [doctor])
@@ -533,12 +538,12 @@ def _past(conn, rng, keyring, hash_key, people, settings, today) -> int:
     return created
 
 
-def _future(url, conn, rng, keyring, hash_key, people, settings, today) -> list[UUID]:
+def _future(url, conn, rng, keyring, hash_key, people, settings, today, target) -> list[UUID]:
     services = _doctor_services(conn)
     booked: list[UUID] = []
     pairs = _doctor_days(rng, conn, [today + timedelta(days=n) for n in range(0, 15)])
     for day, doctor in pairs + pairs:
-        if len(booked) >= FUTURE_TARGET:
+        if len(booked) >= target:
             break
         service_id = rng.choice(services[doctor])
         try:
@@ -570,22 +575,66 @@ def _future(url, conn, rng, keyring, hash_key, people, settings, today) -> list[
     return booked
 
 
+CALENDAR_KINDS = ("calendar.create", "calendar.cancel")
+
+
 def _run_calendar_jobs(conn) -> int:
-    """Run the clinic's calendar jobs with the ledger calendar until none is due."""
+    """Run the seed clinic's own due calendar jobs (never another clinic's) with the ledger
+    calendar, through the outbox claim and fencing, until none is due."""
     ports = Ports(calendar_for=LedgerResolver())
     total = 0
     while True:
-        count = run_batch(
-            conn, "seed-platform", ports, 20, kinds=("calendar.create", "calendar.cancel")
-        )
-        total += count
-        if count == 0:
+        ids = [
+            row["id"]
+            for row in conn.execute(
+                "SELECT id FROM outbox WHERE clinic_id=%s AND kind = ANY(%s)"
+                " AND status IN ('pending', 'processing')",
+                (CLINIC_ID, list(CALENDAR_KINDS)),
+            ).fetchall()
+        ]
+        conn.commit()
+        if not ids:
             return total
+        jobs = claim(conn, "seed-platform", 20, kinds=CALENDAR_KINDS, ids=ids)
+        for job in jobs:
+            process(conn, job, ports)
+        total += len(jobs)
+        if not jobs:
+            return total  # Not due yet, or leased by another worker.
 
 
-def _cancel_some(conn, rng, booked) -> int:
+# Seed appointments: past ones are inserted directly (request_hash 'seed'), future ones
+# through service.reserve (a real request fingerprint); both carry 'seed:' keys.
+SEEDED = "a.clinic_id=%s AND a.idempotency_key LIKE 'seed:%%'"
+
+
+def _count(conn, sql, params=()) -> int:
+    count = conn.execute(sql, params).fetchone()["n"]
+    conn.commit()
+    return count
+
+
+def _cancel_some(conn, rng, today) -> int:
+    """Cancel confirmed future seed appointments until FUTURE_CANCELLED of them are."""
+    start = datetime.combine(today, time(0), ZoneInfo(ZONE_NAME))
+    done = _count(
+        conn,
+        f"SELECT count(*) AS n FROM appointments a WHERE {SEEDED}"  # noqa: S608
+        " AND a.request_hash <> 'seed' AND a.status='cancelled' AND a.starts_at >= %s",
+        (CLINIC_ID, start),
+    )
+    confirmed = [
+        row["id"]
+        for row in conn.execute(
+            f"SELECT a.id FROM appointments a WHERE {SEEDED} AND a.request_hash <> 'seed'"  # noqa: S608
+            " AND a.status='confirmed' AND a.starts_at >= %s ORDER BY a.id",
+            (CLINIC_ID, start),
+        ).fetchall()
+    ]
+    conn.commit()
+    wanted = max(0, min(FUTURE_CANCELLED - done, len(confirmed)))
     count = 0
-    for appointment_id in rng.sample(booked, min(FUTURE_CANCELLED, len(booked))):
+    for appointment_id in rng.sample(confirmed, wanted):
         row = appointments.lock_appointment(conn, CLINIC_ID, appointment_id)
         if row is not None and row["status"] == "confirmed":
             appointments.cancel_locked(conn, row)
@@ -595,7 +644,12 @@ def _cancel_some(conn, rng, booked) -> int:
 
 
 def _callbacks(conn, keyring, hash_key, people) -> int:
-    for source, reason, status in CALLBACKS:
+    existing = _count(
+        conn,
+        "SELECT count(*) AS n FROM callback_requests WHERE clinic_id=%s AND synthetic",
+        (CLINIC_ID,),
+    )
+    for source, reason, status in CALLBACKS[existing:]:
         name, phone = people.next()
         request_id, _ = store_callback(
             conn, keyring, hash_key, CLINIC_ID, name, phone, reason, source
@@ -611,38 +665,69 @@ def _callbacks(conn, keyring, hash_key, people) -> int:
                 (CLINIC_ID, request_id),
             )
     conn.commit()
-    return len(CALLBACKS)
+    return max(0, len(CALLBACKS) - existing)
+
+
+def _check_and_upsert(conn) -> None:
+    """The refusal check and catalogue upsert, atomically (see the module docstring)."""
+    conn.execute("SELECT pg_advisory_xact_lock(hashtextextended('seed-platform', 0))")
+    conn.execute("LOCK TABLE clinics IN SHARE ROW EXCLUSIVE MODE")
+    foreign = conn.execute(
+        "SELECT count(*) AS n FROM clinics WHERE seed_tag IS DISTINCT FROM %s", (SEED_TAG,)
+    ).fetchone()["n"]
+    if foreign:
+        conn.rollback()
+        raise SeedRefused("Refusing to seed: the database holds clinics that are not seed data")
+    _upsert_catalogue(conn)
+    conn.commit()
+
+
+def _synthetic_contacts(conn) -> int:
+    return _count(
+        conn,
+        "SELECT (SELECT count(*) FROM patients WHERE clinic_id=%s AND synthetic)"
+        " + (SELECT count(*) FROM callback_requests WHERE clinic_id=%s AND synthetic) AS n",
+        (CLINIC_ID, CLINIC_ID),
+    )
 
 
 def seed(url, settings) -> dict[str, int]:
-    """Seed (or refresh) the demo clinic. Raises SeedRefused when the database holds a
-    clinic that is not seed data, or the encryption settings are missing."""
+    """Seed (or refresh, or finish) the demo clinic. Raises SeedRefused when the database
+    holds a clinic that is not seed data, or the encryption settings are missing."""
     keyring, hash_key = _crypto(settings)
     zone = ZoneInfo(ZONE_NAME)
     today = utc_now().astimezone(zone).date()
     counts = {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "jobs": 0}
     with connect(url) as conn:
-        foreign = conn.execute(
-            "SELECT count(*) AS n FROM clinics WHERE seed_tag IS DISTINCT FROM %s", (SEED_TAG,)
-        ).fetchone()["n"]
-        if foreign:
-            raise SeedRefused("Refusing to seed: the database holds clinics that are not seed data")
-        _upsert_catalogue(conn)
-        conn.commit()
+        _check_and_upsert(conn)
         _exceptions(conn, today)
-        existing = conn.execute(
-            "SELECT count(*) AS n FROM appointments WHERE clinic_id=%s", (CLINIC_ID,)
-        ).fetchone()["n"]
-        conn.commit()
-        if existing == 0:
-            # Seeded from the date, so a re-seed on the same day picks the same pattern.
-            rng = random.Random(f"aster-dental:{today.isoformat()}")
-            people = _People(rng)
-            counts["past"] = _past(conn, rng, keyring, hash_key, people, settings, today)
-            booked = _future(url, conn, rng, keyring, hash_key, people, settings, today)
+        past = _count(
+            conn,
+            f"SELECT count(*) AS n FROM appointments a WHERE {SEEDED}"  # noqa: S608
+            " AND a.request_hash='seed'",
+            (CLINIC_ID,),
+        )
+        future = _count(
+            conn,
+            f"SELECT count(*) AS n FROM appointments a WHERE {SEEDED}"  # noqa: S608
+            " AND a.request_hash<>'seed'",
+            (CLINIC_ID,),
+        )
+        # Seeded from the date, so a re-seed on the same day picks the same pattern; phone
+        # numbers continue after the synthetic contacts already stored, so they stay distinct.
+        rng = random.Random(f"aster-dental:{today.isoformat()}")
+        people = _People(rng, start=1001 + _synthetic_contacts(conn))
+        if past < PAST_TARGET:
+            counts["past"] = _past(
+                conn, rng, keyring, hash_key, people, settings, today, PAST_TARGET - past
+            )
+        if future < FUTURE_TARGET:
+            booked = _future(
+                url, conn, rng, keyring, hash_key, people, settings, today, FUTURE_TARGET - future
+            )
             counts["future"] = len(booked)
-            counts["jobs"] += _run_calendar_jobs(conn)
-            counts["cancelled"] = _cancel_some(conn, rng, booked)
-            counts["callbacks"] = _callbacks(conn, keyring, hash_key, people)
+        counts["jobs"] += _run_calendar_jobs(conn)
+        counts["cancelled"] = _cancel_some(conn, rng, today)
+        counts["callbacks"] = _callbacks(conn, keyring, hash_key, people)
         counts["jobs"] += _run_calendar_jobs(conn)
     return counts

@@ -1128,6 +1128,80 @@ def test_seeded_clinic_serves_the_public_api(empty, monkeypatch):
     assert {sid for d in doctors for sid in d["service_ids"]} == {s["id"] for s in services}
 
 
+# --- Seed robustness (P2 review fix A5) --------------------------------------------------
+
+
+class _Interrupted(Exception):
+    pass
+
+
+@pytest.mark.parametrize("stage", ["_future", "_cancel_some", "_callbacks"])
+def test_interrupted_seed_is_completed_by_the_next_run(empty, monkeypatch, stage):
+    original = getattr(seed_platform, stage)
+
+    def interrupted(*args, **kwargs):
+        raise _Interrupted()
+
+    monkeypatch.setattr(seed_platform, stage, interrupted)
+    with pytest.raises(_Interrupted):
+        seed_platform.seed(empty, get_settings())
+    monkeypatch.setattr(seed_platform, stage, original)
+    seed_platform.seed(empty, get_settings())
+    again = seed_platform.seed(empty, get_settings())
+    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "jobs": 0}
+    with connect(empty) as conn:
+        kinds = conn.execute(
+            """SELECT count(*) FILTER (WHERE request_hash='seed') AS past,
+            count(*) FILTER (WHERE request_hash<>'seed') AS future,
+            count(*) FILTER (WHERE request_hash<>'seed' AND status='cancelled') AS cancelled
+            FROM appointments"""
+        ).fetchone()
+        callbacks = conn.execute("SELECT count(*) AS n FROM callback_requests").fetchone()["n"]
+        jobs = conn.execute("SELECT DISTINCT status FROM outbox").fetchall()
+        phones = conn.execute(
+            "SELECT count(*) AS n, count(DISTINCT phone_hash) AS d FROM ("
+            " SELECT phone_hash FROM patients UNION ALL SELECT phone_hash FROM callback_requests"
+            ") x"
+        ).fetchone()
+    assert kinds["past"] == seed_platform.PAST_TARGET
+    assert seed_platform.FUTURE_TARGET - 6 <= kinds["future"] <= seed_platform.FUTURE_TARGET
+    assert kinds["cancelled"] == seed_platform.FUTURE_CANCELLED
+    assert callbacks == len(seed_platform.CALLBACKS)
+    assert [j["status"] for j in jobs] == ["done"]
+    assert phones["n"] == phones["d"]  # Every synthetic number is used once.
+
+
+def test_seed_calendar_jobs_never_touch_another_clinic(env):
+    other = reserve_direct(env["url"], SLOT)
+    with connect(env["url"]) as conn:
+        assert seed_platform._run_calendar_jobs(conn) == 0
+        job = conn.execute(
+            "SELECT status, attempts FROM outbox WHERE appointment_id=%s",
+            (other["appointment_id"],),
+        ).fetchone()
+    assert (job["status"], job["attempts"]) == ("pending", 0)
+
+
+def test_seed_refusal_check_holds_off_clinic_inserts(empty, monkeypatch):
+    """No clinic can be inserted between the refusal check and the catalogue upsert."""
+    original = seed_platform._upsert_catalogue
+    raced = []
+
+    def upsert_while_racing(conn):
+        with connect(empty) as other:
+            other.execute("SET LOCAL lock_timeout = '200ms'")
+            try:
+                other.execute("INSERT INTO clinics (id,name) VALUES (%s,'Racing')", (uuid4(),))
+            except psycopg.errors.LockNotAvailable:
+                raced.append("blocked")
+        original(conn)
+
+    monkeypatch.setattr(seed_platform, "_upsert_catalogue", upsert_while_racing)
+    with connect(empty) as conn:
+        seed_platform._check_and_upsert(conn)
+    assert raced == ["blocked"]
+
+
 # --- Synthetic contacts (P2 review fix A4) -----------------------------------------------
 
 
