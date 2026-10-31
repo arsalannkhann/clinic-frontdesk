@@ -1128,6 +1128,38 @@ def test_seeded_clinic_serves_the_public_api(empty, monkeypatch):
     assert {sid for d in doctors for sid in d["service_ids"]} == {s["id"] for s in services}
 
 
+# --- Retention (P2 review fix A2) --------------------------------------------------------
+
+
+def test_retention_purge_erases_booking_notes(env):
+    from clinic_voice import retention
+
+    client = env["client"]
+    kept = client.post(f"{BASE}/bookings", json=booking(notes=NOTES)).json()
+    purged = client.post(
+        f"{BASE}/bookings",
+        json=booking(SLOT + timedelta(hours=1), phone="+919000000102", notes=NOTES),
+    ).json()
+    url = env["url"]
+    with connect(url) as conn:
+        for reference in (kept["reference"], purged["reference"]):
+            row = appointment_by_reference(url, reference)
+            assert row["notes_ciphertext"] is not None
+        target = appointment_by_reference(url, purged["reference"])
+        # The purged patient's booking has ended and the record is past retention.
+        conn.execute("UPDATE appointments SET status='cancelled' WHERE id=%s", (target["id"],))
+        conn.execute(
+            "UPDATE patients SET retention_until=now() - interval '1 day' WHERE id=%s",
+            (target["patient_id"],),
+        )
+        conn.commit()
+        result = retention.purge(conn, 90)
+    assert result["patients"] == 1
+    gone = appointment_by_reference(url, purged["reference"])
+    assert (gone["patient_id"], gone["notes_ciphertext"], gone["notes_key_id"]) == (None,) * 3
+    assert appointment_by_reference(url, kept["reference"])["notes_ciphertext"] is not None
+
+
 # --- Trusted edge: proxy secret and client address (P2 review fix A1) -------------------
 
 PROXY_SECRET = "synthetic-proxy-secret-" + "1" * 32

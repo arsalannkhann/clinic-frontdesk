@@ -3,7 +3,8 @@ nothing schedules it.
 
 - Patients whose retention_until has passed, and who hold no active appointment that has not
   ended, are deleted with their consent and opt-out rows. Their appointments (and planned
-  contacts) stay, as they carry no patient data, with patient_id cleared.
+  contacts) stay with patient_id cleared and their booking notes (encrypted, possibly
+  health details, migration 018) erased, so they no longer carry patient data.
 - Callback requests (migration 018) linked to a purged patient are unlinked. Callback
   requests created more than `session_days` ago are deleted (they hold an encrypted name,
   phone and reason, like a call session's caller number).
@@ -45,8 +46,8 @@ def purge(conn, session_days: int, dry_run: bool = False) -> dict[str, int]:
         "patients": len(patients),
         "patient_appointments_unlinked": _count(
             conn,
-            "UPDATE appointments SET patient_id=NULL, updated_at=now() WHERE "
-            + PAIRS.format(column="patient_id"),
+            "UPDATE appointments SET patient_id=NULL, notes_ciphertext=NULL, notes_key_id=NULL,"
+            " updated_at=now() WHERE " + PAIRS.format(column="patient_id"),
             patient_pairs,
         ),
         "consents": _count(
