@@ -29,6 +29,7 @@ Logs and audit rows carry ids and codes only.
 import hashlib
 import ipaddress
 import logging
+from contextlib import nullcontext
 from datetime import UTC, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -448,13 +449,14 @@ def booking_limits(conn, settings, hash_key, clinic_id, phone, address) -> None:
     )
 
 
-def lookup(url, settings, clinic, request, address) -> dict:
+def lookup(url, settings, clinic, request, address, conn=None) -> dict:
     """One booking by reference + phone. Every mismatch (malformed or unknown reference,
     another clinic's reference, a phone that is not the booking patient's, a booking whose
     patient record was purged) is the same 404 not_found, so the response never reveals
-    whether a reference exists."""
+    whether a reference exists. `conn` (the chat turn's connection) is used instead of a
+    new one; the caller commits it."""
     _, hash_key = crypto(settings)
-    with connect(url) as conn:
+    with nullcontext(conn) if conn is not None else connect(url) as conn:
         limit(
             conn,
             hash_key,

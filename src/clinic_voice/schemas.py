@@ -1076,6 +1076,9 @@ class StaffCalendarOut(StrictModel):
     doctors: list[StaffCalendarDoctor]
     appointments: list[StaffCalendarAppointment]
     exceptions: list[StaffCalendarException]
+    # True when the range held more than 2000 appointments; only the earliest 2000 are
+    # listed (narrow the range or filter by doctor client-side).
+    truncated: bool = False
 
 
 class StaffBookingRequest(StrictModel):

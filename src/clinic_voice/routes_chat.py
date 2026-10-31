@@ -56,10 +56,11 @@ def create_session(slug: str, request: Request, response: Response):
 
 
 @router.get("/sessions/{session_id}", response_model=ChatTurnOut)
-def get_session(session_id: str, response: Response):
-    """The visible transcript (user and assistant text), the open proposal, quick replies."""
+def get_session(session_id: str, request: Request, response: Response):
+    """The newest 100 visible messages (user and assistant text), the open proposal, quick
+    replies."""
     response.headers["Cache-Control"] = "no-store"
-    return chat.history(_url(), get_settings(), session_id)
+    return chat.history(_url(), get_settings(), session_id, client_ip(request))
 
 
 @router.post("/sessions/{session_id}/messages", response_model=ChatTurnOut)

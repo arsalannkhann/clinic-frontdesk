@@ -747,6 +747,96 @@ def test_session_ids_are_random_128_bit(env):
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
 
 
+# --- Review fixes: bounded transcript reads and one connection per turn ---------------------
+
+
+def test_transcript_reloads_are_rate_limited_per_ip(env, monkeypatch):
+    monkeypatch.setenv("CHAT_HISTORY_IP_PER_HOUR", "2")
+    get_settings.cache_clear()
+    session = start(env)
+    client = env["client"]
+    assert client.get(f"/v1/chat/sessions/{session}").status_code == 200
+    # Guessed ids count too: the limit is checked before the session lookup.
+    assert_envelope(client.get("/v1/chat/sessions/" + "0" * 32), 404, "not_found")
+    assert_envelope(client.get(f"/v1/chat/sessions/{session}"), 429, "rate_limited")
+    # Messages have their own bucket.
+    assert say(env, session, "hello").status_code == 200
+
+
+def test_transcript_reload_returns_the_newest_visible_messages(env, monkeypatch):
+    monkeypatch.setattr(chat, "HISTORY_VISIBLE", 3)
+    session = start(env)
+    for n in range(3):
+        env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply(f"answer {n}")]
+        say(env, session, f"question {n}")
+    body = env["client"].get(f"/v1/chat/sessions/{session}").json()
+    assert body["messages"] == [
+        {"role": "assistant", "text": "answer 1"},
+        {"role": "user", "text": "question 2"},
+        {"role": "assistant", "text": "answer 2"},
+    ]
+    monkeypatch.setattr(chat, "HISTORY_VISIBLE", 100)
+    body = env["client"].get(f"/v1/chat/sessions/{session}").json()
+    assert len(body["messages"]) == 7 and body["messages"][0]["text"].startswith("Hello!")
+
+
+def test_a_turn_reuses_one_connection_and_is_idle_during_model_calls(env, monkeypatch):
+    from clinic_voice import public
+
+    session = start(env)
+    slots, propose, final = propose_script()
+    env["fake"].script = [
+        LLMReply(
+            None,
+            [
+                call("clinic_info"),
+                call("list_services"),
+                call("booking_status", reference="ZZZZZZZZ", phone=PHONE),
+            ],
+        ),
+        LLMReply(None, [call("request_callback", name=NAME, phone=PHONE), *slots.tool_calls]),
+        propose,
+        final,
+    ]
+    opened = {"chat": 0, "public": 0}
+    real_chat, real_public = chat.connect, public.connect
+
+    def counting(module):
+        real = real_chat if module == "chat" else real_public
+
+        def connect(url):
+            opened[module] += 1
+            return real(url)
+
+        return connect
+
+    monkeypatch.setattr(chat, "connect", counting("chat"))
+    monkeypatch.setattr(public, "connect", counting("public"))
+    states = []
+    fake_complete = env["fake"].complete
+
+    def watching(messages, tools):
+        with real_chat(env["url"]) as conn:
+            states.extend(
+                r["state"]
+                for r in conn.execute(
+                    "SELECT state FROM pg_stat_activity WHERE datname=current_database()"
+                    " AND pid <> pg_backend_pid() AND state LIKE 'idle in transaction%%'"
+                )
+            )
+        return fake_complete(messages, tools)
+
+    monkeypatch.setattr(env["fake"], "complete", watching)
+    body = say(env, session, "several things please").json()
+    assert body["proposal"] is not None
+    # One connection for the whole turn (session check, every tool, stores, release).
+    assert opened == {"chat": 1, "public": 0}
+    # It never sat inside a transaction while the model was called.
+    assert states == []
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM callback_requests").fetchone()["n"] == 1
+
+
 # --- Review fixes: one turn per session at a time (busy lease, migration 020) ---------------
 
 
@@ -817,9 +907,13 @@ def test_a_turn_whose_lease_was_taken_over_does_not_clear_the_new_mark(env):
     later = env["clock"]["now"] + timedelta(minutes=5)
     with connect(env["url"]) as conn:
         conn.execute("UPDATE chat_sessions SET busy_until=%s", (later,))
-    chat._release(env["url"], row, env["clock"]["now"] + timedelta(seconds=60))
+    turn = chat.Turn(
+        env["url"], get_settings(), {"timezone": "Asia/Kolkata"}, row, None, None, None
+    )
+    chat._release(turn, env["clock"]["now"] + timedelta(seconds=60))
     assert session_row(env["url"])["busy_until"] == later
-    chat._release(env["url"], row, later)
+    chat._release(turn, later)
+    turn.close()
     assert session_row(env["url"])["busy_until"] is None
     assert say(env, session, "ok").status_code == 200
 

@@ -40,7 +40,7 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 
 from clinic_voice import reminders, service
-from clinic_voice.audit import audit
+from clinic_voice.audit import audit, audit_many
 from clinic_voice.crypto import CryptoError, Keyring
 from clinic_voice.db import connect
 from clinic_voice.errors import PublicError
@@ -115,8 +115,7 @@ def list_callbacks(conn, staff, keyring, status, limit) -> list[dict]:
     ).fetchall()
     result = [_out(row, keyring if with_details else None) for row in rows]
     if with_details:
-        for row in rows:
-            audit(conn, clinic_id, staff["id"], "callback.details_viewed", row["id"])
+        audit_many(conn, clinic_id, staff["id"], "callback.details_viewed", [r["id"] for r in rows])
     return result
 
 

@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from fastapi import HTTPException
 
 from clinic_voice import chat, public, service
-from clinic_voice.audit import audit
+from clinic_voice.audit import audit_many
 from clinic_voice.db import connect
 from clinic_voice.patients import decrypt_field
 
@@ -24,6 +24,8 @@ log = logging.getLogger("clinic_voice.staff_platform")
 
 NOT_FOUND = "Not found"
 MAX_CALENDAR_DAYS = 31
+# Appointments returned by one calendar read; more sets truncated (the earliest are kept).
+MAX_CALENDAR_APPOINTMENTS = 2000
 STAFF_KEY_PREFIX = "staff:"
 SYNC_STATE = {"done": "synced", "pending": "pending", "processing": "pending", "dead": "failed"}
 ACTIVE = ("pending_sync", "confirmed", "needs_review")
@@ -62,8 +64,10 @@ def me(conn, staff) -> dict:
 
 def calendar(conn, staff, keyring, starts, ends, include_cancelled=False) -> dict:
     """Doctors, appointments overlapping [starts, ends) and schedule exceptions overlapping
-    it. At most MAX_CALENDAR_DAYS (422 otherwise). Patient names for owner/admin only, each
-    audited as 'appointment.patient_details_viewed'."""
+    it. At most MAX_CALENDAR_DAYS (422 otherwise) and MAX_CALENDAR_APPOINTMENTS appointments
+    (the earliest; truncated is true when more exist). Patient names for owner/admin only,
+    each audited as 'appointment.patient_details_viewed' (one row per appointment, written
+    in one INSERT)."""
     if ends <= starts:
         raise HTTPException(422, "to must be after from")
     if ends - starts > timedelta(days=MAX_CALENDAR_DAYS):
@@ -88,14 +92,23 @@ def calendar(conn, staff, keyring, starts, ends, include_cancelled=False) -> dic
             ORDER BY o.created_at DESC, o.appointment_version DESC LIMIT 1) j ON true
         WHERE a.clinic_id=%(clinic)s AND a.starts_at < %(ends)s AND a.ends_at > %(starts)s
         AND (%(cancelled)s OR a.status <> 'cancelled')
-        ORDER BY a.starts_at, a.id""",
-        {"clinic": clinic_id, "starts": starts, "ends": ends, "cancelled": include_cancelled},
+        ORDER BY a.starts_at, a.id LIMIT %(limit)s""",
+        {
+            "clinic": clinic_id,
+            "starts": starts,
+            "ends": ends,
+            "cancelled": include_cancelled,
+            "limit": MAX_CALENDAR_APPOINTMENTS + 1,
+        },
     ).fetchall()
+    truncated = len(rows) > MAX_CALENDAR_APPOINTMENTS
+    rows = rows[:MAX_CALENDAR_APPOINTMENTS]
     appointments = []
+    viewed = []
     for row in rows:
         name = _patient_name(keyring, row)
         if keyring is not None and row["patient_id"] is not None:
-            audit(conn, clinic_id, staff["id"], "appointment.patient_details_viewed", row["id"])
+            viewed.append(row["id"])
         appointments.append(
             {
                 **{
@@ -122,11 +135,13 @@ def calendar(conn, staff, keyring, starts, ends, include_cancelled=False) -> dic
         WHERE clinic_id=%s AND starts_at < %s AND ends_at > %s ORDER BY starts_at, id""",
         (clinic_id, ends, starts),
     ).fetchall()
+    audit_many(conn, clinic_id, staff["id"], "appointment.patient_details_viewed", viewed)
     return {
         "timezone": clinic["timezone"],
         "doctors": doctors,
         "appointments": appointments,
         "exceptions": exceptions,
+        "truncated": truncated,
     }
 
 
@@ -222,13 +237,13 @@ def conversations(conn, staff, keyring, channel=None, limit=50) -> list[dict]:
         rows = conn.execute(
             CHAT_SQL + " ORDER BY s.created_at DESC, s.id LIMIT %(limit)s", params
         ).fetchall()
+        viewed = []
         for row in rows:
             out = _chat_out(row, keyring)
             if out["patient_name"] is not None:
-                audit(
-                    conn, clinic_id, staff["id"], "conversation.patient_details_viewed", row["id"]
-                )
+                viewed.append(row["id"])
             result.append(out)
+        audit_many(conn, clinic_id, staff["id"], "conversation.patient_details_viewed", viewed)
     if channel in (None, "voice"):
         rows = conn.execute(
             VOICE_SQL + " ORDER BY cs.started_at DESC, cs.id LIMIT %(limit)s", params

@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from fastapi.testclient import TestClient
 
-from clinic_voice import chat, routes_staff, service, staff, tick
+from clinic_voice import chat, routes_staff, service, staff, staff_platform, tick
 from clinic_voice.api import app
 from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
@@ -274,6 +274,57 @@ def test_calendar_shows_appointments_sync_state_and_exceptions(env):
     (seen,) = calendar(env, viewer).json()["appointments"]
     assert seen["patient_name"] is None and seen["reference"] == reference
     assert actions(env["url"]).count("appointment.patient_details_viewed") == 1
+
+
+def test_calendar_is_capped_and_audits_in_one_statement(env, monkeypatch):
+    owner = login(env)
+    for hours in range(4):
+        assert book(env, owner, starts_at=SLOT + timedelta(hours=hours)).status_code == 201
+    monkeypatch.setattr(staff_platform, "MAX_CALENDAR_APPOINTMENTS", 3)
+    audits = []
+    real_audit_many = staff_platform.audit_many
+
+    def counting(conn, clinic_id, actor_id, action, ids):
+        audits.append(list(ids))
+        return real_audit_many(conn, clinic_id, actor_id, action, ids)
+
+    monkeypatch.setattr(staff_platform, "audit_many", counting)
+    body = calendar(env, owner).json()
+    assert body["truncated"] is True
+    starts = [datetime.fromisoformat(a["starts_at"]) for a in body["appointments"]]
+    assert starts == [SLOT + timedelta(hours=h) for h in range(3)]  # The earliest are kept.
+    assert len(audits) == 1 and len(audits[0]) == 3
+    assert actions(env["url"]).count("appointment.patient_details_viewed") == 3
+    monkeypatch.setattr(staff_platform, "MAX_CALENDAR_APPOINTMENTS", 4)
+    assert calendar(env, owner).json()["truncated"] is False
+
+
+def test_calendar_cap_default_is_2000():
+    from clinic_voice.staff_platform import MAX_CALENDAR_APPOINTMENTS
+
+    assert MAX_CALENDAR_APPOINTMENTS == 2000
+
+
+def test_callback_list_audits_every_shown_row_in_one_insert(env, monkeypatch):
+    from clinic_voice import audit as audit_module
+    from clinic_voice import callbacks
+
+    owner = login(env)
+    for _ in range(3):
+        callback(env["url"])
+    single = []
+    monkeypatch.setattr(callbacks, "audit", lambda *a, **k: single.append(a))
+    batches = []
+    real = audit_module.audit_many
+
+    def counting(conn, clinic_id, actor_id, action, ids):
+        batches.append(list(ids))
+        return real(conn, clinic_id, actor_id, action, ids)
+
+    monkeypatch.setattr(callbacks, "audit_many", counting)
+    assert len(env["client"].get("/v1/staff/callbacks", headers=h(owner)).json()) == 3
+    assert single == [] and [len(b) for b in batches] == [3]
+    assert actions(env["url"]).count("callback.details_viewed") == 3
 
 
 def test_calendar_sync_state_mapping(env):

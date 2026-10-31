@@ -36,6 +36,7 @@ import logging
 import re
 import secrets
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -57,6 +58,8 @@ TOKEN = re.compile(r"^[0-9a-f]{32}$")
 PROPOSAL_TTL = timedelta(minutes=10)
 MAX_TOOL_ROUNDS = 4
 HISTORY_MESSAGES = 40
+# Visible messages a reloaded page gets back (GET /v1/chat/sessions/{id}).
+HISTORY_VISIBLE = 100
 MAX_SLOTS = 8
 # One turn per session at a time (send): the busy lease, at least this long, and the margin
 # kept free at its end.
@@ -203,6 +206,10 @@ def transcript(conn, keyring, clinic_id, session_id) -> list[dict]:
         " FROM chat_messages WHERE clinic_id=%s AND session_id=%s ORDER BY seq",
         (clinic_id, session_id),
     ).fetchall()
+    return _decrypted(keyring, clinic_id, session_id, rows)
+
+
+def _decrypted(keyring, clinic_id, session_id, rows) -> list[dict]:
     result = []
     for row in rows:
         try:
@@ -309,17 +316,47 @@ def proposal_out(row, zone) -> dict:
     }
 
 
-def history(url, settings, token) -> dict:
-    """GET /v1/chat/sessions/{id}: the visible transcript, the open proposal if any, and
-    quick replies, so a reloaded page can restore the conversation."""
-    keyring, _ = public.crypto(settings)
+def recent_visible(conn, keyring, clinic_id, session_id, limit=None) -> list[dict]:
+    """The newest `limit` (HISTORY_VISIBLE) patient-visible messages (visible()), oldest
+    first. Reads only user and assistant rows, newest first and bounded: a turn holds at most
+    MAX_TOOL_ROUNDS + 2 of them (the user message, its tool-call rows and the reply), so the
+    newest `limit` visible messages lie within the newest limit * (MAX_TOOL_ROUNDS + 2)."""
+    limit = HISTORY_VISIBLE if limit is None else limit
+    rows = conn.execute(
+        """SELECT seq, role, tool_name, created_at, content_ciphertext, content_key_id
+        FROM chat_messages WHERE clinic_id=%s AND session_id=%s AND role IN ('user','assistant')
+        ORDER BY seq DESC LIMIT %s""",
+        (clinic_id, session_id, limit * (MAX_TOOL_ROUNDS + 2)),
+    ).fetchall()
+    found = []
+    for row in rows:
+        found.extend(visible(_decrypted(keyring, clinic_id, session_id, [row])))
+        if len(found) >= limit:
+            break
+    return list(reversed(found[:limit]))
+
+
+def history(url, settings, token, address=None) -> dict:
+    """GET /v1/chat/sessions/{id}: the newest HISTORY_VISIBLE visible messages, the open
+    proposal if any, and quick replies, so a reloaded page can restore the conversation.
+    Limited per client address (CHAT_HISTORY_IP_PER_HOUR), counted before the session is
+    looked up, so guessing ids costs the same as reading one."""
+    keyring, hash_key = public.crypto(settings)
     with connect(url) as conn:
+        public.limit(
+            conn,
+            hash_key,
+            "chat-history-ip",
+            settings.chat_history_ip_per_hour,
+            public.HOUR,
+            public.client_value(address),
+        )
         session = find_session(conn, token)
         clinic = _clinic(conn, session["clinic_id"])
-        messages = transcript(conn, keyring, session["clinic_id"], session["id"])
+        messages = recent_visible(conn, keyring, session["clinic_id"], session["id"])
         proposal = current_proposal(conn, session["clinic_id"], session["id"])
     zone = ZoneInfo(clinic["timezone"])
-    result = {"messages": visible(messages), "quick_replies": QUICK_REPLIES}
+    result = {"messages": messages, "quick_replies": QUICK_REPLIES}
     if proposal is not None:
         result["proposal"] = proposal_out(proposal, zone)
         result["quick_replies"] = PROPOSAL_QUICK_REPLIES
@@ -471,9 +508,11 @@ class CallbackArgs(BaseModel):
 
 
 class Turn:
-    """Per-turn state shared by the tools: the clinic, address, and any new proposal."""
+    """Per-turn state shared by the tools: the clinic, address, any new proposal, and the
+    turn's one database connection (db())."""
 
-    def __init__(self, url, settings, clinic, session, address, keyring, hash_key):
+    def __init__(self, url, settings, clinic, session, address, keyring, hash_key, conn=None):
+        self._conn = conn
         self.url = url
         self.settings = settings
         self.clinic = clinic
@@ -485,6 +524,40 @@ class Turn:
         self.proposal = None
         # time.monotonic() after which no further model call starts (send sets it).
         self.deadline = float("inf")
+
+    @contextmanager
+    def db(self):
+        """The turn's single connection, reused by every tool call and store of the turn
+        (opened on first use, or the one send() checked the session on). Each block is its
+        own transaction, committed when it ends and rolled back on an error, so the
+        connection is never inside a transaction while the model is called: through a
+        transaction pooler it then holds no server connection, and no lock outlives its
+        block. A broken connection is dropped and the next block reconnects."""
+        if self._conn is None or self._conn.closed:
+            self._conn = connect(self.url)
+        conn = self._conn
+        try:
+            yield conn
+        except BaseException:
+            try:
+                conn.rollback()
+            except Exception:
+                self.close()
+            raise
+        else:
+            conn.commit()
+
+    def store(self, role, document, tool_name=None) -> None:
+        with self.db() as conn:
+            append(conn, self.keyring, self.session, role, document, tool_name)
+
+    def close(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                log.warning("chat turn connection close failed session=%s", self.session["id"])
 
 
 def _tool_clinic_info(turn, _args):
@@ -501,7 +574,7 @@ def _tool_clinic_info(turn, _args):
 
 
 def _tool_list_services(turn, _args):
-    with connect(turn.url) as conn:
+    with turn.db() as conn:
         services = public.list_services(conn, turn.clinic["id"])
         doctors = public.list_doctors(conn, turn.clinic["id"])
     return {
@@ -523,7 +596,7 @@ def _tool_list_services(turn, _args):
 
 
 def _slots(turn, service_id, day, doctor_id):
-    with connect(turn.url) as conn:
+    with turn.db() as conn:
         public.read_limit(
             conn, turn.settings, "slots-ip", turn.settings.public_slots_ip_per_hour, turn.address
         )
@@ -565,7 +638,7 @@ def _tool_propose_booking(turn, args):
     wanted = starts_at.timestamp()
     if not any(s["starts_at"].timestamp() == wanted for s in slots):
         return {"error": "slot_not_offered"}
-    with connect(turn.url) as conn:
+    with turn.db() as conn:
         offer = public.offerings(conn, turn.clinic["id"], parsed.service_id, parsed.doctor_id)
         if not offer:
             return {"error": "not_found"}
@@ -606,7 +679,10 @@ def _tool_propose_booking(turn, args):
 def _tool_booking_status(turn, args):
     parsed = StatusArgs.model_validate(args)
     try:
-        found = public.lookup(turn.url, turn.settings, turn.clinic, parsed, turn.address)
+        with turn.db() as conn:
+            found = public.lookup(
+                turn.url, turn.settings, turn.clinic, parsed, turn.address, conn=conn
+            )
     except PublicError as error:
         return {"found": False} if error.code == "not_found" else {"error": error.code}
     return {
@@ -624,7 +700,7 @@ def _tool_request_callback(turn, args):
     parsed = CallbackArgs.model_validate(args)
     reason = (parsed.reason or "").strip()[:500] or None
     try:
-        with connect(turn.url) as conn:
+        with turn.db() as conn:
             public.limit(
                 conn,
                 turn.hash_key,
@@ -791,15 +867,11 @@ def fallback_text(clinic) -> str:
     return "Sorry, I cannot answer right now. You can book online, request a callback" + call + "."
 
 
-def _store(url, keyring, session, role, document, tool_name=None):
-    with connect(url) as conn:
-        append(conn, keyring, session, role, document, tool_name)
-
-
 def send(url, settings, token, text, address, llm: ChatLLMPort | None) -> dict:
     """One patient turn: {messages, proposal?, quick_replies}."""
     keyring, hash_key = public.crypto(settings)
-    with connect(url) as conn:
+    conn = connect(url)
+    try:
         find_session(conn, token)
         public.limit(
             conn,
@@ -834,9 +906,13 @@ def send(url, settings, token, text, address, llm: ChatLLMPort | None) -> dict:
         conn.commit()
         clinic = _clinic(conn, session["clinic_id"])
         conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    # From here the turn reuses this connection (Turn.db), idle between its blocks.
+    turn = Turn(url, settings, clinic, session, address, keyring, hash_key, conn=conn)
     try:
         zone = ZoneInfo(clinic["timezone"])
-        turn = Turn(url, settings, clinic, session, address, keyring, hash_key)
         turn.deadline = time.monotonic() + lease.total_seconds() - TURN_LEASE_MARGIN_SECONDS
         if EMERGENCY.search(text):
             reply, quick = emergency_script(clinic), EMERGENCY_QUICK_REPLIES
@@ -846,9 +922,10 @@ def send(url, settings, token, text, address, llm: ChatLLMPort | None) -> dict:
             log.warning("chat model unconfigured session=%s", session["id"])
         else:
             reply, quick = _converse(turn, llm)
-        _store(url, keyring, session, "assistant", {"text": reply})
+        turn.store("assistant", {"text": reply})
     finally:
-        _release(url, session, busy_until)
+        _release(turn, busy_until)
+        turn.close()
     result = {"messages": [{"role": "assistant", "text": reply}], "quick_replies": quick}
     if turn.proposal is not None:
         result["proposal"] = proposal_out(turn.proposal, zone)
@@ -864,12 +941,13 @@ def turn_lease(settings) -> timedelta:
     return timedelta(seconds=max(TURN_LEASE_SECONDS, settings.chat_llm_timeout_seconds + 20))
 
 
-def _release(url, session, busy_until) -> None:
+def _release(turn, busy_until) -> None:
     """Clear the session's busy mark if it is still this turn's (compare-and-set on the
     lease value; a turn whose lease expired and was taken over clears nothing). Best
     effort: a failure here leaves the session busy until the lease ends."""
+    session = turn.session
     try:
-        with connect(url) as conn:
+        with turn.db() as conn:
             conn.execute(
                 "UPDATE chat_sessions SET busy_until=NULL WHERE clinic_id=%s AND id=%s"
                 " AND busy_until=%s",
@@ -884,8 +962,8 @@ def _release(url, session, busy_until) -> None:
 def _converse(turn, llm) -> tuple[str, list[str]]:
     """Run the model with tools for at most MAX_TOOL_ROUNDS rounds. Returns the reply text
     and quick replies; any model failure is the fallback reply."""
-    url, keyring, session = turn.url, turn.keyring, turn.session
-    with connect(url) as conn:
+    keyring, session = turn.keyring, turn.session
+    with turn.db() as conn:
         prompt = system_prompt(conn, turn.clinic)
         messages = _model_messages(transcript(conn, keyring, session["clinic_id"], session["id"]))
     messages = [{"role": "system", "content": prompt}, *messages]
@@ -915,7 +993,7 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
                 return fallback_text(turn.clinic), FALLBACK_QUICK_REPLIES
             rounds += 1
             stored = [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in calls]
-            _store(url, keyring, session, "assistant", {"text": reply.text, "tool_calls": stored})
+            turn.store("assistant", {"text": reply.text, "tool_calls": stored})
             pending = [c.id for c in calls]
             messages.append(
                 {
@@ -937,14 +1015,7 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
             for call in calls:
                 result = run_tool(turn, call.name, call.arguments)
                 name = call.name if call.name in TOOL_NAMES else None
-                _store(
-                    url,
-                    keyring,
-                    session,
-                    "tool",
-                    {"tool_call_id": call.id, "result": result},
-                    tool_name=name,
-                )
+                turn.store("tool", {"tool_call_id": call.id, "result": result}, tool_name=name)
                 pending.remove(call.id)
                 log.info(
                     "chat tool session=%s tool=%s outcome=%s",
@@ -975,7 +1046,7 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
 def _model_call_allowed(turn) -> bool:
     """Count one model call against the clinic's daily cap (CHAT_LLM_CALLS_PER_CLINIC_PER_DAY,
     a fixed UTC-day window shared by every session and instance); False when over it."""
-    with connect(turn.url) as conn:
+    with turn.db() as conn:
         return ratelimit.hit(
             conn,
             turn.hash_key,
@@ -992,13 +1063,7 @@ def _answer_pending(turn, pending) -> None:
     such calls when building the model's history)."""
     for call_id in list(pending):
         try:
-            _store(
-                turn.url,
-                turn.keyring,
-                turn.session,
-                "tool",
-                {"tool_call_id": call_id, "result": dict(TOOL_FAILED)},
-            )
+            turn.store("tool", {"tool_call_id": call_id, "result": dict(TOOL_FAILED)})
         except Exception as error:
             log.error(
                 "chat placeholder tool result failed session=%s error=%s",
