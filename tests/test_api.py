@@ -1,10 +1,12 @@
+import subprocess
+import sys
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from clinic_voice.api import app, tool_caller
-from clinic_voice.config import Settings, get_settings
+from clinic_voice.config import ENV_FILE, Settings, get_settings
 from clinic_voice.credentials import parse
 from clinic_voice.deps import ToolCaller
 
@@ -108,8 +110,13 @@ def test_tests_never_read_dotenv(tmp_path, monkeypatch):
         assert settings.database_url.get_secret_value() == "postgresql://from-env/x"
     finally:
         get_settings.cache_clear()
-    from conftest import PRODUCTION_ENV_FILE
-
-    assert PRODUCTION_ENV_FILE == ".env"
-    explicit = Settings(_env_file=PRODUCTION_ENV_FILE)
+    # The declared production default, not conftest's override: config.ENV_FILE, and a fresh
+    # interpreter (no conftest) shows Settings is configured with it.
+    assert ENV_FILE == ".env"
+    code = (
+        "from clinic_voice.config import ENV_FILE, Settings\n"
+        "assert Settings.model_config['env_file'] == ENV_FILE == '.env'\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=tmp_path)
+    explicit = Settings(_env_file=ENV_FILE)
     assert explicit.bolna_api_key.get_secret_value() == "synthetic-dotenv-key"

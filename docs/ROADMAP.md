@@ -19,7 +19,7 @@ All twelve build tasks (docs/plans/2026-10-29-full-build.md) are implemented on 
 | T11 staff dashboard | Done; not deployed |
 | T12 final review and documentation | Done (credential scopes, line-gated tool API, message reference off by default) |
 | Provisioning sets the agent `webhook_url` | Done with fakes (migration 017; managed webhook credential); not live-validated |
-| Gateway refuses unsubstituted call context | Done (422 `context_unsubstituted`, field names only, warning log line; no metric). Answers the substitution question on the first test call; not live-validated |
+| Gateway refuses unsubstituted call context | Done (422 `context_unsubstituted`, or `context_missing` for an empty execution id; field names only, warning log line; empty/malformed caller number or agent id logged without refusing; no metric). Answers the substitution question on the first test call; not live-validated |
 
 Pilot blockers (all need the owner; see "Owner actions required before any live use" in docs/CLAUDE_HANDOFF.md): live contract validation of Bolna and Google with owner-authorized test accounts; the outbound reminder agent design and review; clinic-approved emergency, handoff, reschedule and "not yet confirmed" wording; a messaging provider meeting the idempotency criteria plus consent and DLT/TRAI compliance; secret management and key rotation plan; retention periods and a purge schedule; a cross-call verification rate limit per phone hash and clinic; a staff login rate limit and MFA; human transfer; native-speaker evaluation; hosting, TLS and a restore drill.
 

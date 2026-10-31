@@ -18,7 +18,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from clinic_voice import cli, credentials, service
+from clinic_voice import cli, credentials, service, staff
 from clinic_voice.api import app
 from clinic_voice.bolna import agent_config, gateway
 from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
@@ -52,6 +52,7 @@ OTHER_DOCTOR = UUID("00000000-0000-4000-8000-0000000000b2")
 OTHER_SERVICE = UUID("00000000-0000-4000-8000-0000000000b3")
 SYNTHETIC_TOKEN = "cvt_" + "0" * 32 + "." + "A" * 43
 MARKER = "SYNTHETIC-BODY-MARKER"
+STAFF_PASSWORD = "synthetic-staff-password-0001"
 
 
 @pytest.fixture
@@ -1154,10 +1155,50 @@ FIELD_ARG = {"execution_id": "execution", "from_number": "number", "agent_id": "
 
 
 def test_placeholder_detector_is_narrow():
-    for value in ("{x}", "{{from_number}}", "%(agent_id)s", "%()s", " Call_SID ", "to_number"):
-        assert unsubstituted(value)
-    for value in (EXECUTION, AGENT, CALLER, "+919876543210", "", "  ", "anonymous", "50%", None, 7):
-        assert not unsubstituted(value)
+    for value in (
+        "{x}",
+        "{{from_number}}",
+        "%(agent_id)s",
+        "%()s",
+        "%(from_number)d",
+        "%(execution id)r",
+        "+91%(from_number)s",
+        " Call_SID ",
+        "to_number",
+        "<from_number>",
+        "< AGENT_ID >",
+        "<execution_id>",
+        "<call_sid>",
+        "<to_number>",
+        "+91<from_number>",
+    ):
+        assert unsubstituted(value), value
+    for value in (
+        EXECUTION,
+        AGENT,
+        CALLER,
+        "+919876543210",
+        str(uuid4()).upper(),
+        "",
+        "  ",
+        "anonymous",
+        "withheld",
+        "Anonymous",
+        "None",
+        "null",
+        "unknown",
+        "50%",
+        "100% (approx)",
+        "%(from_number)",
+        "%(x)S",
+        "<unknown>",
+        "<>",
+        "a < b > c",
+        "<from_numbers>",
+        None,
+        7,
+    ):
+        assert not unsubstituted(value), value
 
 
 def test_every_call_context_route_is_covered():
@@ -1195,6 +1236,9 @@ def test_unsubstituted_context_refused_on_every_route(env, path, field):
         "agent_id",
         "+91{from_number}",
         "}",
+        "%(from_number)d",
+        "<from_number>",
+        "<From_Number>",
     ],
 )
 def test_placeholder_shapes(env, value):
@@ -1267,3 +1311,139 @@ def test_other_validation_errors_keep_generic_shape(env):
     )
     assert r.status_code == 422
     assert isinstance(r.json()["detail"], list) and "code" not in r.json()
+
+
+def test_non_bolna_validation_errors_keep_generic_shape(env):
+    """The call-context 422s are Bolna-only: elsewhere a template value or a bad body gets
+    the generic location/type list, without code or fields."""
+    for path, body, headers in (
+        ("/v1/staff/login", {"email": "{from_number}", "password": "%(agent_id)s"}, {}),
+        (
+            "/v1/tools/check-slots",
+            {"execution_id": "", "doctor_id": "{agent_id}", "service_id": "x", "day": "y"},
+            auth(env["token"]),
+        ),
+    ):
+        r = env["client"].post(path, json=body, headers=headers)
+        assert r.status_code == 422, path
+        payload = r.json()
+        assert set(payload) == {"detail"}
+        assert payload["detail"] and all(set(e) == {"loc", "type"} for e in payload["detail"])
+        assert all(
+            e["type"] not in ("context_unsubstituted", "context_missing") for e in payload["detail"]
+        )
+        assert "{from_number}" not in r.text and "%(agent_id)s" not in r.text
+
+
+def test_wrong_scope_credential_with_template_body_gets_401(env):
+    """Authentication precedes the call-context 422: a webhook (cvw_) or staff session (cvs_)
+    token, or a revoked gateway (cvb_) token, gets 401 even with a template body."""
+    with connect(env["url"]) as conn:
+        _, webhook = credentials.issue(conn, CLINIC, "bolna-webhook", scope="webhook")
+        revoked_id, revoked = credentials.issue(conn, CLINIC, "bolna-revoked", scope="bolna")
+        credentials.revoke(conn, revoked_id)
+        staff.create_user(conn, CLINIC, "ctx-owner@example.test", "owner", STAFF_PASSWORD)
+        session = staff.login(conn, "ctx-owner@example.test", STAFF_PASSWORD)["token"]
+    assert webhook.startswith("cvw_") and revoked.startswith("cvb_")
+    assert session.startswith("cvs_")
+    for body in (
+        TOOL_BODIES["/v1/bolna/tools/check-slots"](number="{from_number}"),
+        TOOL_BODIES["/v1/bolna/tools/check-slots"](execution=""),
+    ):
+        for token in (webhook, session, revoked):
+            r = post(env, "/v1/bolna/tools/check-slots", body, token=token)
+            assert r.status_code == 401
+            assert r.json() == {"detail": "Invalid credentials"}
+    assert sessions(env["url"]) == []
+
+
+# A missing execution id: Bolna sent none at all. Same speakable 422, code context_missing.
+
+
+@pytest.mark.parametrize("path", sorted(TOOL_BODIES))
+@pytest.mark.parametrize("execution", ["", "   ", None, "absent"])
+def test_missing_execution_id_refused_on_every_route(env, path, execution):
+    body = TOOL_BODIES[path](execution=execution)
+    if execution == "absent":
+        del body["execution_id"]
+    r = post(env, path, body)
+    assert r.status_code == 422
+    assert r.json() == {
+        "detail": gateway.CONTEXT_UNSUBSTITUTED,
+        "code": "context_missing",
+        "fields": ["execution_id"],
+    }
+    assert r.headers["cache-control"] == "no-store"
+    assert CALLER not in r.text and AGENT not in r.text
+    assert sessions(env["url"]) == []
+
+
+def test_unsubstituted_takes_precedence_over_missing(env):
+    body = TOOL_BODIES["/v1/bolna/tools/check-slots"](execution="", number="{from_number}")
+    r = post(env, "/v1/bolna/tools/check-slots", body)
+    assert r.json()["code"] == "context_unsubstituted" and r.json()["fields"] == ["from_number"]
+
+
+def test_missing_execution_id_logged_without_values(env, caplog):
+    caplog.set_level(logging.DEBUG)
+    body = TOOL_BODIES["/v1/bolna/tools/verify-booking"](execution="")
+    assert post(env, "/v1/bolna/tools/verify-booking", body).status_code == 422
+    (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert line == f"call context missing clinic={CLINIC} tool=verify-booking fields=execution_id"
+    for secret in (CALLER, AGENT, env["token"], "ABC123"):
+        assert secret not in caplog.text
+
+
+def test_non_uuid_execution_id_keeps_generic_422(env):
+    for execution in ("None", "null", "unknown"):
+        r = post(env, "/v1/bolna/context", call(execution=execution))
+        assert r.status_code == 422 and "code" not in r.json()
+        assert r.json()["detail"] == [{"loc": ["body", "execution_id"], "type": "uuid_parsing"}]
+
+
+# Empty or malformed from_number / agent_id: accepted and ignored as before, with one
+# diagnostic line naming the fields by category, never the values.
+
+
+def context_lines(caplog):
+    return [r for r in caplog.records if r.getMessage().startswith("call context incomplete")]
+
+
+@pytest.mark.parametrize("number", ["None", "null", "unknown", "anonymous", "+91 98765"])
+def test_malformed_caller_number_logged_and_ignored(env, caplog, number):
+    caplog.set_level(logging.DEBUG)
+    body = TOOL_BODIES["/v1/bolna/tools/check-slots"](number=number)
+    assert post(env, "/v1/bolna/tools/check-slots", body).status_code == 200
+    (row,) = sessions(env["url"])
+    assert row["caller_number_hash"] is None and row["agent_id"] == AGENT
+    (record,) = context_lines(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == (
+        f"call context incomplete clinic={CLINIC} tool=check-slots empty=- malformed=from_number"
+    )
+    for secret in (number, AGENT, EXECUTION, env["token"], "Demo Doctor"):
+        assert secret not in caplog.text
+
+
+def test_empty_and_malformed_fields_categorised(env, caplog):
+    caplog.set_level(logging.DEBUG)
+    r = post(env, "/v1/bolna/context", call(number="", agent="not-a-uuid"))
+    assert r.status_code == 200
+    (record,) = context_lines(caplog)
+    assert record.levelno == logging.WARNING
+    assert record.getMessage().endswith("tool=context empty=from_number malformed=agent_id")
+    assert "not-a-uuid" not in caplog.text
+    caplog.clear()
+    r = post(env, "/v1/bolna/context", call(number=" ", agent=""))
+    (record,) = context_lines(caplog)
+    assert record.levelno == logging.INFO
+    assert record.getMessage().endswith("tool=context empty=from_number,agent_id malformed=-")
+    (row,) = sessions(env["url"])
+    assert row["caller_number_hash"] is None and row["agent_id"] is None
+
+
+def test_complete_context_logs_nothing(env, caplog):
+    caplog.set_level(logging.DEBUG)
+    assert post(env, "/v1/bolna/context", call()).status_code == 200
+    assert context_lines(caplog) == []
+    assert not [r for r in caplog.records if r.name == "clinic_voice.bolna"]

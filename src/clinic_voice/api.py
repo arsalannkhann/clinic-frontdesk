@@ -12,7 +12,7 @@ from psycopg import Error as DatabaseError
 
 from clinic_voice import staff as staff_service
 from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
-from clinic_voice.bolna.gateway import refuse_unsubstituted, require_line
+from clinic_voice.bolna.gateway import refuse_context, require_line
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tool_caller
 from clinic_voice.errors import NotFound
@@ -23,8 +23,8 @@ from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
 from clinic_voice.routes_webhooks import router as webhooks_router
 from clinic_voice.schemas import (
+    CONTEXT_CODES,
     SLOT_SOURCE,
-    UNSUBSTITUTED_CODE,
     AppointmentStatusRequest,
     AppointmentStatusResponse,
     LoginRequest,
@@ -204,15 +204,17 @@ async def not_found(request, exc):
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
     errors = exc.errors()
-    unfilled = [error for error in errors if error["type"] == UNSUBSTITUTED_CODE]
-    if unfilled:
-        # A Bolna tool body with literal call-context templates (schemas.BolnaCallContext).
-        # Only reachable after authentication (routes_bolna.authenticated), which named the
-        # clinic. The tool is the last path segment (context, check-slots, ...).
-        fields = list(dict.fromkeys(name for e in unfilled for name in e["ctx"]["fields"]))
-        tool = request.url.path.rstrip("/").rsplit("/", 1)[-1]
-        clinic_id = getattr(request.state, "bolna_clinic_id", None)
-        return refuse_unsubstituted(clinic_id, tool, fields)
+    for code in CONTEXT_CODES:  # Unsubstituted first: a template is the likelier root cause.
+        unusable = [error for error in errors if error["type"] == code]
+        if unusable:
+            # A Bolna tool body with literal call-context templates, or without an
+            # execution_id (schemas.BolnaCallContext). Only reachable after authentication
+            # (routes_bolna.authenticated), which named the clinic. The tool is the last
+            # path segment (context, check-slots, ...).
+            fields = list(dict.fromkeys(name for e in unusable for name in e["ctx"]["fields"]))
+            tool = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+            clinic_id = getattr(request.state, "bolna_clinic_id", None)
+            return refuse_context(clinic_id, tool, code, fields)
     # Pydantic errors can echo sensitive submitted values. Return locations/types only.
     return JSONResponse(
         status_code=422,

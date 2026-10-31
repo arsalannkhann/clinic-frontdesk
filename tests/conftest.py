@@ -1,23 +1,25 @@
-import os
-from pathlib import Path
-from uuid import uuid4
-
-import pytest
-from psycopg.conninfo import conninfo_to_dict
-
-from clinic_voice.cli import seed
-from clinic_voice.config import Settings, get_settings
-from clinic_voice.db import connect, migrate
-
 # Tests never read a .env file: a developer's .env holds real secrets (Bolna API key,
 # encryption keys) and would leak into tests that expect a setting to be unset. Settings
-# reads model_config["env_file"] on every instantiation, so clearing it here, at conftest
-# import and before any test module builds settings, covers get_settings() and direct
-# Settings(...) calls alike. Tests configure settings through monkeypatch.setenv only.
-# Production keeps reading .env from the working directory (config.py).
-PRODUCTION_ENV_FILE = Settings.model_config.get("env_file")
+# reads model_config["env_file"] on every instantiation, so clearing it here covers
+# get_settings() and direct Settings(...) calls alike. It runs before any other clinic_voice
+# import (and so before any test module is collected), so not even an import-time Settings
+# could read .env; clinic_voice.config itself builds none at import. Tests configure
+# settings through monkeypatch.setenv only. Production keeps reading .env from the working
+# directory (config.ENV_FILE).
+from clinic_voice.config import Settings, get_settings
+
 Settings.model_config["env_file"] = None
 get_settings.cache_clear()
+
+import os  # noqa: E402
+from pathlib import Path  # noqa: E402
+from uuid import uuid4  # noqa: E402
+
+import pytest  # noqa: E402
+from psycopg.conninfo import conninfo_to_dict  # noqa: E402
+
+from clinic_voice.cli import seed  # noqa: E402
+from clinic_voice.db import connect, migrate  # noqa: E402
 
 
 @pytest.fixture

@@ -28,7 +28,12 @@ from clinic_voice import patients, reminders, service
 from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key, phone_hash
 from clinic_voice.domain import spoken_reference
 from clinic_voice.patients import session_aad
-from clinic_voice.schemas import CONSENT_UNCLEAR, UNSUBSTITUTED_CODE, ReservationRequest
+from clinic_voice.schemas import (
+    CONSENT_UNCLEAR,
+    MISSING_CODE,
+    UNSUBSTITUTED_CODE,
+    ReservationRequest,
+)
 
 log = logging.getLogger("clinic_voice.bolna")
 
@@ -89,22 +94,57 @@ def require_line(conn, clinic_id, changes: bool, lock: bool = False) -> None:
     raise HTTPException(403, NOT_ACCEPTING)
 
 
-def refuse_unsubstituted(clinic_id, tool: str, fields: list[str]) -> JSONResponse:
-    """422 for a tool request whose call-context fields still hold their templates
-    (schemas.unsubstituted): Bolna did not fill execution_id/from_number/agent_id, or the
-    agent's tool parameters do not reference them. Nothing has been written (validation runs
-    before the endpoint, so before the line gate and the call session). Answers and logs
-    field names only, never the values, the credential or the body."""
+CONTEXT_LOG = {
+    UNSUBSTITUTED_CODE: "call context unsubstituted",
+    MISSING_CODE: "call context missing",
+}
+
+
+def refuse_context(clinic_id, tool: str, code: str, fields: list[str]) -> JSONResponse:
+    """422 for a tool request whose call context is unusable: code context_unsubstituted
+    when fields still hold their templates (schemas.unsubstituted: Bolna did not fill
+    execution_id/from_number/agent_id, or the agent's tool parameters do not reference them),
+    code context_missing when execution_id is absent, null or blank. Nothing has been written
+    (validation runs before the endpoint, so before the line gate and the call session).
+    Answers and logs field names only, never the values, the credential or the body."""
     log.warning(
-        "call context unsubstituted clinic=%s tool=%s fields=%s",
+        "%s clinic=%s tool=%s fields=%s",
+        CONTEXT_LOG[code],
         clinic_id,
         tool,
         ",".join(fields),
     )
     return JSONResponse(
         status_code=422,
-        content={"detail": CONTEXT_UNSUBSTITUTED, "code": UNSUBSTITUTED_CODE, "fields": fields},
+        content={"detail": CONTEXT_UNSUBSTITUTED, "code": code, "fields": fields},
         headers={"Cache-Control": "no-store"},
+    )
+
+
+def note_context(clinic_id, tool: str, context) -> None:
+    """Diagnostics for an accepted call context whose from_number or agent_id is unusable:
+    one line naming the fields by category, never the values. empty: blank (a withheld
+    number, or an agent whose tools do not send agent_id). malformed: anything else that is
+    not E.164 (from_number: "None", "null", "unknown", "anonymous") or not a UUID
+    (agent_id). Nothing is refused: such a number or agent id is ignored, as before. Info
+    when only empty fields, warning when any is malformed."""
+    empty, malformed = [], []
+    for name, usable in (
+        ("from_number", caller_number(context.from_number) is not None),
+        ("agent_id", provider_uuid(context.agent_id) is not None),
+    ):
+        if usable:
+            continue
+        (malformed if getattr(context, name).strip() else empty).append(name)
+    if not (empty or malformed):
+        return
+    log.log(
+        logging.WARNING if malformed else logging.INFO,
+        "call context incomplete clinic=%s tool=%s empty=%s malformed=%s",
+        clinic_id,
+        tool,
+        ",".join(empty) or "-",
+        ",".join(malformed) or "-",
     )
 
 
@@ -145,11 +185,14 @@ def _sealed(keyring, hash_key, clinic_id, session_id, number):
     return blob, key_id, phone_hash(hash_key, number)
 
 
-def upsert_session(conn, clinic_id, context, crypto) -> UUID:
+def upsert_session(conn, clinic_id, context, crypto, tool: str | None = None) -> UUID:
     """The call session for (clinic, execution id), created on first use. A later call may
     fill a missing caller number or agent id but never replaces one already stored.
     Commits, so the session is recorded even when the tool itself then fails, and so that
-    service.reserve (its own connection) can reference it."""
+    service.reserve (its own connection) can reference it. With the tool name (every route
+    passes it), an empty or malformed from_number/agent_id is logged (note_context)."""
+    if tool is not None:
+        note_context(clinic_id, tool, context)
     keyring, hash_key = crypto
     execution_id = str(context.execution_id)
     agent_id = provider_uuid(context.agent_id)

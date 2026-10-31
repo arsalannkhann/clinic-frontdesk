@@ -418,32 +418,49 @@ CatalogName = Annotated[
 
 CONTEXT_FIELDS = ("execution_id", "from_number", "agent_id")
 UNSUBSTITUTED_CODE = "context_unsubstituted"
+MISSING_CODE = "context_missing"
+CONTEXT_CODES = (UNSUBSTITUTED_CODE, MISSING_CODE)
 # Names of Bolna call-context variables (docs/SOURCE_REVIEW.md). A value equal to one of them
 # is the variable's name, not its value.
 CONTEXT_VARIABLE_NAMES = frozenset(CONTEXT_FIELDS + ("call_sid", "to_number"))
-_SPECIFIER = re.compile(r"%\(\w*\)s")
+# printf-style "%(name)s" and its siblings ("%(name)d", "%()r"): a lowercase conversion
+# letter after the parenthesised name.
+_SPECIFIER = re.compile(r"%\([^)]*\)[a-z]")
+# "<from_number>" and the other variable names in angle brackets (any case, inner spaces).
+_ANGLE = re.compile(r"<\s*(?:" + "|".join(sorted(CONTEXT_VARIABLE_NAMES)) + r")\s*>", re.IGNORECASE)
 
 
 def unsubstituted(value) -> bool:
     """True when a call-context value is a template rather than data: it contains a brace
-    ("{from_number}", "{{execution_id}}"), a %(name)s specifier, or is a variable name itself
-    (trimmed, any case). Deliberately narrow: an empty or otherwise malformed value is not a
-    placeholder (an empty from_number is a withheld number, as before)."""
+    ("{from_number}", "{{execution_id}}"), a %(name)s-style specifier, a variable name in
+    angle brackets ("<agent_id>"), or is a variable name itself (trimmed, any case).
+    Deliberately narrow: an empty or otherwise malformed value is not a placeholder (an
+    empty from_number is a withheld number, as before; "None" or "unknown" is ignored and
+    logged, gateway.note_context)."""
     if not isinstance(value, str):
         return False
     return (
         "{" in value
         or "}" in value
         or _SPECIFIER.search(value) is not None
+        or _ANGLE.search(value) is not None
         or value.strip().casefold() in CONTEXT_VARIABLE_NAMES
     )
 
 
+def _missing(value) -> bool:
+    """execution_id absent, null or blank: Bolna sent no execution id at all."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
 # Every /v1/bolna/* tool body. A call-context field still holding its template fails
 # validation with type UNSUBSTITUTED_CODE (field names in ctx, never values), which api.py
-# turns into the dedicated 422. It runs before the field validators, so a literal
-# "{execution_id}" is reported as unsubstituted rather than as a malformed UUID. (A comment,
-# not a docstring, so the OpenAPI contract is unchanged.)
+# turns into the dedicated 422. Failing that, an absent, null or blank execution_id fails
+# with type MISSING_CODE, the same speakable 422 (code context_missing). Both run before the
+# field validators, so a literal "{execution_id}" is reported as unsubstituted and an empty
+# one as missing rather than as a malformed UUID. Any other execution_id that is not a UUID
+# keeps the generic validation 422. (A comment, not a docstring, so the OpenAPI contract is
+# unchanged.)
 class BolnaCallContext(StrictModel):
     execution_id: UUID
     # The number that initiated the call. Stored encrypted when it is E.164, else ignored
@@ -462,6 +479,12 @@ class BolnaCallContext(StrictModel):
                     UNSUBSTITUTED_CODE,
                     "call context variables were not substituted",
                     {"fields": fields},
+                )
+            if _missing(data.get("execution_id")):
+                raise PydanticCustomError(
+                    MISSING_CODE,
+                    "call context variables are missing",
+                    {"fields": ["execution_id"]},
                 )
         return data
 

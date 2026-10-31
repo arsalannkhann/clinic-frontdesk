@@ -47,8 +47,13 @@ def _origin(value: str) -> str:
     return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
 
 
+# Production reads this file from the working directory. The test suite clears it
+# (tests/conftest.py) and asserts this declared default (tests/test_api.py).
+ENV_FILE = ".env"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore", hide_input_in_errors=True)
     database_url: SecretStr
     # Only "development" relaxes development-only safety checks (e.g. worker --calendar fake).
     app_env: str = "production"
