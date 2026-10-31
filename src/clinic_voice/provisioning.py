@@ -29,6 +29,7 @@ from psycopg.errors import UniqueViolation
 from psycopg.types.json import Jsonb
 
 from clinic_voice.audit import audit
+from clinic_voice.providers.ledger import LEDGER_PREFIX
 
 AGENT_GENERATION = 1
 STEP_MAX_ATTEMPTS = 6
@@ -142,19 +143,21 @@ def active_secret_hash(conn, clinic_id, credential_id, scopes=("bolna", "tools")
 
 
 def calendar_ready(conn, clinic_id) -> bool:
-    """An active calendar account, and at least one active doctor mapped to a booking
-    calendar through an active account (its own, or the clinic's only active account)."""
+    """At least one active doctor with a usable booking calendar: a ledger calendar (the
+    platform is the calendar of record, no account needed), or a calendar reached through an
+    active account (its own, or the clinic's only active account)."""
     row = conn.execute(
         """SELECT EXISTS (
             SELECT 1 FROM doctors d WHERE d.clinic_id=%(c)s AND d.active
             AND d.booking_calendar_id IS NOT NULL
-            AND CASE WHEN d.calendar_account_id IS NOT NULL THEN EXISTS (
+            AND CASE WHEN starts_with(d.booking_calendar_id, %(ledger)s) THEN true
+                WHEN d.calendar_account_id IS NOT NULL THEN EXISTS (
                     SELECT 1 FROM calendar_accounts a WHERE a.clinic_id=d.clinic_id
                     AND a.id=d.calendar_account_id AND a.status='active')
                 ELSE (SELECT count(*) FROM calendar_accounts a WHERE a.clinic_id=d.clinic_id
                     AND a.status='active') = 1 END
         ) AS ready""",
-        {"c": clinic_id},
+        {"c": clinic_id, "ledger": LEDGER_PREFIX},
     ).fetchone()
     return row["ready"]
 

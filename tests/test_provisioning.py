@@ -1948,6 +1948,25 @@ def test_manual_activation_checks_prerequisites_and_opens_the_line(env, capsys):
         manual(env)
 
 
+def test_manual_activation_accepts_a_ledger_calendar_without_an_account(env):
+    owner = headers(env)
+    approve_scripts(env, owner)
+    execute(
+        env["url"],
+        "UPDATE clinics SET bolna_agent_id='77777777-7777-4777-8777-777777777777' WHERE id=%s",
+        (CLINIC,),
+    )
+    with pytest.raises(SystemExit, match="calendar"):
+        manual(env)
+    execute(
+        env["url"],
+        "UPDATE doctors SET booking_calendar_id='ledger:' || id::text WHERE clinic_id=%s",
+        (CLINIC,),
+    )
+    manual(env)
+    assert state(env, owner)["state"] == "active"
+
+
 def test_hand_configured_clinic_cannot_start_api_provisioning(env):
     owner = headers(env)
     connect_calendar(env)
