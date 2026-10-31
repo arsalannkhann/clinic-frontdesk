@@ -137,6 +137,9 @@ class Settings(BaseSettings):
     chat_max_turns: int = Field(default=40, ge=1, le=500)
     chat_session_ip_per_hour: int = Field(default=10, ge=1, le=10000)
     chat_message_ip_per_hour: int = Field(default=120, ge=1, le=100000)
+    # Model calls (each tool round is one) per clinic per UTC day, all sessions together.
+    # Over it the chat answers with the fallback text and quick replies, never an error.
+    chat_llm_calls_per_clinic_per_day: int = Field(default=3000, ge=1, le=1000000)
 
     @field_validator("worker_tick_secret", "public_proxy_secret")
     @classmethod

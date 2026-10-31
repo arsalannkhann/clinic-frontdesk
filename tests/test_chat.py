@@ -664,6 +664,29 @@ def test_session_ids_are_random_128_bit(env):
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
 
 
+# --- Review fixes: the per-clinic daily model cap --------------------------------------------
+
+
+def test_model_calls_are_capped_per_clinic_per_day(env, monkeypatch):
+    monkeypatch.setenv("CHAT_LLM_CALLS_PER_CLINIC_PER_DAY", "3")
+    get_settings.cache_clear()
+    first, second = start(env), start(env)
+    env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply("We open at 9.")]
+    assert say(env, first, "when do you open?").json()["messages"][0]["text"] == "We open at 9."
+    assert say(env, second, "hello").json()["quick_replies"] == chat.QUICK_REPLIES
+    # Three model calls today; the fourth, from any session, is not made.
+    over = say(env, first, "and on Sunday?")
+    assert over.status_code == 200
+    body = over.json()
+    assert body["messages"][0]["text"].startswith("Sorry, I cannot answer right now.")
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    assert len(env["fake"].calls) == 3
+    # Emergencies never need the model and still get the script.
+    assert say(env, second, "This is an emergency").json()["messages"][0]["text"] == (
+        chat.DEFAULT_EMERGENCY
+    )
+
+
 # --- Review fixes: tool failures never orphan a tool call ------------------------------------
 
 

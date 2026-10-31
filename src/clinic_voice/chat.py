@@ -41,7 +41,7 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ValidationError
 
-from clinic_voice import public, service
+from clinic_voice import public, ratelimit, service
 from clinic_voice.audit import audit
 from clinic_voice.crypto import CryptoError
 from clinic_voice.db import connect
@@ -794,6 +794,13 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
     try:
         while True:
             tools = TOOLS if rounds < MAX_TOOL_ROUNDS else []
+            if not _model_call_allowed(turn):
+                log.warning(
+                    "chat model daily cap reached session=%s clinic=%s",
+                    session["id"],
+                    turn.clinic["id"],
+                )
+                return fallback_text(turn.clinic), FALLBACK_QUICK_REPLIES
             reply: LLMReply = llm.complete(messages, tools)
             calls = [c for c in reply.tool_calls if tools]
             if not calls:
@@ -859,6 +866,20 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
         log.error("chat turn failed session=%s error=%s", session["id"], type(error).__name__)
     _answer_pending(turn, pending)
     return fallback_text(turn.clinic), FALLBACK_QUICK_REPLIES
+
+
+def _model_call_allowed(turn) -> bool:
+    """Count one model call against the clinic's daily cap (CHAT_LLM_CALLS_PER_CLINIC_PER_DAY,
+    a fixed UTC-day window shared by every session and instance); False when over it."""
+    with connect(turn.url) as conn:
+        return ratelimit.hit(
+            conn,
+            turn.hash_key,
+            ratelimit.Limit(
+                "chat-llm-clinic", turn.settings.chat_llm_calls_per_clinic_per_day, public.DAY
+            ),
+            str(turn.clinic["id"]),
+        )
 
 
 def _answer_pending(turn, pending) -> None:

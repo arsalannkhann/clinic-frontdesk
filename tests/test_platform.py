@@ -1408,6 +1408,48 @@ def test_client_ip_header_is_trusted_only_with_the_secret(env, monkeypatch):
     assert_envelope(post("+919000000407", **{"X-Client-IP": "999.1.1.1"}), 429, "rate_limited")
 
 
+@pytest.mark.parametrize(
+    ("address", "bucket"),
+    [
+        ("203.0.113.7", "203.0.113.7"),
+        ("2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64"),
+        ("2001:DB8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::/64"),
+        ("::ffff:203.0.113.7", "203.0.113.7"),
+        ("not-an-ip", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_rate_limit_buckets_ipv6_by_its_64_prefix(address, bucket):
+    from clinic_voice import public
+    from clinic_voice.edge import _parse_ip
+
+    assert public.client_value(address) == bucket
+    if address is not None:
+        assert public.client_value(_parse_ip(address)) == bucket
+
+
+def test_ipv6_visitors_of_one_64_share_a_bucket(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
+    monkeypatch.setenv("PUBLIC_CALLBACK_PHONE_PER_DAY", "100")
+    get_settings.cache_clear()
+
+    def post(phone, address):
+        return env["client"].post(
+            f"{BASE}/callbacks",
+            json={"name": NAME, "phone": phone},
+            headers={"X-Proxy-Secret": PROXY_SECRET, "X-Client-IP": address},
+        )
+
+    assert post("+919000000421", "2001:db8:5:6::1").status_code == 201
+    # Rotating the interface identifier inside the same /64 does not open a new bucket.
+    assert_envelope(post("+919000000422", "2001:db8:5:6:dead:beef:0:2"), 429, "rate_limited")
+    # Another /64 is another visitor; IPv4 stays per address.
+    assert post("+919000000423", "2001:db8:5:7::1").status_code == 201
+    assert post("+919000000424", "198.51.100.1").status_code == 201
+    assert post("+919000000425", "198.51.100.2").status_code == 201
+
+
 def test_without_the_secret_client_ip_header_is_ignored(env, monkeypatch):
     monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
     get_settings.cache_clear()
