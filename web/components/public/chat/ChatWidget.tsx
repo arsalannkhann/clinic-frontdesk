@@ -2,10 +2,10 @@
 
 import { MessageCircle, Phone, RotateCcw, SendHorizontal, X } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useReducer, useRef, useState, type FormEvent } from "react";
+import { Fragment, useCallback, useEffect, useReducer, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { api, ApiError, errorMessage, newIdempotencyKey } from "@/lib/api/client";
-import type { BookingResult, ChatReply, ChatSessionCreated } from "@/lib/api/types";
+import type { BookingResult, ChatReply, ChatSessionCreated, ChatTranscript } from "@/lib/api/types";
 import {
   chatReducer,
   FALLBACK_REPLIES,
@@ -109,18 +109,39 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
     }
   }, []);
 
-  // Start or resume once the panel mounts.
-  useEffect(() => {
-    if (state.status !== "idle") return;
-    const stored = readStoredSession();
-    if (stored) {
+  /** Reload the stored conversation; a forgotten one (404) is replaced by a new session. */
+  const resumeSession = useCallback(
+    async (stored: string): Promise<void> => {
       sessionRef.current = stored;
-      dispatch({ type: "resumed", sessionId: stored });
-    } else {
-      void startSession();
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+      dispatch({ type: "starting" });
+      try {
+        const transcript = await api<ChatTranscript>(`/api/chat/sessions/${encodeURIComponent(stored)}`);
+        dispatch({ type: "restored", sessionId: stored, transcript });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 404) {
+          storeSession(null);
+          sessionRef.current = null;
+          await startSession();
+          return;
+        }
+        // The transcript could not be fetched (offline, timeout): carry on in the same
+        // session without the earlier messages.
+        dispatch({ type: "resumed", sessionId: stored });
+      }
+    },
+    [startSession],
+  );
+
+  // Start or resume exactly once per mount. The ref keeps StrictMode's double effect run (and
+  // any re-render) from creating a second session.
+  const initialised = useRef(false);
+  useEffect(() => {
+    if (initialised.current) return;
+    initialised.current = true;
+    const stored = readStoredSession();
+    if (stored) void resumeSession(stored);
+    else void startSession();
+  }, [resumeSession, startSession]);
 
   useEffect(() => {
     inputRef.current?.focus();
@@ -230,6 +251,22 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
 
   const busy = state.typing || state.status === "starting";
 
+  // The card sits right after the message that offered it; if that line is gone, at the end.
+  const card =
+    state.proposal && state.proposalState ? (
+      <ProposalCard
+        proposal={state.proposal}
+        state={state.proposalState}
+        error={state.proposalError}
+        booking={state.booking}
+        timeZone={timeZone}
+        onConfirm={confirm}
+        onChange={changeProposal}
+      />
+    ) : null;
+  const cardAnchor =
+    state.proposalAfter && state.lines.some((line) => line.id === state.proposalAfter) ? state.proposalAfter : null;
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
@@ -259,23 +296,16 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
         ) : null}
         {state.status === "ready" && state.lines.length === 0 ? (
           <p className="mx-auto rounded-full bg-sunk px-3 py-1 text-xs text-ink-2">
-            Continuing your conversation. Earlier messages aren&apos;t shown after a reload.
+            Continuing your conversation. Earlier messages couldn&apos;t be loaded.
           </p>
         ) : null}
         {state.lines.map((line) => (
-          <Bubble key={line.id} line={line} animate={!reduced && line.id === lastAnimated} />
+          <Fragment key={line.id}>
+            <Bubble line={line} animate={!reduced && line.id === lastAnimated} />
+            {line.id === cardAnchor ? card : null}
+          </Fragment>
         ))}
-        {state.proposal && state.proposalState ? (
-          <ProposalCard
-            proposal={state.proposal}
-            state={state.proposalState}
-            error={state.proposalError}
-            booking={state.booking}
-            timeZone={timeZone}
-            onConfirm={confirm}
-            onChange={changeProposal}
-          />
-        ) : null}
+        {cardAnchor === null ? card : null}
         {state.typing ? (
           <div className="flex items-center gap-1 self-start rounded-lg border border-line bg-raised px-3.5 py-3" aria-label="Assistant is typing" role="status">
             {[0, 1, 2].map((i) => (
@@ -344,11 +374,39 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   );
 }
 
-/** The floating launcher on every public page. The panel mounts on first open. */
+/** Below Tailwind's `sm` breakpoint the panel covers the screen and becomes a true modal. */
+export const SMALL_SCREEN_QUERY = "(max-width: 639.98px)";
+
+function useMediaQuery(query: string): boolean {
+  const [matches, setMatches] = useState(false);
+  useEffect(() => {
+    const list = window.matchMedia?.(query);
+    if (!list) return;
+    setMatches(list.matches);
+    const listener = () => setMatches(list.matches);
+    list.addEventListener?.("change", listener);
+    return () => list.removeEventListener?.("change", listener);
+  }, [query]);
+  return matches;
+}
+
+const FOCUSABLE =
+  'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
+/**
+ * The floating launcher on every public page. The panel mounts on first open. On a phone
+ * (under 640 px) it is a full-screen modal: aria-modal, Tab and Shift+Tab stay inside, the
+ * page behind does not scroll, Escape closes it and focus goes back to the launcher. On larger
+ * screens it is a non-modal panel beside the page; Escape still closes it.
+ */
 export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
   const [open, setOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const wasOpen = useRef(false);
+  const small = useMediaQuery(SMALL_SCREEN_QUERY);
+  const modal = open && small;
 
   useEffect(() => {
     const onOpen = () => {
@@ -362,39 +420,72 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
   useEffect(() => {
     if (!open) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        setOpen(false);
-        buttonRef.current?.focus();
-      }
+      if (event.key === "Escape") setOpen(false);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
+
+  // Focus moves into the panel on open and back to the launcher on close. This runs after the
+  // render, when the launcher (hidden behind the modal on phones) is visible again.
+  useEffect(() => {
+    if (open && !wasOpen.current) {
+      const input = dialogRef.current?.querySelector<HTMLElement>("#chat-input");
+      (input ?? dialogRef.current?.querySelector<HTMLElement>(FOCUSABLE))?.focus();
+    } else if (!open && wasOpen.current) {
+      buttonRef.current?.focus();
+    }
+    wasOpen.current = open;
+  }, [open]);
+
+  // The page behind a full-screen modal must not scroll.
+  useEffect(() => {
+    if (!modal) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      document.body.style.overflow = previous;
+    };
+  }, [modal]);
+
+  function trapFocus(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (!modal || event.key !== "Tab" || !dialogRef.current) return;
+    const items = [...dialogRef.current.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => !el.closest("[hidden]"));
+    if (items.length === 0) {
+      event.preventDefault();
+      return;
+    }
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    const active = document.activeElement as HTMLElement | null;
+    const inside = active ? dialogRef.current.contains(active) : false;
+    if (event.shiftKey && (active === first || !inside)) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && (active === last || !inside)) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
 
   if (!props.enabled) return null;
 
   return (
     <>
       <div
+        ref={dialogRef}
         role="dialog"
-        aria-modal="false"
+        aria-modal={modal ? "true" : "false"}
         aria-labelledby="chat-title"
         hidden={!open}
+        onKeyDown={trapFocus}
         className={cx(
           "fixed z-40 flex flex-col overflow-hidden border-line bg-paper shadow-float",
           "inset-0 sm:inset-auto sm:right-6 sm:bottom-24 sm:h-[min(40rem,calc(100dvh-8rem))] sm:w-[25rem] sm:rounded-lg sm:border",
           open && "animate-rise",
         )}
       >
-        {mounted ? (
-          <ChatPanel
-            {...props}
-            onClose={() => {
-              setOpen(false);
-              buttonRef.current?.focus();
-            }}
-          />
-        ) : null}
+        {mounted ? <ChatPanel {...props} onClose={() => setOpen(false)} /> : null}
       </div>
       <button
         ref={buttonRef}

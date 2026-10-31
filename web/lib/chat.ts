@@ -1,11 +1,12 @@
 /**
  * Chat widget state as a pure reducer. The server keeps the history; the client sends only
- * its new message and renders what comes back. A proposal is only a suggestion: nothing is
+ * its new message and renders what comes back, and after a reload it fetches the transcript
+ * (GET /api/chat/sessions/{id}) to restore it. A proposal is only a suggestion: nothing is
  * booked until the patient presses Confirm on the card, which calls the confirm route with
  * the name, phone and consent typed into that card.
  */
 
-import type { BookingResult, ChatProposal, ChatReply, ChatSessionCreated } from "./api/types";
+import type { BookingResult, ChatProposal, ChatReply, ChatSessionCreated, ChatTranscript } from "./api/types";
 
 export interface ChatLine {
   id: string;
@@ -23,6 +24,8 @@ export interface ChatState {
   typing: boolean;
   proposal: ChatProposal | null;
   proposalState: ProposalState | null;
+  /** The line the proposal card follows, so it sits at its place in the transcript. */
+  proposalAfter: string | null;
   proposalError: string | null;
   booking: BookingResult | null;
   error: string | null;
@@ -38,6 +41,7 @@ export const initialChat: ChatState = {
   typing: false,
   proposal: null,
   proposalState: null,
+  proposalAfter: null,
   proposalError: null,
   booking: null,
   error: null,
@@ -48,6 +52,7 @@ export type ChatAction =
   | { type: "starting" }
   | { type: "started"; session: ChatSessionCreated }
   | { type: "resumed"; sessionId: string }
+  | { type: "restored"; sessionId: string; transcript: ChatTranscript }
   | { type: "startFailed"; message: string }
   | { type: "send"; text: string }
   | { type: "retrying" }
@@ -90,6 +95,22 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         sessionId: action.sessionId,
         quickReplies: state.quickReplies.length ? state.quickReplies : ["Book a check-up", "Opening hours"],
       };
+    case "restored": {
+      const lines = action.transcript.messages
+        .filter((m) => (m.role === "assistant" || m.role === "user") && m.text.trim())
+        .map((m) => ({ id: lineId(), role: m.role, text: m.text }));
+      const proposal = action.transcript.proposal ?? null;
+      return {
+        ...initialChat,
+        status: "ready",
+        sessionId: action.sessionId,
+        lines,
+        quickReplies: action.transcript.quick_replies ?? [],
+        proposal,
+        proposalState: proposal ? "open" : null,
+        proposalAfter: proposal ? (lines.at(-1)?.id ?? null) : null,
+      };
+    }
     case "startFailed":
       return { ...state, status: "unavailable", error: action.message, quickReplies: FALLBACK_REPLIES };
     case "send":
@@ -108,14 +129,18 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         .filter((m) => m.role === "assistant" && m.text.trim())
         .map((m) => ({ id: lineId(), role: "assistant" as const, text: m.text }));
       const proposal = action.reply.proposal ?? null;
+      const all = [...state.lines, ...lines];
+      const keepBooked = !proposal && state.proposalState === "booked";
       return {
         ...state,
-        lines: [...state.lines, ...lines],
+        lines: all,
         typing: false,
         quickReplies: action.reply.quick_replies ?? [],
-        // A new proposal replaces an unconfirmed one; a booked card stays as it is.
-        proposal: proposal ?? (state.proposalState === "booked" ? state.proposal : null),
-        proposalState: proposal ? "open" : state.proposalState === "booked" ? "booked" : null,
+        // A new proposal replaces an unconfirmed one and follows the reply that offered it; a
+        // booked card stays where it was, with later messages below it.
+        proposal: proposal ?? (keepBooked ? state.proposal : null),
+        proposalState: proposal ? "open" : keepBooked ? "booked" : null,
+        proposalAfter: proposal ? (all.at(-1)?.id ?? null) : keepBooked ? state.proposalAfter : null,
         proposalError: null,
         booking: proposal ? null : state.booking,
         pending: null,
@@ -133,6 +158,8 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         proposalState: "booked",
         booking: action.result,
         proposalError: null,
+        // Suggestions offered alongside the proposal ("Show a later time") no longer apply.
+        quickReplies: [],
         lines: [
           ...state.lines,
           { id: lineId(), role: "system", text: `Booking reference ${action.result.reference}` },

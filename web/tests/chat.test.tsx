@@ -1,8 +1,9 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ChatPanel } from "@/components/public/chat/ChatWidget";
+import { ChatLauncher, ChatPanel, SMALL_SCREEN_QUERY } from "@/components/public/chat/ChatWidget";
 import { ProposalCard } from "@/components/public/chat/ProposalCard";
 import type { ChatProposal, ChatReply } from "@/lib/api/types";
 import { chatReducer, FALLBACK_REPLIES, initialChat, readStoredSession, SESSION_KEY, storeSession, validMessage } from "@/lib/chat";
@@ -227,11 +228,90 @@ describe("chat panel flow", () => {
     });
     handlers.push((c) => (c.url === `/api/chat/sessions/${SESSION}/messages` ? json(reply("We open at 9:30 am.")) : undefined));
     render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    expect(await screen.findByText("Hello again")).toBeInTheDocument();
     await user.type(screen.getByLabelText("Message"), "When do you open?{Enter}");
     expect(await screen.findByText("We open at 9:30 am.")).toBeInTheDocument();
     expect(created).toBe(1);
-    expect(calls[0]!.url).toBe("/api/chat/sessions/sess_stale_0123456789/messages");
+    // The reload looked the stored conversation up first; its 404 started a new one.
+    expect(calls[0]!.url).toBe("/api/chat/sessions/sess_stale_0123456789");
+    expect(calls[0]!.init.method).toBe("GET");
     expect(window.sessionStorage.getItem(SESSION_KEY)).toBe(SESSION);
+  });
+
+  it("restores the transcript, proposal and quick replies after a reload", async () => {
+    window.sessionStorage.setItem(SESSION_KEY, SESSION);
+    handlers.push((c) =>
+      c.url === `/api/chat/sessions/${SESSION}`
+        ? json({
+            messages: [
+              { role: "assistant", text: "Hello, how can I help?" },
+              { role: "user", text: "A check-up please" },
+              { role: "assistant", text: "Dr. Kavya Iyer can see you at 10:30 am." },
+            ],
+            proposal: proposal(),
+            quick_replies: ["Show a later time"],
+          })
+        : undefined,
+    );
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    expect(await screen.findByText("A check-up please")).toBeInTheDocument();
+    expect(screen.getByText("Dr. Kavya Iyer can see you at 10:30 am.")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Suggested time" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Show a later time" })).toBeInTheDocument();
+    expect(calls.filter((c) => c.url === "/api/chat/sessions")).toHaveLength(0);
+  });
+
+  it("creates one session under StrictMode", async () => {
+    let created = 0;
+    handlers.push((c) => {
+      if (c.url !== "/api/chat/sessions") return undefined;
+      created++;
+      return json({ session_id: SESSION, greeting: "Hello", quick_replies: [] }, 201);
+    });
+    render(
+      <StrictMode>
+        <ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />
+      </StrictMode>,
+    );
+    expect(await screen.findByText("Hello")).toBeInTheDocument();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(created).toBe(1);
+  });
+
+  it("keeps the proposal card at its place in the transcript and clears stale quick replies once booked", async () => {
+    const user = userEvent.setup();
+    handlers.push((c) => (c.url === "/api/chat/sessions" ? json({ session_id: SESSION, greeting: "Hi", quick_replies: ["Book"] }, 201) : undefined));
+    let replies = 0;
+    handlers.push((c) => {
+      if (!c.url.endsWith("/messages")) return undefined;
+      replies++;
+      return replies === 1
+        ? json(reply("How about 10:30?", proposal(), ["Show a later time", "A different treatment"]))
+        : json(reply("Anything else?", null, ["Opening hours"]));
+    });
+    handlers.push((c) =>
+      c.url.endsWith("/confirm")
+        ? json({ reference: "K7M2Q9XA", status: "confirmed", starts_at: "2026-11-03T05:00:00Z", doctor_name: "Dr. Kavya Iyer", service_name: "Check-up and cleaning" }, 202)
+        : undefined,
+    );
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    await user.click(await screen.findByRole("button", { name: "Book" }));
+    const card = await screen.findByRole("region", { name: "Suggested time" });
+    expect(screen.getByRole("button", { name: "Show a later time" })).toBeInTheDocument();
+    await user.type(within(card).getByLabelText("Patient name"), "Ananya Krishnan");
+    await user.type(within(card).getByLabelText("Mobile number"), "9876543210");
+    await user.click(within(card).getByRole("button", { name: "Confirm booking" }));
+    expect(await screen.findByText("You're booked")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Show a later time" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "A different treatment" })).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("Message"), "Thanks{Enter}");
+    const later = await screen.findByText("Anything else?");
+    const booked = screen.getByRole("region", { name: "Booking" });
+    const offer = screen.getByText("How about 10:30?");
+    // DOM order: the offer, then the card, then the later reply.
+    expect(offer.compareDocumentPosition(booked) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(booked.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it("offers working fallbacks when the assistant is unavailable", async () => {
@@ -241,5 +321,70 @@ describe("chat panel flow", () => {
     render(<ChatPanel clinicName="Aster" timeZone={IST} callHref="tel:+919000000100" />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Book online" })).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Request a call back" })).toBeInTheDocument();
+  });
+});
+
+describe("chat launcher", () => {
+  function stubMatchMedia(small: boolean) {
+    vi.stubGlobal(
+      "matchMedia",
+      vi.fn((query: string) => ({
+        matches: query === SMALL_SCREEN_QUERY ? small : false,
+        media: query,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+      })),
+    );
+  }
+
+  beforeEach(() => {
+    window.sessionStorage.clear();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(JSON.stringify({ session_id: SESSION, greeting: "Hello", quick_replies: ["Opening hours"] }), {
+          status: 201,
+          headers: { "content-type": "application/json" },
+        }),
+      ),
+    );
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("is a focus-trapping modal on a phone, closes on Escape and returns focus", async () => {
+    stubMatchMedia(true);
+    const user = userEvent.setup();
+    render(<ChatLauncher clinicName="Aster" timeZone={IST} callHref={null} enabled />);
+    const launcher = screen.getByRole("button", { name: "Chat with us" });
+    await user.click(launcher);
+    const dialog = await screen.findByRole("dialog", { name: "Aster" });
+    expect(dialog).toHaveAttribute("aria-modal", "true");
+    await screen.findByText("Hello");
+    await waitFor(() => expect(screen.getByLabelText("Message")).toHaveFocus());
+
+    // Tab cycles inside the dialog.
+    for (let i = 0; i < 6; i++) {
+      await user.tab();
+      expect(dialog.contains(document.activeElement)).toBe(true);
+    }
+    await user.tab({ shift: true });
+    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.body.style.overflow).toBe("hidden");
+
+    await user.keyboard("{Escape}");
+    expect(dialog).not.toBeVisible();
+    await waitFor(() => expect(launcher).toHaveFocus());
+    expect(document.body.style.overflow).toBe("");
+  });
+
+  it("is a non-modal panel on larger screens", async () => {
+    stubMatchMedia(false);
+    const user = userEvent.setup();
+    render(<ChatLauncher clinicName="Aster" timeZone={IST} callHref={null} enabled />);
+    await user.click(screen.getByRole("button", { name: "Chat with us" }));
+    const dialog = await screen.findByRole("dialog", { name: "Aster" });
+    expect(dialog).toHaveAttribute("aria-modal", "false");
+    await user.click(within(dialog).getByRole("button", { name: "Close chat" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Chat with us" })).toHaveFocus());
   });
 });
