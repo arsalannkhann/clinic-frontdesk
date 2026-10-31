@@ -22,7 +22,7 @@
             "llm_config": {
               "provider": "openai",
               "model": "gpt-5.4-mini",
-              "max_tokens": 150,
+              "max_tokens": 500,
               "temperature": 1.0
             }
           },

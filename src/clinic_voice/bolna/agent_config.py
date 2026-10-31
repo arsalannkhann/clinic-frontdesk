@@ -60,7 +60,9 @@ class AgentProfile:
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-mini"
     llm_temperature: float = 1.0  # Bolna: GPT-5 models require temperature 1.
-    llm_max_tokens: int = 150
+    # Covers a spoken turn plus a full tool call: reserve_slot arguments alone exceed 150
+    # tokens, and a truncated call reaches Bolna as unparseable JSON (live test, 31 Oct 2026).
+    llm_max_tokens: int = 500
     transcriber_model: str = "saaras:v4"
     endpointing_ms: int = 500
     voices: dict = field(default_factory=lambda: {code: VoiceSettings() for code in ("en", "hi")})
