@@ -205,6 +205,24 @@ def limit(conn, hash_key, name, count, window, value) -> None:
         raise fail(RATE_LIMITED)
 
 
+def hash_key_of(settings) -> bytes:
+    """The rate-limit HMAC key (PHONE_HASH_KEY), or 503 unavailable."""
+    hash_key = settings.phone_hash_key
+    if not hash_key or not hash_key.get_secret_value():
+        log.error("public API needs PHONE_HASH_KEY")
+        raise fail(UNAVAILABLE)
+    try:
+        return decode_hash_key(hash_key.get_secret_value())
+    except CryptoError:
+        log.error("public API phone hash key is invalid")
+        raise fail(UNAVAILABLE) from None
+
+
+def read_limit(conn, settings, name, count, address) -> None:
+    """Per-IP hourly limit of a public read (catalogue, slots); commits its counter."""
+    limit(conn, hash_key_of(settings), name, count, HOUR, client_value(address))
+
+
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
 
@@ -359,6 +377,14 @@ def lookup(url, settings, clinic, request, address) -> dict:
             settings.public_lookup_ip_per_hour,
             HOUR,
             client_value(address),
+        )
+        limit(
+            conn,
+            hash_key,
+            "lookup-phone",
+            settings.public_lookup_phone_per_day,
+            DAY,
+            f"{clinic['id']}:{request.phone}",
         )
         reference = normalize_reference(request.reference)
         row = None

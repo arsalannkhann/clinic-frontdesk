@@ -1126,3 +1126,122 @@ def test_seeded_clinic_serves_the_public_api(empty, monkeypatch):
     assert len(services) == 10 and len(doctors) == 5
     assert all(s["colour"] and s["description"] for s in services)
     assert {sid for d in doctors for sid in d["service_ids"]} == {s["id"] for s in services}
+
+
+# --- Trusted edge: proxy secret and client address (P2 review fix A1) -------------------
+
+PROXY_SECRET = "synthetic-proxy-secret-" + "1" * 32
+
+
+def test_proxy_secret_must_be_long(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u@localhost/x_test")
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", "short")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Proxy-Secret": "wrong"},
+        {"X-Proxy-Secret": PROXY_SECRET[:-1]},
+        {"X-Proxy-Secret": PROXY_SECRET + "x"},
+    ],
+)
+def test_proxy_secret_refuses_direct_callers(env, monkeypatch, headers):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    client = env["client"]
+    for path in ("", "/services", "/doctors"):
+        assert_envelope(client.get(f"{BASE}{path}", headers=headers), 403, "forbidden")
+    r = client.post(f"{BASE}/bookings", json=booking(), headers=headers)
+    assert_envelope(r, 403, "forbidden")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def test_proxy_secret_lets_the_bff_through(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    assert env["client"].get(BASE, headers={"X-Proxy-Secret": PROXY_SECRET}).status_code == 200
+
+
+def test_repeated_proxy_secret_lines_are_refused(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    r = env["client"].get(
+        BASE, headers=[("X-Proxy-Secret", PROXY_SECRET), ("X-Proxy-Secret", PROXY_SECRET)]
+    )
+    assert_envelope(r, 403, "forbidden")
+
+
+def test_client_ip_header_is_trusted_only_with_the_secret(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
+    monkeypatch.setenv("PUBLIC_CALLBACK_PHONE_PER_DAY", "100")
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+
+    def post(phone, **headers):
+        return client.post(
+            f"{BASE}/callbacks",
+            json={"name": NAME, "phone": phone},
+            headers={"X-Proxy-Secret": PROXY_SECRET, **headers},
+        )
+
+    assert post("+919000000401", **{"X-Client-IP": "203.0.113.10"}).status_code == 201
+    assert_envelope(post("+919000000402", **{"X-Client-IP": "203.0.113.10"}), 429, "rate_limited")
+    # Another BFF-reported visitor has its own bucket; X-Forwarded-For is ignored now.
+    assert post("+919000000403", **{"X-Client-IP": "203.0.113.11"}).status_code == 201
+    r = post("+919000000404", **{"X-Client-IP": "203.0.113.11", "X-Forwarded-For": "1.2.3.4"})
+    assert_envelope(r, 429, "rate_limited")
+    # A malformed or missing X-Client-IP falls into one shared bucket (fails closed).
+    assert post("+919000000405", **{"X-Client-IP": "not-an-ip"}).status_code == 201
+    assert_envelope(post("+919000000406"), 429, "rate_limited")
+    assert_envelope(post("+919000000407", **{"X-Client-IP": "999.1.1.1"}), 429, "rate_limited")
+
+
+def test_without_the_secret_client_ip_header_is_ignored(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+    body = {"name": NAME, "phone": "+919000000501"}
+    r = client.post(f"{BASE}/callbacks", json=body, headers={"X-Client-IP": "203.0.113.1"})
+    assert r.status_code == 201
+    # A spoofed X-Client-IP does not open a new bucket: the socket address is used.
+    body["phone"] = "+919000000502"
+    r = client.post(f"{BASE}/callbacks", json=body, headers={"X-Client-IP": "203.0.113.2"})
+    assert_envelope(r, 429, "rate_limited")
+
+
+def test_public_reads_are_rate_limited_per_ip(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_READ_IP_PER_HOUR", "3")
+    monkeypatch.setenv("PUBLIC_SLOTS_IP_PER_HOUR", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+    for path in ("", "/services", "/doctors"):
+        assert client.get(f"{BASE}{path}").status_code == 200
+    assert_envelope(client.get(f"{BASE}/doctors"), 429, "rate_limited")
+    params = {"service_id": str(SERVICE_ID), "date": DAY.isoformat()}
+    assert client.get(f"{BASE}/slots", params=params).status_code == 200
+    assert_envelope(client.get(f"{BASE}/slots", params=params), 429, "rate_limited")
+
+
+def test_lookup_is_rate_limited_per_phone(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_LOOKUP_PHONE_PER_DAY", "2")
+    monkeypatch.setenv("PUBLIC_LOOKUP_IP_PER_HOUR", "100")
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+
+    def lookup(phone, address):
+        body = {"reference": "ZZZZZZZZ", "phone": phone}
+        headers = {"X-Forwarded-For": address}
+        return client.post(f"{BASE}/bookings/lookup", json=body, headers=headers)
+
+    assert lookup(PHONE, "203.0.113.1").status_code == 404
+    assert lookup(PHONE, "203.0.113.2").status_code == 404
+    assert_envelope(lookup(PHONE, "203.0.113.9"), 429, "rate_limited")
+    assert lookup("+919000000998", "203.0.113.9").status_code == 404

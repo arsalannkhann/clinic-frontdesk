@@ -195,9 +195,10 @@ app.include_router(webhooks_router)
 app.include_router(public_router)
 app.include_router(internal_router)
 
-PUBLIC_PATH = "/v1/public/"
+PUBLIC_PATHS = ("/v1/public/", "/v1/chat/")
 PUBLIC_CODES = {
     400: "invalid_request",
+    403: "forbidden",
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
@@ -213,7 +214,7 @@ def _is_public(request) -> bool:
     root = request.scope.get("root_path") or ""
     if root and path.startswith(root):
         path = path[len(root) :]
-    return path.startswith(PUBLIC_PATH)
+    return path.startswith(PUBLIC_PATHS)
 
 
 def envelope(status: int, code: str, message: str, headers=None) -> JSONResponse:
