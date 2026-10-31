@@ -8,7 +8,7 @@ of max_tokens, so max_tokens is about 1500; the message may carry `reasoning_con
 is never shown to a patient, stored or logged.
 
 The adapter is a thin, stateless HTTP client. Errors are ChatLLMError with a short code
-(timeout, unauthorized, http_<status>, malformed, transport); no request or response body,
+(timeout, unauthorized, http_<status>, malformed, transport, length); no request or response body,
 header or provider message is ever placed in an exception or a log line.
 """
 
@@ -21,6 +21,9 @@ from typing import Protocol
 import httpx
 
 THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
+# A reasoning block the model never closed (cut off by max_tokens, or just sloppy): from the
+# opening tag to the end of the text is reasoning, never shown.
+UNCLOSED_THINK = re.compile(r"<think>.*\Z", re.S | re.I)
 MAX_TOOL_CALLS = 8
 
 
@@ -54,15 +57,19 @@ class ChatLLMPort(Protocol):
 def _clean_text(value) -> str | None:
     if not isinstance(value, str):
         return None
-    text = THINK.sub("", value).strip()
+    text = UNCLOSED_THINK.sub("", THINK.sub("", value)).strip()
     return text or None
 
 
 def parse_reply(data) -> LLMReply:
     """The visible text and tool calls of a chat completion response. reasoning_content
-    and any <think> block are dropped. Raises ChatLLMError('malformed')."""
+    and any <think> block, closed or not, are dropped. Raises ChatLLMError('malformed'), or
+    ChatLLMError('length') when the model hit max_tokens (finish_reason "length") before
+    any visible text or tool call: the patient must get the fallback, not an empty or
+    half-reasoned reply. Tool calls of a length-truncated reply still run."""
     try:
-        message = data["choices"][0]["message"]
+        choice = data["choices"][0]
+        message = choice["message"]
     except (KeyError, IndexError, TypeError):
         raise ChatLLMError("malformed") from None
     if not isinstance(message, dict):
@@ -85,7 +92,11 @@ def parse_reply(data) -> LLMReply:
             arguments = None
         call_id = raw.get("id") if isinstance(raw.get("id"), str) and raw.get("id") else None
         calls.append(ToolCall(call_id or f"call_{index}", name[:64], arguments))
-    return LLMReply(_clean_text(message.get("content")), calls)
+    text = _clean_text(message.get("content"))
+    finish = choice.get("finish_reason") if isinstance(choice, dict) else None
+    if finish == "length" and text is None and not calls:
+        raise ChatLLMError("length")
+    return LLMReply(text, calls)
 
 
 class OpenAIChatLLM:

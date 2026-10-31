@@ -664,6 +664,68 @@ def test_session_ids_are_random_128_bit(env):
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
 
 
+# --- Review fixes: unclosed reasoning and length-truncated replies ---------------------------
+
+
+def _completion(content, finish_reason="stop", tool_calls=None):
+    message = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {"choices": [{"message": message, "finish_reason": finish_reason}]}
+
+
+@pytest.mark.parametrize(
+    ("content", "text"),
+    [
+        ("<think>closed</think>Hello", "Hello"),
+        ("Hello <think>never closed, cut off by max_tok", "Hello"),
+        ("<THINK>\nall reasoning\nno end", None),
+        ("<think>a</think>Hi<think>b", "Hi"),
+        ("No reasoning at all", "No reasoning at all"),
+    ],
+)
+def test_reasoning_blocks_are_dropped_closed_or_not(content, text):
+    assert parse_reply(_completion(content)).text == text
+
+
+def test_a_length_truncated_reply_without_visible_text_is_a_failure():
+    with pytest.raises(ChatLLMError) as raised:
+        parse_reply(_completion("<think>thinking until the token limit", "length"))
+    assert raised.value.code == "length"
+    with pytest.raises(ChatLLMError):
+        parse_reply(_completion(None, "length"))
+    # Visible text survives a length stop; tool calls of a truncated reply still run.
+    assert parse_reply(_completion("Partial but visible", "length")).text == "Partial but visible"
+    calls = [{"id": "c1", "function": {"name": "clinic_info", "arguments": "{}"}}]
+    reply = parse_reply(_completion("<think>cut", "length", calls))
+    assert reply.text is None and reply.tool_calls == [ToolCall("c1", "clinic_info", {})]
+
+
+def test_chat_falls_back_on_a_truncated_reasoning_reply(env, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    replies = [
+        _completion(
+            "<think>tool first",
+            "length",
+            [{"id": "c1", "function": {"name": "clinic_info", "arguments": "{}"}}],
+        ),
+        _completion("<think>SYNTHETIC-REASONING the clinic opens at", "length"),
+    ]
+    llm = _adapter(lambda request: httpx.Response(200, json=replies.pop(0)))
+    monkeypatch.setattr(routes_chat, "llm_for", lambda settings: llm)
+    session = start(env)
+    body = say(env, session, "when do you open?").json()
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    assert "SYNTHETIC-REASONING" not in json.dumps(body)
+    assert "code=length" in caplog.text and "SYNTHETIC-REASONING" not in caplog.text
+    keyring = Keyring.from_setting(KEYS)
+    with connect(env["url"]) as conn:
+        stored = chat.transcript(conn, keyring, CLINIC, session_row(env["url"])["id"])
+    # The tool call of the first, truncated reply ran and was answered.
+    assert any(m["role"] == "tool" and m["tool_name"] == "clinic_info" for m in stored)
+    assert "SYNTHETIC-REASONING" not in json.dumps([m["document"] for m in stored])
+
+
 # --- Review fixes: the per-clinic daily model cap --------------------------------------------
 
 
