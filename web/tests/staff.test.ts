@@ -2,10 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({}), useSearchParams: () => new URLSearchParams() }));
 
-import { callBlockReason, outboundGap } from "@/components/staff/CallbacksPage";
+import { callBlockReason, callFailure, outboundGap } from "@/components/staff/CallbacksPage";
 import { safeNext } from "@/components/staff/LoginForm";
-import { clinicChanges, validateHours } from "@/components/staff/SettingsPage";
+import { clinicChanges, clinicFieldErrors, validateHours } from "@/components/staff/SettingsPage";
 import { canWriteRole } from "@/components/staff/StaffContext";
+import { ApiError } from "@/lib/api/client";
 
 describe("staff helpers", () => {
   it("only returns to a staff page after sign-in", () => {
@@ -91,17 +92,44 @@ describe("clinic settings", () => {
     scripts_approved: false,
     test_calls_enabled: false,
     include_reference_in_messages: false,
-    tagline: "Gentle care",
-    address: null,
-    chat_enabled: true,
+    public_slug: "aster-dental",
+    public_enabled: true,
+    public_tagline: "Gentle care",
+    public_address: null,
+    public_map_url: "https://maps.example/aster",
+    public_chat_enabled: true,
+    bolna_outbound_from_number: "+919800000001",
   };
-  const { id: _id, timezone: _tz, ...base } = original;
+  const { id: _id, timezone: _tz, public_slug: _slug, public_enabled: _enabled, ...base } = original;
 
-  it("sends changed fields only, clears empty profile text to null and keeps owner-only fields to the owner", () => {
-    const form = { ...base, tagline: "  Gentle care ", address: "", about: "", outbound_enabled: true, chat_enabled: false };
-    expect(clinicChanges(form, original, true)).toEqual({ outbound_enabled: true, chat_enabled: false });
-    expect(clinicChanges(form, original, false)).toEqual({ chat_enabled: false });
-    expect(clinicChanges({ ...base, tagline: "" }, original, false)).toEqual({ tagline: null });
-    expect(clinicChanges({ ...base, address: " 12 MG Road " }, original, false)).toEqual({ address: "12 MG Road" });
+  it("sends changed fields only, never null, and keeps owner-only fields to the owner", () => {
+    const form = { ...base, public_tagline: "  Gentle care ", public_address: "", public_about: "", outbound_enabled: true, public_chat_enabled: false };
+    expect(clinicChanges(form, original, true)).toEqual({ outbound_enabled: true, public_chat_enabled: false });
+    expect(clinicChanges(form, original, false)).toEqual({ public_chat_enabled: false });
+    // A cleared text goes as "", not null (the API refuses nulls).
+    expect(clinicChanges({ ...base, public_tagline: "" }, original, false)).toEqual({ public_tagline: "" });
+    expect(clinicChanges({ ...base, public_address: " 12 MG Road " }, original, false)).toEqual({ public_address: "12 MG Road" });
+    expect(clinicChanges({ ...base, bolna_outbound_from_number: "+919800000002" }, original, false)).toEqual({});
+    expect(clinicChanges({ ...base, bolna_outbound_from_number: "+919800000002" }, original, true)).toEqual({ bolna_outbound_from_number: "+919800000002" });
+  });
+
+  it("checks links and numbers, and refuses to clear what the API can't clear", () => {
+    expect(clinicFieldErrors({ public_map_url: "" }, original).public_map_url).toMatch(/replaced but not cleared/);
+    expect(clinicFieldErrors({ public_map_url: "http://maps.example" }, original).public_map_url).toMatch(/https/);
+    expect(clinicFieldErrors({ public_voice_number: "98000 00001" }, original).public_voice_number).toMatch(/international/);
+    expect(clinicFieldErrors({ bolna_outbound_from_number: "" }, original).bolna_outbound_from_number).toMatch(/not cleared/);
+    expect(clinicFieldErrors({ public_tagline: "", public_voice_number: "+919800000003" }, original)).toEqual({});
+  });
+});
+
+describe("call-backs", () => {
+  const apiError = (status: number, code: string) => new ApiError(status, code, "upstream text");
+
+  it("tells clinic-wide refusals from per-call failures, by code", () => {
+    expect(callFailure(apiError(409, "no_outbound_agent"))).toMatchObject({ clinicWide: true, code: "no_outbound_agent" });
+    expect(callFailure(apiError(409, "synthetic_contact"))).toMatchObject({ clinicWide: false, text: "Demo record — calls disabled.", refresh: true });
+    expect(callFailure(apiError(409, "quiet_hours")).text).toMatch(/quiet hours/);
+    expect(callFailure(apiError(503, "bolna_unconfigured")).text).toMatch(/voice provider/);
+    expect(callFailure(apiError(502, "call_failed"))).toMatchObject({ refresh: true });
   });
 });

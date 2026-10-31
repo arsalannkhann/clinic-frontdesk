@@ -58,24 +58,40 @@ export function SettingsPage() {
 
 /* ---------- clinic ---------- */
 
-type ClinicForm = Omit<ClinicConfig, "id" | "timezone">;
-const OWNER_ONLY: (keyof ClinicForm)[] = ["outbound_enabled", "scripts_approved", "test_calls_enabled", "include_reference_in_messages"];
+type ClinicForm = Omit<ClinicConfig, "id" | "timezone" | "public_slug" | "public_enabled">;
+const OWNER_ONLY: (keyof ClinicForm)[] = [
+  "outbound_enabled",
+  "bolna_outbound_from_number",
+  "scripts_approved",
+  "test_calls_enabled",
+  "include_reference_in_messages",
+];
 
-/** The public profile, edited through GET/PATCH admin/clinic and shown on the website. */
-const PROFILE_TEXT = ["tagline", "address", "map_url", "phone_display", "email", "hours_note", "about", "voice_number"] as const;
-type ProfileText = (typeof PROFILE_TEXT)[number];
-const PROFILE_KEYS: (keyof ClinicForm)[] = [...PROFILE_TEXT, "chat_enabled"];
+/** The public profile on admin/clinic, shown on the website. */
+const PROFILE_TEXT = [
+  "public_tagline",
+  "public_address",
+  "public_map_url",
+  "public_phone_display",
+  "public_email",
+  "public_hours_note",
+  "public_about",
+  "public_voice_number",
+] as const;
+type TextKey = (typeof PROFILE_TEXT)[number] | "bolna_outbound_from_number";
+const TEXT_KEYS: readonly TextKey[] = [...PROFILE_TEXT, "bolna_outbound_from_number"];
+/** The API takes no nulls and validates these, so once set they can be replaced, not cleared. */
+const UNCLEARABLE: readonly TextKey[] = ["public_map_url", "public_voice_number", "bolna_outbound_from_number"];
+const E164 = /^\+[1-9]\d{7,14}$/;
 
-/** Empty text and a missing value are the same thing; a cleared field is sent as null. */
-function normalise(key: keyof ClinicForm, value: unknown): unknown {
-  if ((PROFILE_TEXT as readonly string[]).includes(key)) {
-    const text = typeof value === "string" ? value.trim() : "";
-    return text === "" ? null : text;
-  }
-  return value;
-}
+const isText = (key: keyof ClinicForm): key is TextKey => (TEXT_KEYS as readonly string[]).includes(key);
+/** Text compares trimmed, with empty and missing alike. */
+const normalise = (key: keyof ClinicForm, value: unknown): unknown => (isText(key) ? (typeof value === "string" ? value.trim() : "") : value);
 
-/** The PATCH body: changed fields only, leaving out owner-only fields for everyone else. */
+/**
+ * The PATCH body: changed fields only (the API refuses nulls), leaving out owner-only fields
+ * for everyone else. A cleared text field is sent as "".
+ */
 export function clinicChanges(form: ClinicForm, original: ClinicConfig, isOwner: boolean): Partial<ClinicForm> {
   const changes: Record<string, unknown> = {};
   for (const key of Object.keys(form) as (keyof ClinicForm)[]) {
@@ -86,11 +102,24 @@ export function clinicChanges(form: ClinicForm, original: ClinicConfig, isOwner:
   return changes as Partial<ClinicForm>;
 }
 
+/** Field errors for the changed profile and number fields, before anything is sent. */
+export function clinicFieldErrors(changes: Partial<ClinicForm>, original: ClinicConfig): Partial<Record<TextKey, string>> {
+  const errors: Partial<Record<TextKey, string>> = {};
+  for (const key of TEXT_KEYS) {
+    const value = changes[key];
+    if (typeof value !== "string") continue;
+    if (value === "" && UNCLEARABLE.includes(key) && original[key]) errors[key] = "This can be replaced but not cleared.";
+    else if (key === "public_map_url" && !/^https:\/\/\S+$/.test(value)) errors[key] = "Use an https:// link.";
+    else if ((key === "public_voice_number" || key === "bolna_outbound_from_number") && !E164.test(value)) errors[key] = "Use the international format, for example +919800012345.";
+    else if (key === "public_email" && value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) errors[key] = "Enter an email address.";
+  }
+  return errors;
+}
+
 function toForm(clinic: ClinicConfig): ClinicForm {
-  const { id: _id, timezone: _tz, ...rest } = clinic;
+  const { id: _id, timezone: _tz, public_slug: _slug, public_enabled: _enabled, ...rest } = clinic;
   const form: ClinicForm = { ...rest };
-  for (const key of PROFILE_TEXT) form[key] = rest[key] ?? "";
-  if (form.chat_enabled === undefined && "chat_enabled" in clinic) form.chat_enabled = false;
+  for (const key of TEXT_KEYS) if (key in clinic) form[key] = rest[key] ?? "";
   return form;
 }
 
@@ -102,6 +131,7 @@ function ClinicSettings() {
   const [form, setForm] = useState<ClinicForm | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<TextKey, string>>>({});
 
   useEffect(() => {
     if (clinic.data) setForm(toForm(clinic.data));
@@ -117,16 +147,29 @@ function ClinicSettings() {
     );
   }
   const original = clinic.data;
-  // Until the API returns the profile on admin/clinic there is nothing to edit.
-  const hasProfile = PROFILE_KEYS.some((key) => key in original);
-  const set = <K extends keyof ClinicForm>(key: K, value: ClinicForm[K]) => setForm((f) => (f ? { ...f, [key]: value } : f));
-  const text = (key: ProfileText) => (form[key] as string | null | undefined) ?? "";
+  // An API without the profile on admin/clinic leaves nothing to edit.
+  const hasProfile = PROFILE_TEXT.some((key) => key in original);
+  const set = <K extends keyof ClinicForm>(key: K, value: ClinicForm[K]) => {
+    setForm((f) => (f ? { ...f, [key]: value } : f));
+    if (isText(key)) setFieldErrors((e) => ({ ...e, [key]: undefined }));
+  };
+  const text = (key: TextKey) => (form[key] as string | null | undefined) ?? "";
+  const textField = (key: TextKey) => ({
+    value: text(key),
+    onChange: (e: { target: { value: string } }) => set(key, e.target.value),
+  });
 
   async function save(event: FormEvent) {
     event.preventDefault();
     if (!form) return;
     setError(null);
     const changes = clinicChanges(form, original, isOwner);
+    const invalid = clinicFieldErrors(changes, original);
+    setFieldErrors(invalid);
+    if (Object.keys(invalid).length) {
+      setError("Check the highlighted fields.");
+      return;
+    }
     if (Object.keys(changes).length === 0) {
       toast.show("Nothing has changed.", "info");
       return;
@@ -136,7 +179,7 @@ function ClinicSettings() {
       const updated = await api<ClinicConfig>("/api/admin/clinic", { method: "PATCH", body: changes });
       await clinic.mutate(updated, { revalidate: false });
       // Outbound readiness depends on outbound_enabled; refresh the panel and Call-backs.
-      if ("outbound_enabled" in changes) void mutate("/api/staff/outbound-status");
+      if ("outbound_enabled" in changes || "bolna_outbound_from_number" in changes) void mutate("/api/staff/outbound-status");
       toast.show("Clinic settings saved.");
     } catch (err) {
       setError(errorMessage(err));
@@ -167,36 +210,44 @@ function ClinicSettings() {
           <Panel title="Clinic profile">
             {hasProfile ? (
               <div className="grid gap-4 p-4 sm:grid-cols-2">
-                <p className="text-sm text-ink-2 sm:col-span-2">Shown to patients on the website and used by the assistants. Leave a field empty to hide it.</p>
-                <Field label="Tagline" className="sm:col-span-2">
-                  {(p) => <Input {...p} value={text("tagline")} maxLength={160} onChange={(e) => set("tagline", e.target.value)} />}
+                <p className="text-sm text-ink-2 sm:col-span-2">
+                  Shown to patients on the website and used by the assistants. Leave a text empty to hide it.
+                  {original.public_slug ? (
+                    <>
+                      {" "}
+                      The website is {original.public_enabled ? "published" : "not published"} at the address <span className="font-mono">{original.public_slug}</span>.
+                    </>
+                  ) : null}
+                </p>
+                <Field label="Tagline" className="sm:col-span-2" error={fieldErrors.public_tagline}>
+                  {(p) => <Input {...p} {...textField("public_tagline")} maxLength={160} />}
                 </Field>
-                <Field label="Address" className="sm:col-span-2">
-                  {(p) => <Textarea {...p} rows={2} value={text("address")} maxLength={300} onChange={(e) => set("address", e.target.value)} />}
+                <Field label="Address" className="sm:col-span-2" error={fieldErrors.public_address}>
+                  {(p) => <Textarea {...p} {...textField("public_address")} rows={2} maxLength={300} />}
                 </Field>
-                <Field label="Map link" hint="A Google Maps or similar https link.">
-                  {(p) => <Input {...p} type="url" inputMode="url" value={text("map_url")} maxLength={500} onChange={(e) => set("map_url", e.target.value)} />}
+                <Field label="Map link" hint="An https link. Once set it can be replaced, not removed." error={fieldErrors.public_map_url}>
+                  {(p) => <Input {...p} {...textField("public_map_url")} type="url" inputMode="url" maxLength={500} />}
                 </Field>
-                <Field label="Phone shown on the website">
-                  {(p) => <Input {...p} type="tel" value={text("phone_display")} maxLength={40} onChange={(e) => set("phone_display", e.target.value)} />}
+                <Field label="Phone shown on the website" error={fieldErrors.public_phone_display}>
+                  {(p) => <Input {...p} {...textField("public_phone_display")} type="tel" maxLength={32} />}
                 </Field>
-                <Field label="Email">
-                  {(p) => <Input {...p} type="email" autoComplete="off" value={text("email")} maxLength={254} onChange={(e) => set("email", e.target.value)} />}
+                <Field label="Email" error={fieldErrors.public_email}>
+                  {(p) => <Input {...p} {...textField("public_email")} type="email" autoComplete="off" maxLength={254} />}
                 </Field>
-                <Field label="Receptionist line" hint="The number patients call to reach the voice assistant, in +91 format.">
-                  {(p) => <Input {...p} type="tel" value={text("voice_number")} maxLength={20} onChange={(e) => set("voice_number", e.target.value)} />}
+                <Field label="Receptionist line" hint="The number patients call for the voice assistant, like +919800012345." error={fieldErrors.public_voice_number}>
+                  {(p) => <Input {...p} {...textField("public_voice_number")} type="tel" maxLength={16} />}
                 </Field>
-                <Field label="Hours note" hint="For example “Sunday by appointment only”." className="sm:col-span-2">
-                  {(p) => <Input {...p} value={text("hours_note")} maxLength={200} onChange={(e) => set("hours_note", e.target.value)} />}
+                <Field label="Hours note" hint="For example “Sunday by appointment only”." className="sm:col-span-2" error={fieldErrors.public_hours_note}>
+                  {(p) => <Input {...p} {...textField("public_hours_note")} maxLength={300} />}
                 </Field>
-                <Field label="About the clinic" className="sm:col-span-2">
-                  {(p) => <Textarea {...p} rows={4} value={text("about")} maxLength={2000} onChange={(e) => set("about", e.target.value)} />}
+                <Field label="About the clinic" className="sm:col-span-2" error={fieldErrors.public_about}>
+                  {(p) => <Textarea {...p} {...textField("public_about")} rows={4} maxLength={2000} />}
                 </Field>
                 <Checkbox
                   className="sm:col-span-2"
                   label="Show the chat assistant on the website"
-                  checked={!!form.chat_enabled}
-                  onChange={(e) => set("chat_enabled", e.target.checked)}
+                  checked={!!form.public_chat_enabled}
+                  onChange={(e) => set("public_chat_enabled", e.target.checked)}
                 />
               </div>
             ) : (
@@ -217,6 +268,19 @@ function ClinicSettings() {
                 disabled={!isOwner}
                 onChange={(e) => set("outbound_enabled", e.target.checked)}
               />
+              {"bolna_outbound_from_number" in original ? (
+                <Field
+                  label="Calling number"
+                  hint={
+                    isOwner
+                      ? "The number call-backs come from, connected to the clinic's voice provider, like +919800012345. Once set it can be replaced, not removed."
+                      : "Owner only."
+                  }
+                  error={fieldErrors.bolna_outbound_from_number}
+                >
+                  {(p) => <Input {...p} {...textField("bolna_outbound_from_number")} type="tel" maxLength={16} disabled={!isOwner} className="sm:max-w-xs" />}
+                </Field>
+              ) : null}
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Quiet hours start">{(p) => <Input {...p} type="time" value={form.quiet_hours_start} onChange={(e) => set("quiet_hours_start", e.target.value)} />}</Field>
                 <Field label="Quiet hours end">{(p) => <Input {...p} type="time" value={form.quiet_hours_end} onChange={(e) => set("quiet_hours_end", e.target.value)} />}</Field>
@@ -304,7 +368,9 @@ function OutboundPanel({ saved }: { saved: boolean }) {
         {
           done: data.has_from_number,
           label: "A calling number",
-          detail: data.has_from_number ? "Configured. Calls show this number to the patient." : "Not configured yet. The platform team connects a number for the clinic.",
+          detail: data.has_from_number ? "Configured. Calls show this number to the patient." : isOwner
+              ? "Not configured yet. Set the calling number under Patient contact and save."
+              : "Not configured yet. The owner sets it under Patient contact.",
         },
         {
           done: data.has_outbound_agent,
