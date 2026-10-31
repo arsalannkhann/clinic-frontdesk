@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarDays, ChevronDown, MapPin, MessageCircle, Phone } from "lucide-react";
+import { ArrowRight, CalendarDays, ChevronDown, MapPin, Phone, Sparkles } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 
@@ -136,14 +136,14 @@ export default async function HomePage() {
               </Link>
             </div>
             <div className="flex flex-col gap-3 bg-raised p-6">
-              <MessageCircle className="size-6 text-accent" aria-hidden="true" />
-              <h3 className="font-display text-xl">Chat</h3>
+              <Sparkles className="size-6 text-accent" aria-hidden="true" />
+              <h3 className="font-display text-xl">AI assistant</h3>
               <p className="flex-1 text-ink-2">
-                Ask the clinic&apos;s virtual assistant about times, treatments or parking. It suggests a slot; you confirm it.
+                Ask our AI booking assistant about times, treatments or parking. It suggests a slot; you confirm it.
               </p>
               {profile.chat_enabled ? (
                 <OpenChatButton variant="quiet" size="md" className="justify-start">
-                  Start a chat <ArrowRight className="size-4" aria-hidden="true" />
+                  Chat with the AI assistant <ArrowRight className="size-4" aria-hidden="true" />
                 </OpenChatButton>
               ) : (
                 <p className="text-sm text-ink-3">Chat is unavailable right now.</p>

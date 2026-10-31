@@ -1,6 +1,6 @@
 "use client";
 
-import { MessageCircle, Phone, RotateCcw, SendHorizontal, X } from "lucide-react";
+import { Phone, RotateCcw, SendHorizontal, Sparkles, X } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Fragment, useCallback, useEffect, useReducer, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
@@ -317,11 +317,19 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
-        <div>
-          <h2 id="chat-title" className="font-display text-lg leading-tight">
-            {clinicName}
-          </h2>
-          <p className="text-xs text-ink-3">Virtual assistant · replies in seconds · no medical advice</p>
+        <div className="flex items-center gap-3">
+          <span className="grid size-10 shrink-0 place-items-center rounded-full bg-accent text-paper" aria-hidden="true">
+            <Sparkles className="size-5" />
+          </span>
+          <div>
+            <h2 id="chat-title" className="flex items-center gap-2 font-display text-lg leading-tight">
+              AI booking assistant
+              <span className="rounded-full bg-accent-tint px-1.5 py-0.5 font-sans text-[0.625rem] font-semibold tracking-wide text-accent uppercase">
+                AI
+              </span>
+            </h2>
+            <p className="text-xs text-ink-3">{clinicName} · books real open slots · no medical advice</p>
+          </div>
         </div>
         <div className="flex items-center gap-1">
           {callHref ? (
@@ -558,8 +566,8 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
           open && "max-sm:hidden",
         )}
       >
-        {open ? <X className="size-5" aria-hidden="true" /> : <MessageCircle className="size-5" aria-hidden="true" />}
-        {open ? "Close chat" : "Chat with us"}
+        {open ? <X className="size-5" aria-hidden="true" /> : <Sparkles className="size-5" aria-hidden="true" />}
+        {open ? "Close chat" : "Book with AI assistant"}
       </button>
     </>
   );
