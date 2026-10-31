@@ -33,16 +33,12 @@ export const patientBookingStatus = table({
   cancelled: ["Cancelled", "neutral"],
 });
 
-/** Calendar sync state; values beyond the plan's are assumed (see the P3 report). */
+/** Calendar sync state (staff calendar `sync_state`). */
 export const syncState = table({
   synced: ["Synced", "ok"],
-  confirmed: ["Synced", "ok"],
   pending: ["Sync pending", "warn"],
-  pending_sync: ["Sync pending", "warn"],
   failed: ["Sync failed", "bad"],
-  needs_review: ["Sync failed", "bad"],
   not_applicable: ["No sync", "neutral"],
-  ledger: ["Clinic ledger", "info"],
 });
 
 export const channel = table({
@@ -85,9 +81,27 @@ export const role = table({
   viewer: ["Viewer (read-only)", "neutral"],
 });
 
-/** Refusals of "Call now", shown next to the disabled button. */
+/** Clinic-wide refusals of "Call now", shown next to the disabled buttons. */
 export const CALL_REFUSALS: Record<string, string> = {
   outbound_disabled: "Outbound calling is off for this clinic. The owner can turn it on in Settings once a calling number is configured.",
-  no_from_number: "No calling number is configured yet, so calls can't be placed. The owner can set one up and then turn outbound calling on in Settings.",
+  no_from_number: "No calling number is configured yet, so calls can't be placed. The owner can set one in Settings and then turn outbound calling on.",
   no_outbound_agent: "No outbound voice agent is configured yet, so calls can't be placed.",
 };
+
+/**
+ * Why one call didn't start (POST staff/callbacks/{id}/call). Codes come through on 5xx too;
+ * the BFF drops the upstream message there, so the text is ours.
+ */
+export const CALL_FAILURES: Record<string, string> = {
+  callback_resolved: "This request has already been resolved.",
+  synthetic_contact: "Demo record — calls disabled.",
+  quiet_hours: "It's within the clinic's quiet hours, so no call was placed. Try again after quiet hours end.",
+  budget_exhausted: "Today's outbound contact budget is used up, so no call was placed.",
+  retry: "The clinic's settings changed while the call was being set up. Try again.",
+  bolna_unconfigured: "The voice provider isn't set up on the server, so calls can't be placed.",
+  unavailable: "Calling is unavailable right now. Try again shortly.",
+  call_failed: "The call couldn't be placed, and the request is open again. Try again later or ring from the clinic phone.",
+};
+
+/** Shown for a demo (synthetic) record, whose Call now is always disabled. */
+export const DEMO_RECORD = "Demo record — calls disabled";

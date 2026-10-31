@@ -69,6 +69,8 @@ describe("calendar booking defaults", () => {
     status,
     sync_state: "synced",
     channel: "web",
+    patient_name: null,
+    reference: null,
   });
 
   it("picks the first free slot, skipping bookings, blocked time and the past", () => {

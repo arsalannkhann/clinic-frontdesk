@@ -149,7 +149,7 @@ function TodayHero({
 
       {stats && channelTotal > 0 ? (
         <p className="mt-3 text-sm text-ink-3">
-          This week by channel:{" "}
+          Bookings in the last 30 days by channel:{" "}
           {CHANNELS.map((c, i) => (
             <span key={c}>
               {i > 0 ? <span aria-hidden="true"> · </span> : null}

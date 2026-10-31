@@ -127,6 +127,8 @@ export interface StaffUser {
   id: string;
   email: string;
   role: Role;
+  /** GET /v1/staff/me carries the clinic; the login response's user may not. */
+  clinic?: { id: string; name: string; timezone: string; public_slug: string | null };
 }
 
 export interface LoginResult {
@@ -151,12 +153,14 @@ export interface CalendarAppointment {
   starts_at: string;
   ends_at: string;
   status: BookingStatus;
-  /** Assumed values: "pending" | "synced" | "failed" | "not_applicable" (open string). */
-  sync_state: string;
+  sync_state: SyncState;
   channel: Channel;
-  patient_name?: string | null;
-  reference?: string | null;
+  /** Null for viewers. */
+  patient_name: string | null;
+  reference: string | null;
 }
+
+export type SyncState = "synced" | "pending" | "failed" | "not_applicable";
 
 /** Assumed to match `ExceptionOut` of /v1/admin/exceptions. */
 export interface ScheduleException {
@@ -182,23 +186,38 @@ export interface StaffBookingRequest {
   name: string;
   phone: string;
   notes?: string;
+  consent_contact?: boolean;
 }
 
 export type CallbackStatus = "open" | "calling" | "done" | "dismissed";
 
+/** GET /v1/staff/callbacks item. name, phone_masked and reason are null for viewers. */
 export interface CallbackItem {
   id: string;
-  name: string;
-  phone_masked: string;
+  name: string | null;
+  /** "****1234" */
+  phone_masked: string | null;
   reason: string | null;
   source: "web" | "chat" | "voice";
   status: CallbackStatus;
   created_at: string;
+  resolved_at: string | null;
+  execution_id: string | null;
+  call_requested_at: string | null;
+  /** Seeded demo data: never dialled. */
+  synthetic: boolean;
 }
 
+/** 202 from POST /v1/staff/callbacks/{id}/call; execution_id is null after a provider timeout. */
 export interface CallStarted {
   status: "calling";
-  execution_id: string;
+  execution_id: string | null;
+}
+
+export interface CallbackResolved {
+  id: string;
+  status: CallbackStatus;
+  resolved_at: string;
 }
 
 export interface ConversationSummary {
@@ -207,14 +226,29 @@ export interface ConversationSummary {
   started_at: string;
   status: string;
   turns: number;
-  patient_name?: string | null;
-  outcome: string | null;
+  /** Null for viewers. */
+  patient_name: string | null;
+  outcome: "booked" | null;
 }
 
-/** Assumed shape of GET /v1/staff/conversations/{id}. */
+export interface ConversationMessage {
+  role: "user" | "assistant" | "tool" | "system";
+  /** Null for viewers; tool entries are summarised as "<tool>: ok|<error code>". */
+  text: string | null;
+  tool_name: string | null;
+  created_at: string;
+}
+
+/** GET /v1/staff/conversations/{id}. Voice entries have no messages. */
 export interface ConversationDetail extends ConversationSummary {
-  messages?: { role: "user" | "assistant" | "tool"; text: string; created_at?: string }[];
-  summary?: string | null;
+  last_active_at: string | null;
+  ended_at: string | null;
+  messages: ConversationMessage[];
+  provider_status: string | null;
+  call_type: string | null;
+  duration_seconds: number | null;
+  hangup_by: string | null;
+  appointments: { id: string; reference: string; status: BookingStatus; starts_at: string; channel: Channel }[];
 }
 
 export interface StaffStats {
@@ -257,19 +291,26 @@ export interface ClinicConfig {
   scripts_approved: boolean;
   test_calls_enabled: boolean;
   include_reference_in_messages: boolean;
+  /* Read-only. */
+  public_slug?: string | null;
+  public_enabled?: boolean;
   /*
-   * Public profile fields (the GET /v1/public/clinics/{slug} shape), assumed to be read and
-   * written through GET/PATCH /v1/admin/clinic. Optional until the backend adds them.
+   * The public profile (owner, admin). PATCH takes no nulls: send changed fields only; a set
+   * map URL or number can be replaced but not cleared.
    */
-  tagline?: string | null;
-  address?: string | null;
-  map_url?: string | null;
-  phone_display?: string | null;
-  email?: string | null;
-  hours_note?: string | null;
-  about?: string | null;
-  voice_number?: string | null;
-  chat_enabled?: boolean;
+  public_tagline?: string | null;
+  public_address?: string | null;
+  /** https only. */
+  public_map_url?: string | null;
+  public_phone_display?: string | null;
+  public_email?: string | null;
+  public_hours_note?: string | null;
+  public_about?: string | null;
+  /** E.164. */
+  public_voice_number?: string | null;
+  public_chat_enabled?: boolean;
+  /** E.164, owner only. */
+  bolna_outbound_from_number?: string | null;
 }
 
 /** GET /v1/staff/outbound-status. */

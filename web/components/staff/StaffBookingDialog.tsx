@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { api, errorMessage, newIdempotencyKey } from "@/lib/api/client";
-import type { BookingResult, PublicDoctor, PublicService } from "@/lib/api/types";
+import type { BookingResult, PublicDoctor, PublicService, StaffBookingRequest } from "@/lib/api/types";
 import { validateDetails } from "@/lib/booking";
 import { servicesForDoctor } from "@/lib/catalog";
 import { appointmentStatus } from "@/lib/labels";
@@ -11,7 +11,7 @@ import { toIndianE164 } from "@/lib/phone";
 import { formatDateTime, hhmm, minutesLabel, zonedToIso } from "@/lib/time";
 import { LabelBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { Field, Input, PhoneInput, Select, Textarea } from "@/components/ui/Field";
+import { Checkbox, Field, Input, PhoneInput, Select, Textarea } from "@/components/ui/Field";
 import { Dialog } from "@/components/ui/Modal";
 import { useStaff } from "./StaffContext";
 
@@ -44,6 +44,7 @@ export function StaffBookingDialog({
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [notes, setNotes] = useState("");
+  const [consent, setConsent] = useState(false);
   const [errors, setErrors] = useState<Record<string, string | undefined>>({});
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -64,6 +65,7 @@ export function StaffBookingDialog({
     setName("");
     setPhone("");
     setNotes("");
+    setConsent(false);
     setErrors({});
     setError(null);
     setResult(null);
@@ -94,7 +96,15 @@ export function StaffBookingDialog({
     try {
       const booked = await api<BookingResult>("/api/staff/bookings", {
         method: "POST",
-        body: { service_id: serviceId, doctor_id: doctorId, starts_at: startsAt, name: name.trim(), phone: e164.e164, ...(notes.trim() ? { notes: notes.trim() } : {}) },
+        body: {
+          service_id: serviceId,
+          doctor_id: doctorId,
+          starts_at: startsAt,
+          name: name.trim(),
+          phone: e164.e164,
+          consent_contact: consent,
+          ...(notes.trim() ? { notes: notes.trim() } : {}),
+        } satisfies StaffBookingRequest,
         idempotencyKey: key,
       });
       setResult(booked);
@@ -199,6 +209,12 @@ export function StaffBookingDialog({
           <Field label="Notes" optional error={errors.notes}>
             {(props) => <Textarea {...props} maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} className="min-h-16" />}
           </Field>
+          <Checkbox
+            label="The patient agreed to be contacted about this appointment"
+            description="Confirmations and reminders go out only when this is ticked."
+            checked={consent}
+            onChange={(e) => setConsent(e.target.checked)}
+          />
           {error ? (
             <p role="alert" className="rounded-md border border-bad/25 bg-bad-tint/60 px-3 py-2 text-sm font-medium">
               {error}
