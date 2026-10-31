@@ -1,7 +1,7 @@
 "use client";
 
 import { CalendarCheck2, Clock } from "lucide-react";
-import { useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent } from "react";
 
 import type { BookingResult, ChatProposal } from "@/lib/api/types";
 import type { ProposalState } from "@/lib/chat";
@@ -12,6 +12,8 @@ import { formatLongDate, formatTime } from "@/lib/time";
 import { Button } from "@/components/ui/Button";
 import { Checkbox, Field, Input, PhoneInput } from "@/components/ui/Field";
 import { LabelBadge } from "@/components/ui/Badge";
+
+export const CONSENT_REQUIRED = "Tick this to book. The clinic needs to be able to reach you about the appointment.";
 
 export interface ProposalCardProps {
   proposal: ChatProposal;
@@ -28,7 +30,8 @@ export function ProposalCard({ proposal, state, error, booking, timeZone, onConf
   const [name, setName] = useState("");
   const [phone, setPhone] = useState("");
   const [consent, setConsent] = useState(false);
-  const [errors, setErrors] = useState<{ name?: string; phone?: string }>({});
+  const consentId = useId();
+  const [errors, setErrors] = useState<{ name?: string; phone?: string; consent?: string }>({});
 
   const when = (
     <div className="flex flex-col gap-1">
@@ -77,11 +80,13 @@ export function ProposalCard({ proposal, state, error, booking, timeZone, onConf
   function submit(event: FormEvent) {
     event.preventDefault();
     const found = validateDetails({ name, phone, notes: "" });
-    setErrors({ name: found.name, phone: found.phone });
-    if (found.name || found.phone) return;
+    // The clinic has to be able to reach the patient about a booking, so consent is required.
+    const consentError = consent ? undefined : CONSENT_REQUIRED;
+    setErrors({ name: found.name, phone: found.phone, consent: consentError });
+    if (found.name || found.phone || consentError) return;
     const e164 = toIndianE164(phone);
     if (!e164.ok) return;
-    onConfirm({ name: name.trim(), phone: e164.e164, consent_contact: consent });
+    onConfirm({ name: name.trim(), phone: e164.e164, consent_contact: true });
   }
 
   const busy = state === "confirming";
@@ -99,12 +104,23 @@ export function ProposalCard({ proposal, state, error, booking, timeZone, onConf
           {(props) => <PhoneInput {...props} value={phone} onValueChange={setPhone} disabled={busy} />}
         </Field>
         <Checkbox
-          label="Send me a confirmation and a reminder about this appointment."
-          description="By call or message from the clinic. You can say no; it doesn't affect the booking."
+          label="The clinic may contact me about this appointment."
+          description="A confirmation, a reminder, or a call if the time has to change. Needed to book from the chat."
           checked={consent}
-          onChange={(e) => setConsent(e.target.checked)}
+          onChange={(e) => {
+            setConsent(e.target.checked);
+            if (e.target.checked) setErrors((current) => ({ ...current, consent: undefined }));
+          }}
           disabled={busy}
+          id={consentId}
+          aria-invalid={errors.consent ? true : undefined}
+          aria-describedby={errors.consent ? `${consentId}-desc ${consentId}-error` : `${consentId}-desc`}
         />
+        {errors.consent ? (
+          <p id={`${consentId}-error`} className="-mt-1 text-sm font-medium text-bad">
+            {errors.consent}
+          </p>
+        ) : null}
         {error ? (
           <p role="alert" className="text-sm font-medium text-bad">
             {error}

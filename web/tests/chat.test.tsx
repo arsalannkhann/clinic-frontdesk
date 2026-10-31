@@ -6,7 +6,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatLauncher, ChatPanel, SMALL_SCREEN_QUERY } from "@/components/public/chat/ChatWidget";
 import { ProposalCard } from "@/components/public/chat/ProposalCard";
 import type { ChatProposal, ChatReply } from "@/lib/api/types";
-import { chatReducer, FALLBACK_REPLIES, initialChat, readStoredSession, SESSION_KEY, storeSession, validMessage } from "@/lib/chat";
+import {
+  BOOKED_KEY,
+  chatReducer,
+  CONFIRM_ERRORS,
+  CONVERSATION_LIMIT,
+  FALLBACK_REPLIES,
+  initialChat,
+  NEW_CHAT,
+  readStoredBooking,
+  readStoredSession,
+  SESSION_KEY,
+  storeSession,
+  validMessage,
+} from "@/lib/chat";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }) }));
 
@@ -64,6 +77,46 @@ describe("chat reducer", () => {
     expect(later.booking?.reference).toBe("ABCD2345");
   });
 
+  it("puts a stored booked card back after a reload, where it was", () => {
+    const booking = { reference: "ABCD2345", status: "confirmed" as const, starts_at: "x", doctor_name: "d", service_name: "s" };
+    const transcript = {
+      messages: [
+        { role: "assistant" as const, text: "Hello" },
+        { role: "user" as const, text: "A check-up" },
+        { role: "assistant" as const, text: "10:30?" },
+        { role: "user" as const, text: "Thanks" },
+        { role: "assistant" as const, text: "Anything else?" },
+      ],
+      proposal: null,
+      quick_replies: [],
+    };
+    const restored = chatReducer(initialChat, {
+      type: "restored",
+      sessionId: SESSION,
+      transcript,
+      booked: { sessionId: SESSION, proposal: proposal(), booking, after: 3 },
+    });
+    expect(restored).toMatchObject({ proposalState: "booked", booking });
+    expect(restored.lines.map((l) => l.text)).toEqual(["Hello", "A check-up", "10:30?", "Booking reference ABCD2345", "Thanks", "Anything else?"]);
+    expect(restored.proposalAfter).toBe(restored.lines[2]!.id);
+    // Another session's booking is ignored.
+    const other = chatReducer(initialChat, {
+      type: "restored",
+      sessionId: "sess_other_0123456789",
+      transcript,
+      booked: { sessionId: SESSION, proposal: proposal(), booking, after: 3 },
+    });
+    expect(other.proposalState).toBeNull();
+  });
+
+  it("ends a conversation at the turn limit without offering a retry", () => {
+    const sent = chatReducer(started, { type: "send", text: "More?" });
+    const limited = chatReducer(sent, { type: "replyFailed", message: CONVERSATION_LIMIT, final: true });
+    expect(limited).toMatchObject({ pending: null, error: CONVERSATION_LIMIT });
+    expect(limited.quickReplies).toEqual([NEW_CHAT, ...FALLBACK_REPLIES]);
+    expect(chatReducer(limited, { type: "reset" })).toBe(initialChat);
+  });
+
   it("falls back to options that work without the assistant", () => {
     expect(chatReducer(initialChat, { type: "startFailed", message: "x" }).quickReplies).toEqual(FALLBACK_REPLIES);
   });
@@ -108,17 +161,23 @@ describe("proposal card", () => {
 
     await user.clear(screen.getByLabelText("Mobile number"));
     await user.type(screen.getByLabelText("Mobile number"), "+91 98765 43210");
+    await user.click(screen.getByRole("checkbox"));
     await user.click(screen.getByRole("button", { name: "Confirm booking" }));
-    expect(onConfirm).toHaveBeenCalledWith({ name: "Ananya Krishnan", phone: "+919876543210", consent_contact: false });
+    expect(onConfirm).toHaveBeenCalledWith({ name: "Ananya Krishnan", phone: "+919876543210", consent_contact: true });
   });
 
-  it("passes consent only when ticked", async () => {
+  it("requires consent to contact before booking", async () => {
     const user = userEvent.setup();
     const onConfirm = vi.fn();
     render(<ProposalCard proposal={proposal()} state="open" error={null} booking={null} timeZone={IST} onConfirm={onConfirm} onChange={vi.fn()} />);
     await user.type(screen.getByLabelText("Patient name"), "Ananya Krishnan");
     await user.type(screen.getByLabelText("Mobile number"), "9876543210");
-    await user.click(screen.getByRole("checkbox"));
+    await user.click(screen.getByRole("button", { name: "Confirm booking" }));
+    expect(onConfirm).not.toHaveBeenCalled();
+    const box = screen.getByRole("checkbox");
+    expect(box).toHaveAttribute("aria-invalid", "true");
+    expect(box).toHaveAccessibleDescription(/Tick this to book/);
+    await user.click(box);
     await user.click(screen.getByRole("button", { name: "Confirm booking" }));
     expect(onConfirm).toHaveBeenCalledWith(expect.objectContaining({ consent_contact: true }));
   });
@@ -190,14 +249,87 @@ describe("chat panel flow", () => {
 
     await user.type(within(card).getByLabelText("Patient name"), "Ananya Krishnan");
     await user.type(within(card).getByLabelText("Mobile number"), "9876543210");
+    await user.click(within(card).getByRole("checkbox"));
     await user.click(within(card).getByRole("button", { name: "Confirm booking" }));
 
     expect(await screen.findByText("You're booked")).toBeInTheDocument();
     const confirm = calls.find((c) => c.url.endsWith("/confirm"))!;
     expect(confirm.url).toBe(`/api/chat/sessions/${SESSION}/proposals/p1/confirm`);
-    expect(body(confirm)).toEqual({ name: "Ananya Krishnan", phone: "+919876543210", consent_contact: false });
+    expect(body(confirm)).toEqual({ name: "Ananya Krishnan", phone: "+919876543210", consent_contact: true });
     expect((confirm.init.headers as Record<string, string>)["Idempotency-Key"]).toMatch(/^chat-/);
     expect(screen.getAllByText("K7M2Q9XA").length).toBeGreaterThan(0);
+    expect(readStoredBooking(SESSION)?.booking.reference).toBe("K7M2Q9XA");
+  });
+
+  it("shows the booked card again after a reload, though the server hides the booking note", async () => {
+    window.sessionStorage.setItem(SESSION_KEY, SESSION);
+    window.sessionStorage.setItem(
+      BOOKED_KEY,
+      JSON.stringify({
+        sessionId: SESSION,
+        proposal: proposal(),
+        booking: { reference: "K7M2Q9XA", status: "pending_sync", starts_at: "2026-11-03T05:00:00Z", doctor_name: "Dr. Kavya Iyer", service_name: "Check-up and cleaning" },
+        after: 3,
+      }),
+    );
+    handlers.push((c) =>
+      c.url === `/api/chat/sessions/${SESSION}`
+        ? json({
+            messages: [
+              { role: "assistant", text: "Hello" },
+              { role: "user", text: "A check-up please" },
+              { role: "assistant", text: "How about 10:30?" },
+            ],
+            proposal: null,
+            quick_replies: ["Opening hours"],
+          })
+        : undefined,
+    );
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    const booked = await screen.findByRole("region", { name: "Booking" });
+    expect(within(booked).getByText("Booking received")).toBeInTheDocument();
+    expect(within(booked).getByText("K7M2Q9XA")).toBeInTheDocument();
+    expect(screen.getByText("How about 10:30?").compareDocumentPosition(booked) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("explains a refused confirm by its code and keeps the card for consent", async () => {
+    const user = userEvent.setup();
+    handlers.push((c) => (c.url === "/api/chat/sessions" ? json({ session_id: SESSION, greeting: "Hi", quick_replies: ["Book"] }, 201) : undefined));
+    handlers.push((c) => (c.url.endsWith("/messages") ? json(reply("How about 10:30?", proposal())) : undefined));
+    handlers.push((c) =>
+      c.url.endsWith("/confirm") ? json({ error: { code: "consent_required", message: "consent_contact must be true" } }, 422) : undefined,
+    );
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    await user.click(await screen.findByRole("button", { name: "Book" }));
+    const card = await screen.findByRole("region", { name: "Suggested time" });
+    await user.type(within(card).getByLabelText("Patient name"), "Ananya Krishnan");
+    await user.type(within(card).getByLabelText("Mobile number"), "9876543210");
+    await user.click(within(card).getByRole("checkbox"));
+    await user.click(within(card).getByRole("button", { name: "Confirm booking" }));
+    expect(await screen.findByText(CONFIRM_ERRORS.consent_required!)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Confirm booking" })).toBeEnabled();
+  });
+
+  it("offers a new chat once the conversation reaches its limit", async () => {
+    const user = userEvent.setup();
+    let created = 0;
+    handlers.push((c) => {
+      if (c.url !== "/api/chat/sessions") return undefined;
+      created++;
+      return json({ session_id: created === 1 ? SESSION : "sess_fresh_0123456789", greeting: `Hello ${created}`, quick_replies: [] }, 201);
+    });
+    handlers.push((c) =>
+      c.url.endsWith("/messages") ? json({ error: { code: "conversation_limit", message: "Too many turns" } }, 409) : undefined,
+    );
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    expect(await screen.findByText("Hello 1")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Message"), "One more thing{Enter}");
+    expect(await screen.findByText(CONVERSATION_LIMIT)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Try again/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: NEW_CHAT }));
+    expect(await screen.findByText("Hello 2")).toBeInTheDocument();
+    expect(screen.queryByText("One more thing")).not.toBeInTheDocument();
+    expect(window.sessionStorage.getItem(SESSION_KEY)).toBe("sess_fresh_0123456789");
   });
 
   it("shows a lost slot as expired and lets the patient ask again", async () => {
@@ -212,8 +344,9 @@ describe("chat panel flow", () => {
     const card = await screen.findByRole("region", { name: "Suggested time" });
     await user.type(within(card).getByLabelText("Patient name"), "Ananya Krishnan");
     await user.type(within(card).getByLabelText("Mobile number"), "9876543210");
+    await user.click(within(card).getByRole("checkbox"));
     await user.click(within(card).getByRole("button", { name: "Confirm booking" }));
-    expect(await screen.findByText("That time was just taken.")).toBeInTheDocument();
+    expect(await screen.findByText(CONFIRM_ERRORS.slot_unavailable!)).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Confirm booking" })).not.toBeInTheDocument();
   });
 
@@ -300,6 +433,7 @@ describe("chat panel flow", () => {
     expect(screen.getByRole("button", { name: "Show a later time" })).toBeInTheDocument();
     await user.type(within(card).getByLabelText("Patient name"), "Ananya Krishnan");
     await user.type(within(card).getByLabelText("Mobile number"), "9876543210");
+    await user.click(within(card).getByRole("checkbox"));
     await user.click(within(card).getByRole("button", { name: "Confirm booking" }));
     expect(await screen.findByText("You're booked")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Show a later time" })).not.toBeInTheDocument();

@@ -8,12 +8,18 @@ import { api, ApiError, errorMessage, newIdempotencyKey } from "@/lib/api/client
 import type { BookingResult, ChatReply, ChatSessionCreated, ChatTranscript } from "@/lib/api/types";
 import {
   chatReducer,
+  CONFIRM_ERRORS,
+  CONVERSATION_LIMIT,
   FALLBACK_REPLIES,
   initialChat,
   MAX_MESSAGE,
+  NEW_CHAT,
+  readStoredBooking,
   readStoredSession,
+  storeBooking,
   storeSession,
   validMessage,
+  visibleCount,
   type ChatLine,
 } from "@/lib/chat";
 import { cx } from "@/lib/cx";
@@ -116,7 +122,7 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
       dispatch({ type: "starting" });
       try {
         const transcript = await api<ChatTranscript>(`/api/chat/sessions/${encodeURIComponent(stored)}`);
-        dispatch({ type: "restored", sessionId: stored, transcript });
+        dispatch({ type: "restored", sessionId: stored, transcript, booked: readStoredBooking(stored) });
       } catch (error) {
         if (error instanceof ApiError && error.status === 404) {
           storeSession(null);
@@ -192,6 +198,10 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
         const fresh = await startSession();
         if (fresh) return send(message, true);
       }
+      if (error instanceof ApiError && error.code === "conversation_limit") {
+        dispatch({ type: "replyFailed", message: CONVERSATION_LIMIT, final: true });
+        return;
+      }
       dispatch({
         type: "replyFailed",
         message:
@@ -203,6 +213,13 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   }
 
   function onQuickReply(text: string) {
+    if (text === NEW_CHAT) {
+      storeSession(null);
+      sessionRef.current = null;
+      dispatch({ type: "reset" });
+      void startSession();
+      return;
+    }
     if (FALLBACK_REPLIES.includes(text)) {
       if (text === "Book online") router.push("/book");
       else if (text === "Request a call back") router.push("/callback");
@@ -217,23 +234,26 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
     const id = sessionRef.current;
     if (!proposal || !id) return;
     dispatch({ type: "confirming" });
-    let key = confirmKey.current.get(proposal.id);
+    // One key per proposal and details: a retry of the same request replays it, while edited
+    // details are a new request (the API answers idempotency_conflict to a reused key).
+    const slot = `${proposal.id}\n${details.name}\n${details.phone}\n${details.consent_contact}`;
+    let key = confirmKey.current.get(slot);
     if (!key) {
       key = newIdempotencyKey("chat");
-      confirmKey.current.set(proposal.id, key);
+      confirmKey.current.set(slot, key);
     }
+    const after = visibleCount(state.lines);
     try {
       const result = await api<BookingResult>(
         `/api/chat/sessions/${encodeURIComponent(id)}/proposals/${encodeURIComponent(proposal.id)}/confirm`,
         { method: "POST", body: details, idempotencyKey: key },
       );
+      storeBooking({ sessionId: id, proposal, booking: result, after });
       dispatch({ type: "confirmed", result });
     } catch (error) {
-      dispatch({
-        type: "confirmFailed",
-        message: errorMessage(error),
-        code: error instanceof ApiError ? error.code : "request_failed",
-      });
+      const code = error instanceof ApiError ? error.code : "request_failed";
+      if (code === "idempotency_conflict") confirmKey.current.delete(slot);
+      dispatch({ type: "confirmFailed", message: CONFIRM_ERRORS[code] ?? errorMessage(error), code });
     }
   }
 
