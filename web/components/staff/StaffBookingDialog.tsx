@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import { api, errorMessage, newIdempotencyKey } from "@/lib/api/client";
 import type { BookingResult, PublicDoctor, PublicService } from "@/lib/api/types";
@@ -49,9 +49,13 @@ export function StaffBookingDialog({
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<BookingResult | null>(null);
   const [key, setKey] = useState("");
+  // The form resets for a new draft only: a calendar refresh after booking hands in new doctor
+  // and service lists, and must not wipe the confirmation or what is being typed.
+  const shownDraft = useRef<BookingDraft | null>(null);
 
   useEffect(() => {
-    if (!draft) return;
+    if (!draft || draft === shownDraft.current) return;
+    shownDraft.current = draft;
     setDoctorId(draft.doctorId);
     setDate(draft.date);
     setMinute(draft.minute);

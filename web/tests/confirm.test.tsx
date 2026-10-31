@@ -82,6 +82,8 @@ describe("calendar booking defaults", () => {
     // At 10:05 IST the first start is 10:15.
     expect(firstFreeMinute("2026-11-02", "d2", zone, window, [], [], Date.parse("2026-11-02T04:35:00Z"))).toBe(10 * 60 + 15);
     expect(firstFreeMinute("2026-11-02", "d2", zone, window, [], [], Date.parse("2026-11-03T00:00:00Z"))).toBeNull();
+    // A grid stretched to midnight by an all-day block still starts bookings at 7 am.
+    expect(firstFreeMinute("2026-11-02", "d2", zone, { start: 0, end: 24 * 60 }, [], [], null)).toBe(7 * 60);
   });
 
   it("says when the next patient is due", () => {

@@ -47,6 +47,9 @@ import { AppointmentBlock } from "./AppointmentBlock";
 const HOUR_PX = 72;
 const PX = HOUR_PX / 60;
 const ALL = "all";
+/** The staff booking dialog offers start times from 7 am to 9 pm. */
+const BOOKING_START = 7 * 60;
+const BOOKING_END = 21 * 60;
 
 type View = "day" | "week";
 
@@ -81,7 +84,10 @@ export function firstFreeMinute(
 ): number | null {
   const active = appointments.filter((a) => a.doctor_id === doctorId && a.status !== "cancelled");
   const blocked = exceptionsFor(exceptions, doctorId);
-  for (let minute = window.start; minute < window.end; minute += SLOT_MINUTES) {
+  // Within the booking dialog's time list (7 am to 9 pm), even when the grid shows more.
+  const from = Math.max(window.start, BOOKING_START);
+  const to = Math.min(window.end, BOOKING_END);
+  for (let minute = from; minute < to; minute += SLOT_MINUTES) {
     if (now !== null && Date.parse(zonedToIso(`${day}T${hhmm(minute)}`, timeZone)) < now) continue;
     if (isCovered(minute, day, timeZone, active) || isCovered(minute, day, timeZone, blocked)) continue;
     return minute;
@@ -386,7 +392,9 @@ export function CalendarPage() {
   const doctors: CalendarDoctor[] = useMemo(() => data?.doctors ?? [], [data]);
   const appointments = useMemo(() => data?.appointments ?? [], [data]);
   const exceptions = useMemo(() => data?.exceptions ?? [], [data]);
-  const window = useMemo(() => visibleWindow([...appointments, ...exceptions.filter((e) => e.kind !== "holiday")], days, zone), [appointments, exceptions, days, zone]);
+  // Only appointments widen the grid; blocked time (all-day leave, holidays) is clipped to it,
+  // so one dentist's day off doesn't stretch everyone's diary to midnight.
+  const window = useMemo(() => visibleWindow(appointments, days, zone), [appointments, days, zone]);
 
   const holiday = exceptions.find((e) => e.doctor_id === null && e.kind === "holiday" && days.some((d) => clipToDay(e, d, zone)));
   const knownFocus = focusDoctor === ALL || doctors.some((d) => d.id === focusDoctor) ? focusDoctor : null;
@@ -413,15 +421,32 @@ export function CalendarPage() {
       ? formatDayKey(day, "long")
       : `${formatDayKey(days[0]!, "short")} – ${formatDayKey(days[6]!, "short")}`;
   const canBook = canWrite && !!catalog.publicDoctors && !!catalog.publicServices;
-  const bookableDoctors = (catalog.publicDoctors ?? []).filter((d) => doctors.some((c) => c.id === d.id));
+  // Memoised: the booking dialog resets its form whenever its doctors or services change.
+  const bookableDoctors = useMemo(() => (catalog.publicDoctors ?? []).filter((d) => doctors.some((c) => c.id === d.id)), [catalog.publicDoctors, doctors]);
   const isBookable = (doctorId: string | null): doctorId is string => !!doctorId && bookableDoctors.some((d) => d.id === doctorId);
 
-  /** Open the booking dialog (with its dentist, date and time pickers) at the first free slot. */
+  /**
+   * Open the booking dialog (with its dentist, date and time pickers) at a given slot, or at
+   * the first free slot from `targetDay` on: a past or full day moves on to the next one.
+   */
   function book(targetDay: string, doctorId: string | null, minute?: number) {
     const doctor = isBookable(doctorId) ? doctorId : bookableDoctors[0]?.id;
     if (!doctor) return;
-    const free = minute ?? firstFreeMinute(targetDay, doctor, zone, window, appointments, exceptions, now) ?? window.start + 60;
-    setDraft({ doctorId: doctor, date: targetDay, minute: free });
+    if (minute !== undefined) {
+      setDraft({ doctorId: doctor, date: targetDay, minute });
+      return;
+    }
+    const today = todayKey(zone);
+    const start = targetDay < today ? today : targetDay;
+    for (let i = 0; i < 14; i++) {
+      const date = addDays(start, i);
+      const free = firstFreeMinute(date, doctor, zone, window, appointments, exceptions, now);
+      if (free !== null) {
+        setDraft({ doctorId: doctor, date, minute: free });
+        return;
+      }
+    }
+    setDraft({ doctorId: doctor, date: start, minute: Math.max(window.start, BOOKING_START) });
   }
 
   function addBooking() {
