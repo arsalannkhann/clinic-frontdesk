@@ -2,7 +2,7 @@
 
 import { Plus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import useSWR from "swr";
+import useSWR, { useSWRConfig } from "swr";
 
 import { api, errorMessage, withQuery } from "@/lib/api/client";
 import type {
@@ -97,6 +97,7 @@ function toForm(clinic: ClinicConfig): ClinicForm {
 function ClinicSettings() {
   const { canWrite, isOwner } = useStaff();
   const toast = useToast();
+  const { mutate } = useSWRConfig();
   const clinic = useSWR<ClinicConfig>("/api/admin/clinic");
   const [form, setForm] = useState<ClinicForm | null>(null);
   const [saving, setSaving] = useState(false);
@@ -134,6 +135,8 @@ function ClinicSettings() {
     try {
       const updated = await api<ClinicConfig>("/api/admin/clinic", { method: "PATCH", body: changes });
       await clinic.mutate(updated, { revalidate: false });
+      // Outbound readiness depends on outbound_enabled; refresh the panel and Call-backs.
+      if ("outbound_enabled" in changes) void mutate("/api/staff/outbound-status");
       toast.show("Clinic settings saved.");
     } catch (err) {
       setError(errorMessage(err));
