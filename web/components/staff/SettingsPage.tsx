@@ -9,7 +9,7 @@ import type {
   AdminDoctor,
   AdminService,
   ClinicConfig,
-  ClinicProfile,
+  OutboundStatus,
   ExceptionCreated,
   HoursWindow,
   ScheduleException,
@@ -59,22 +59,51 @@ export function SettingsPage() {
 /* ---------- clinic ---------- */
 
 type ClinicForm = Omit<ClinicConfig, "id" | "timezone">;
-const OWNER_ONLY: (keyof ClinicForm)[] = ["scripts_approved", "test_calls_enabled", "include_reference_in_messages"];
+const OWNER_ONLY: (keyof ClinicForm)[] = ["outbound_enabled", "scripts_approved", "test_calls_enabled", "include_reference_in_messages"];
+
+/** The public profile, edited through GET/PATCH admin/clinic and shown on the website. */
+const PROFILE_TEXT = ["tagline", "address", "map_url", "phone_display", "email", "hours_note", "about", "voice_number"] as const;
+type ProfileText = (typeof PROFILE_TEXT)[number];
+const PROFILE_KEYS: (keyof ClinicForm)[] = [...PROFILE_TEXT, "chat_enabled"];
+
+/** Empty text and a missing value are the same thing; a cleared field is sent as null. */
+function normalise(key: keyof ClinicForm, value: unknown): unknown {
+  if ((PROFILE_TEXT as readonly string[]).includes(key)) {
+    const text = typeof value === "string" ? value.trim() : "";
+    return text === "" ? null : text;
+  }
+  return value;
+}
+
+/** The PATCH body: changed fields only, leaving out owner-only fields for everyone else. */
+export function clinicChanges(form: ClinicForm, original: ClinicConfig, isOwner: boolean): Partial<ClinicForm> {
+  const changes: Record<string, unknown> = {};
+  for (const key of Object.keys(form) as (keyof ClinicForm)[]) {
+    if (!isOwner && OWNER_ONLY.includes(key)) continue;
+    const next = normalise(key, form[key]);
+    if (next !== normalise(key, original[key])) changes[key] = next;
+  }
+  return changes as Partial<ClinicForm>;
+}
+
+function toForm(clinic: ClinicConfig): ClinicForm {
+  const { id: _id, timezone: _tz, ...rest } = clinic;
+  const form: ClinicForm = { ...rest };
+  for (const key of PROFILE_TEXT) form[key] = rest[key] ?? "";
+  if (form.chat_enabled === undefined && "chat_enabled" in clinic) form.chat_enabled = false;
+  return form;
+}
 
 function ClinicSettings() {
   const { canWrite, isOwner } = useStaff();
   const toast = useToast();
   const clinic = useSWR<ClinicConfig>("/api/admin/clinic");
-  const profile = useSWR<ClinicProfile>("/api/public");
   const [form, setForm] = useState<ClinicForm | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (clinic.data) {
-      const { id: _id, timezone: _tz, ...rest } = clinic.data;
-      setForm(rest);
-    }
+    if (clinic.data) setForm(toForm(clinic.data));
   }, [clinic.data]);
 
   if (clinic.error) return <ErrorState message={errorMessage(clinic.error)} />;
@@ -87,18 +116,16 @@ function ClinicSettings() {
     );
   }
   const original = clinic.data;
+  // Until the API returns the profile on admin/clinic there is nothing to edit.
+  const hasProfile = PROFILE_KEYS.some((key) => key in original);
   const set = <K extends keyof ClinicForm>(key: K, value: ClinicForm[K]) => setForm((f) => (f ? { ...f, [key]: value } : f));
+  const text = (key: ProfileText) => (form[key] as string | null | undefined) ?? "";
 
   async function save(event: FormEvent) {
     event.preventDefault();
     if (!form) return;
     setError(null);
-    const changes: Partial<ClinicForm> = {};
-    for (const key of Object.keys(form) as (keyof ClinicForm)[]) {
-      if (form[key] !== original[key] && (isOwner || !OWNER_ONLY.includes(key))) {
-        (changes as Record<string, unknown>)[key] = form[key];
-      }
-    }
+    const changes = clinicChanges(form, original, isOwner);
     if (Object.keys(changes).length === 0) {
       toast.show("Nothing has changed.", "info");
       return;
@@ -116,7 +143,7 @@ function ClinicSettings() {
   }
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
+    <div className="grid items-start gap-6 xl:grid-cols-[1.4fr_1fr]">
       <form onSubmit={save} noValidate>
         <fieldset disabled={!canWrite || saving} className="flex flex-col gap-6">
           <Panel title="Booking rules">
@@ -134,12 +161,57 @@ function ClinicSettings() {
             </div>
           </Panel>
 
+          <Panel title="Clinic profile">
+            {hasProfile ? (
+              <div className="grid gap-4 p-4 sm:grid-cols-2">
+                <p className="text-sm text-ink-2 sm:col-span-2">Shown to patients on the website and used by the assistants. Leave a field empty to hide it.</p>
+                <Field label="Tagline" className="sm:col-span-2">
+                  {(p) => <Input {...p} value={text("tagline")} maxLength={160} onChange={(e) => set("tagline", e.target.value)} />}
+                </Field>
+                <Field label="Address" className="sm:col-span-2">
+                  {(p) => <Textarea {...p} rows={2} value={text("address")} maxLength={300} onChange={(e) => set("address", e.target.value)} />}
+                </Field>
+                <Field label="Map link" hint="A Google Maps or similar https link.">
+                  {(p) => <Input {...p} type="url" inputMode="url" value={text("map_url")} maxLength={500} onChange={(e) => set("map_url", e.target.value)} />}
+                </Field>
+                <Field label="Phone shown on the website">
+                  {(p) => <Input {...p} type="tel" value={text("phone_display")} maxLength={40} onChange={(e) => set("phone_display", e.target.value)} />}
+                </Field>
+                <Field label="Email">
+                  {(p) => <Input {...p} type="email" autoComplete="off" value={text("email")} maxLength={254} onChange={(e) => set("email", e.target.value)} />}
+                </Field>
+                <Field label="Receptionist line" hint="The number patients call to reach the voice assistant, in +91 format.">
+                  {(p) => <Input {...p} type="tel" value={text("voice_number")} maxLength={20} onChange={(e) => set("voice_number", e.target.value)} />}
+                </Field>
+                <Field label="Hours note" hint="For example “Sunday by appointment only”." className="sm:col-span-2">
+                  {(p) => <Input {...p} value={text("hours_note")} maxLength={200} onChange={(e) => set("hours_note", e.target.value)} />}
+                </Field>
+                <Field label="About the clinic" className="sm:col-span-2">
+                  {(p) => <Textarea {...p} rows={4} value={text("about")} maxLength={2000} onChange={(e) => set("about", e.target.value)} />}
+                </Field>
+                <Checkbox
+                  className="sm:col-span-2"
+                  label="Show the chat assistant on the website"
+                  checked={!!form.chat_enabled}
+                  onChange={(e) => set("chat_enabled", e.target.checked)}
+                />
+              </div>
+            ) : (
+              <p className="p-4 text-sm text-ink-2">The clinic&apos;s public profile can&apos;t be edited from here yet.</p>
+            )}
+          </Panel>
+
           <Panel title="Patient contact">
             <div className="flex flex-col gap-4 p-4">
               <Checkbox
                 label="Allow outbound contact (reminders and staff call-backs)"
-                description="Off by default. Nothing is sent or dialled while this is off. A caller number must also be connected before calls can be placed."
+                description={
+                  isOwner
+                    ? "Off by default. Nothing is sent or dialled while this is off. Calls also need a calling number and an outbound agent; see Outbound calling."
+                    : "Owner only. Nothing is sent or dialled while this is off."
+                }
                 checked={form.outbound_enabled}
+                disabled={!isOwner}
                 onChange={(e) => set("outbound_enabled", e.target.checked)}
               />
               <div className="grid gap-4 sm:grid-cols-2">
@@ -202,38 +274,89 @@ function ClinicSettings() {
         </fieldset>
       </form>
 
-      <Panel title="Public profile">
+      <OutboundPanel saved={original.outbound_enabled} />
+    </div>
+  );
+}
+
+/**
+ * What outbound calling needs and what is in place, from GET staff/outbound-status. Call-backs
+ * links here ("See what's needed"). The number and agent are set up by the platform; the owner
+ * then turns outbound contact on above.
+ */
+function OutboundPanel({ saved }: { saved: boolean }) {
+  const { canWrite, isOwner } = useStaff();
+  const status = useSWR<OutboundStatus>(canWrite ? "/api/staff/outbound-status" : null);
+
+  useEffect(() => {
+    if (status.data && window.location.hash === "#outbound") {
+      document.getElementById("outbound")?.scrollIntoView({ block: "start" });
+    }
+  }, [status.data]);
+
+  const data = status.data;
+  const ready = data ? data.enabled && data.has_from_number && data.has_outbound_agent : false;
+  const steps: { done: boolean; label: string; detail: string }[] = data
+    ? [
+        {
+          done: data.has_from_number,
+          label: "A calling number",
+          detail: data.has_from_number ? "Configured. Calls show this number to the patient." : "Not configured yet. The platform team connects a number for the clinic.",
+        },
+        {
+          done: data.has_outbound_agent,
+          label: "An outbound voice agent",
+          detail: data.has_outbound_agent ? "Configured." : "Not configured yet. It is set up together with the calling number.",
+        },
+        {
+          done: data.enabled,
+          label: "Outbound contact turned on",
+          detail: data.enabled
+            ? "On. Staff can place call-backs from the Call-backs page."
+            : isOwner
+              ? "Off. Turn on “Allow outbound contact” under Patient contact and save."
+              : "Off. Only the owner can turn it on.",
+        },
+      ]
+    : [];
+
+  return (
+    <div id="outbound" className="scroll-mt-20 xl:sticky xl:top-8">
+      <Panel title="Outbound calling" action={data ? <Badge tone={ready ? "ok" : "warn"}>{ready ? "Ready" : "Not ready"}</Badge> : null}>
         <div className="p-4 text-sm">
-          {profile.data ? (
-            <dl className="grid gap-3">
-              {(
-                [
-                  ["Tagline", profile.data.tagline],
-                  ["Address", profile.data.address],
-                  ["Phone shown", profile.data.phone_display],
-                  ["Receptionist line", profile.data.voice_number],
-                  ["Email", profile.data.email],
-                  ["Hours note", profile.data.hours_note],
-                ] as const
-              ).map(([label, value]) => (
-                <div key={label}>
-                  <dt className="text-ink-3">{label}</dt>
-                  <dd className="text-ink">{value ?? <span className="text-ink-3">Not set</span>}</dd>
-                </div>
-              ))}
-              <div>
-                <dt className="text-ink-3">Website chat</dt>
-                <dd>{profile.data.chat_enabled ? "On" : "Off"}</dd>
-              </div>
-            </dl>
-          ) : profile.error ? (
-            <p className="text-ink-2">The public profile couldn&apos;t be loaded.</p>
+          {!canWrite ? (
+            <p className="text-ink-2">Outbound calling is {saved ? "on" : "off"} for this clinic. Only the owner or an admin can place calls.</p>
+          ) : status.error ? (
+            <p className="text-ink-2">The outbound status couldn&apos;t be loaded. Outbound contact is {saved ? "on" : "off"} in the clinic settings.</p>
+          ) : !data ? (
+            <Loading label="Loading the outbound status">
+              <Skeleton className="h-28" />
+            </Loading>
           ) : (
-            <Skeleton className="h-40" />
+            <>
+              <p className="text-ink-2">Staff can call patients back from the clinic&apos;s number once all three are in place.</p>
+              <ol className="mt-4 flex flex-col gap-3">
+                {steps.map((step) => (
+                  <li key={step.label} className="flex gap-3">
+                    <span
+                      aria-hidden="true"
+                      className={`mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full text-xs font-bold ${step.done ? "bg-ok text-paper" : "border border-line-strong text-ink-3"}`}
+                    >
+                      {step.done ? "✓" : ""}
+                    </span>
+                    <span>
+                      <span className="block font-semibold text-ink">
+                        {step.label}
+                        <span className="sr-only">{step.done ? ": done" : ": not yet"}</span>
+                      </span>
+                      <span className="block text-ink-2">{step.detail}</span>
+                    </span>
+                  </li>
+                ))}
+              </ol>
+              <p className="mt-4 border-t border-line pt-3 text-xs text-ink-3">Nothing is dialled automatically: every call is started by a person from Call-backs, after a confirmation.</p>
+            </>
           )}
-          <p className="mt-4 border-t border-line pt-3 text-xs text-ink-3">
-            The public profile is shown on the website. Editing it here needs an admin API route that does not exist yet.
-          </p>
         </div>
       </Panel>
     </div>

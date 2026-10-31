@@ -4,7 +4,7 @@ vi.mock("next/navigation", () => ({ useRouter: () => ({}), useSearchParams: () =
 
 import { callBlockReason, outboundGap } from "@/components/staff/CallbacksPage";
 import { safeNext } from "@/components/staff/LoginForm";
-import { validateHours } from "@/components/staff/SettingsPage";
+import { clinicChanges, validateHours } from "@/components/staff/SettingsPage";
 import { canWriteRole } from "@/components/staff/StaffContext";
 
 describe("staff helpers", () => {
@@ -71,5 +71,37 @@ describe("staff helpers", () => {
     expect(validateHours([{ weekday: 1, opens: "14:00", closes: "09:00" }])).toMatch(/Tuesday: opening must be before closing/);
     expect(validateHours([{ weekday: 2, opens: "09:00", closes: "13:00" }, { weekday: 2, opens: "12:00", closes: "15:00" }])).toMatch(/Wednesday: windows overlap/);
     expect(validateHours([{ weekday: 0, opens: "", closes: "13:00" }])).toMatch(/opening and closing/);
+  });
+});
+
+describe("clinic settings", () => {
+  const original = {
+    id: "c1",
+    name: "Aster Dental",
+    timezone: "Asia/Kolkata",
+    lead_time_minutes: 60,
+    horizon_days: 30,
+    outbound_enabled: false,
+    quiet_hours_start: "21:00",
+    quiet_hours_end: "09:00",
+    reminder_lead_minutes: 1440,
+    daily_contact_budget: 50,
+    emergency_text: "",
+    handoff_text: "",
+    scripts_approved: false,
+    test_calls_enabled: false,
+    include_reference_in_messages: false,
+    tagline: "Gentle care",
+    address: null,
+    chat_enabled: true,
+  };
+  const { id: _id, timezone: _tz, ...base } = original;
+
+  it("sends changed fields only, clears empty profile text to null and keeps owner-only fields to the owner", () => {
+    const form = { ...base, tagline: "  Gentle care ", address: "", about: "", outbound_enabled: true, chat_enabled: false };
+    expect(clinicChanges(form, original, true)).toEqual({ outbound_enabled: true, chat_enabled: false });
+    expect(clinicChanges(form, original, false)).toEqual({ chat_enabled: false });
+    expect(clinicChanges({ ...base, tagline: "" }, original, false)).toEqual({ tagline: null });
+    expect(clinicChanges({ ...base, address: " 12 MG Road " }, original, false)).toEqual({ address: "12 MG Road" });
   });
 });
