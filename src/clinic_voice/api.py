@@ -296,7 +296,7 @@ async def validation_error(request, exc):
 
 # Keys the Bolna gateway, the website, the chat confirm, staff bookings and the seed derive.
 RESERVED_KEY_PREFIXES = (BOLNA_KEY_PREFIX, WEB_KEY_PREFIX, CHAT_KEY_PREFIX, "staff:", "seed:")
-REQUIRED_MIGRATION = "019_chat.sql"
+REQUIRED_MIGRATION = "020_chat_review.sql"
 
 
 @app.get("/health/live")

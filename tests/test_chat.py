@@ -747,6 +747,143 @@ def test_session_ids_are_random_128_bit(env):
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
 
 
+# --- Review fixes: one turn per session at a time (busy lease, migration 020) ---------------
+
+
+class BlockingLLM:
+    """A model whose first call waits until released, to hold a turn open."""
+
+    def __init__(self):
+        import threading
+
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def complete(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            assert self.release.wait(timeout=20)
+        return LLMReply(f"answer {self.calls}")
+
+
+def test_a_concurrent_message_is_409_turn_in_progress(env, monkeypatch):
+    import threading
+
+    session = start(env)
+    llm = BlockingLLM()
+    monkeypatch.setattr(routes_chat, "llm_for", lambda settings: llm)
+    first = {}
+    worker = threading.Thread(target=lambda: first.setdefault("r", say(env, session, "first")))
+    worker.start()
+    try:
+        assert llm.entered.wait(timeout=10)
+        busy = say(env, session, "second while busy")
+        assert_envelope(busy, 409, "turn_in_progress")
+        row = session_row(env["url"])
+        assert row["busy_until"] is not None and row["turn_count"] == 1
+    finally:
+        llm.release.set()
+        worker.join(timeout=20)
+    assert first["r"].status_code == 200 and first["r"].json()["messages"][0]["text"] == "answer 1"
+    assert session_row(env["url"])["busy_until"] is None
+    # The refused message was not stored; the next one goes through.
+    keyring = Keyring.from_setting(KEYS)
+    with connect(env["url"]) as conn:
+        texts = [
+            m["document"].get("text")
+            for m in chat.transcript(conn, keyring, CLINIC, session_row(env["url"])["id"])
+        ]
+    assert "second while busy" not in texts
+    assert say(env, session, "third").json()["messages"][0]["text"] == "answer 2"
+    assert session_row(env["url"])["turn_count"] == 2
+
+
+def test_a_stale_busy_mark_expires(env):
+    session = start(env)
+    lease = chat.turn_lease(get_settings())
+    with connect(env["url"]) as conn:
+        conn.execute("UPDATE chat_sessions SET busy_until=%s", (env["clock"]["now"] + lease,))
+    assert_envelope(say(env, session, "hello"), 409, "turn_in_progress")
+    env["clock"]["now"] += lease + timedelta(seconds=1)
+    assert say(env, session, "hello again").status_code == 200
+    assert session_row(env["url"])["busy_until"] is None
+
+
+def test_a_turn_whose_lease_was_taken_over_does_not_clear_the_new_mark(env):
+    session = start(env)
+    row = session_row(env["url"])
+    later = env["clock"]["now"] + timedelta(minutes=5)
+    with connect(env["url"]) as conn:
+        conn.execute("UPDATE chat_sessions SET busy_until=%s", (later,))
+    chat._release(env["url"], row, env["clock"]["now"] + timedelta(seconds=60))
+    assert session_row(env["url"])["busy_until"] == later
+    chat._release(env["url"], row, later)
+    assert session_row(env["url"])["busy_until"] is None
+    assert say(env, session, "ok").status_code == 200
+
+
+def test_turn_lease_covers_one_model_call(monkeypatch):
+    from clinic_voice.config import Settings
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u@localhost/x_test")
+    monkeypatch.setenv("CHAT_LLM_TIMEOUT_SECONDS", "60")
+    settings = Settings()
+    assert chat.turn_lease(settings) >= timedelta(seconds=settings.chat_llm_timeout_seconds + 20)
+    assert chat.turn_lease(settings) >= timedelta(seconds=chat.TURN_LEASE_SECONDS)
+
+
+def test_no_model_call_starts_past_the_turn_deadline(env, monkeypatch):
+    session = start(env)
+    env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply("never sent")]
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(chat.time, "monotonic", lambda: clock["t"])
+    real_run = chat.run_tool
+
+    def slow_tool(turn, name, arguments):
+        clock["t"] += 50  # The tool round used most of the lease.
+        return real_run(turn, name, arguments)
+
+    monkeypatch.setattr(chat, "run_tool", slow_tool)
+    body = say(env, session, "hello").json()
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    assert len(env["fake"].calls) == 1
+    with connect(env["url"]) as conn:
+        stored = chat.transcript(
+            conn, Keyring.from_setting(KEYS), CLINIC, session_row(env["url"])["id"]
+        )
+    _assert_every_tool_call_answered(chat._model_messages(stored))
+
+
+def test_migration_020_adds_the_proposal_service_key_and_hardening(env):
+    import re
+    from pathlib import Path
+
+    from psycopg.errors import ForeignKeyViolation
+
+    session = start(env)
+    row = session_row(env["url"])
+    with pytest.raises(ForeignKeyViolation), connect(env["url"]) as conn:
+        conn.execute(
+            """INSERT INTO chat_proposals (id,clinic_id,session_id,doctor_id,service_id,
+            starts_at,created_at,expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (uuid4(), CLINIC, row["id"], DOCTOR_ID, uuid4(), SLOT, NOW, NOW + timedelta(minutes=1)),
+        )
+    with connect(env["url"]) as conn:
+        secured = conn.execute(
+            "SELECT relrowsecurity FROM pg_class WHERE relname='callback_call_attempts'"
+        ).fetchone()
+    assert secured["relrowsecurity"] is True
+
+    def block(name):
+        text = Path(f"migrations/{name}").read_text()
+        return [b for b in re.findall(r"DO \$\$.*?\$\$;", text, re.S) if "'anon'" in b]
+
+    assert block("020_chat_review.sql") == block("018_platform.sql")
+    assert say(env, session, "still works").status_code == 200
+
+
 # --- Review fixes: history is trimmed by whole turns -----------------------------------------
 
 

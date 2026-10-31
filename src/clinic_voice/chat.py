@@ -35,6 +35,7 @@ import json
 import logging
 import re
 import secrets
+import time
 from datetime import date, datetime, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -57,6 +58,10 @@ PROPOSAL_TTL = timedelta(minutes=10)
 MAX_TOOL_ROUNDS = 4
 HISTORY_MESSAGES = 40
 MAX_SLOTS = 8
+# One turn per session at a time (send): the busy lease, at least this long, and the margin
+# kept free at its end.
+TURN_LEASE_SECONDS = 60
+TURN_LEASE_MARGIN_SECONDS = 5
 
 QUICK_REPLIES = ["Book an appointment", "Opening hours", "Request a callback"]
 FALLBACK_QUICK_REPLIES = ["Book online", "Request a callback", "Call us"]
@@ -145,7 +150,7 @@ def message_aad(clinic_id: UUID, session_id: UUID, seq: int) -> bytes:
 # --- Sessions and transcript ---------------------------------------------------------------
 
 
-SESSION_SQL = """SELECT s.id, s.clinic_id, s.status, s.turn_count, s.patient_id
+SESSION_SQL = """SELECT s.id, s.clinic_id, s.status, s.turn_count, s.patient_id, s.busy_until
     FROM chat_sessions s JOIN clinics c ON c.id = s.clinic_id
     WHERE s.token_hash=%s AND c.public_enabled AND c.public_chat_enabled"""
 
@@ -478,6 +483,8 @@ class Turn:
         self.hash_key = hash_key
         self.zone = ZoneInfo(clinic["timezone"])
         self.proposal = None
+        # time.monotonic() after which no further model call starts (send sets it).
+        self.deadline = float("inf")
 
 
 def _tool_clinic_info(turn, _args):
@@ -803,36 +810,75 @@ def send(url, settings, token, text, address, llm: ChatLLMPort | None) -> dict:
             public.client_value(address),
         )
         session = find_session(conn, token, lock=True)
+        now = service.utc_now()
+        if session["busy_until"] is not None and session["busy_until"] > now:
+            raise fail(
+                "turn_in_progress",
+                409,
+                "The assistant is still answering your previous message",
+            )
         if session["turn_count"] >= settings.chat_max_turns:
             raise fail(
                 "conversation_limit",
                 409,
                 "This conversation is full; please start a new chat or call the clinic",
             )
+        lease = turn_lease(settings)
+        busy_until = now + lease
         conn.execute(
-            "UPDATE chat_sessions SET turn_count=turn_count + 1 WHERE clinic_id=%s AND id=%s",
-            (session["clinic_id"], session["id"]),
+            "UPDATE chat_sessions SET turn_count=turn_count + 1, busy_until=%s"
+            " WHERE clinic_id=%s AND id=%s",
+            (busy_until, session["clinic_id"], session["id"]),
         )
         append(conn, keyring, session, "user", {"text": text})
         conn.commit()
         clinic = _clinic(conn, session["clinic_id"])
         conn.commit()
-    zone = ZoneInfo(clinic["timezone"])
-    turn = Turn(url, settings, clinic, session, address, keyring, hash_key)
-    if EMERGENCY.search(text):
-        reply, quick = emergency_script(clinic), EMERGENCY_QUICK_REPLIES
-        log.info("chat emergency script session=%s", session["id"])
-    elif llm is None:
-        reply, quick = fallback_text(clinic), FALLBACK_QUICK_REPLIES
-        log.warning("chat model unconfigured session=%s", session["id"])
-    else:
-        reply, quick = _converse(turn, llm)
-    _store(url, keyring, session, "assistant", {"text": reply})
+    try:
+        zone = ZoneInfo(clinic["timezone"])
+        turn = Turn(url, settings, clinic, session, address, keyring, hash_key)
+        turn.deadline = time.monotonic() + lease.total_seconds() - TURN_LEASE_MARGIN_SECONDS
+        if EMERGENCY.search(text):
+            reply, quick = emergency_script(clinic), EMERGENCY_QUICK_REPLIES
+            log.info("chat emergency script session=%s", session["id"])
+        elif llm is None:
+            reply, quick = fallback_text(clinic), FALLBACK_QUICK_REPLIES
+            log.warning("chat model unconfigured session=%s", session["id"])
+        else:
+            reply, quick = _converse(turn, llm)
+        _store(url, keyring, session, "assistant", {"text": reply})
+    finally:
+        _release(url, session, busy_until)
     result = {"messages": [{"role": "assistant", "text": reply}], "quick_replies": quick}
     if turn.proposal is not None:
         result["proposal"] = proposal_out(turn.proposal, zone)
         result["quick_replies"] = PROPOSAL_QUICK_REPLIES
     return result
+
+
+def turn_lease(settings) -> timedelta:
+    """How long a turn keeps its session busy: room for one model call (the first call of a
+    turn is always made) plus a margin, and at least TURN_LEASE_SECONDS. Later model calls
+    of the turn are only started while they fit inside the lease (_converse), so a live
+    turn never outlasts it."""
+    return timedelta(seconds=max(TURN_LEASE_SECONDS, settings.chat_llm_timeout_seconds + 20))
+
+
+def _release(url, session, busy_until) -> None:
+    """Clear the session's busy mark if it is still this turn's (compare-and-set on the
+    lease value; a turn whose lease expired and was taken over clears nothing). Best
+    effort: a failure here leaves the session busy until the lease ends."""
+    try:
+        with connect(url) as conn:
+            conn.execute(
+                "UPDATE chat_sessions SET busy_until=NULL WHERE clinic_id=%s AND id=%s"
+                " AND busy_until=%s",
+                (session["clinic_id"], session["id"], busy_until),
+            )
+    except Exception as error:
+        log.error(
+            "chat turn release failed session=%s error=%s", session["id"], type(error).__name__
+        )
 
 
 def _converse(turn, llm) -> tuple[str, list[str]]:
@@ -848,6 +894,10 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
     try:
         while True:
             tools = TOOLS if rounds < MAX_TOOL_ROUNDS else []
+            if rounds and time.monotonic() + turn.settings.chat_llm_timeout_seconds > turn.deadline:
+                # Another model call could outlast the session's busy lease.
+                log.warning("chat turn deadline reached session=%s", session["id"])
+                return fallback_text(turn.clinic), FALLBACK_QUICK_REPLIES
             if not _model_call_allowed(turn):
                 log.warning(
                     "chat model daily cap reached session=%s clinic=%s",
