@@ -129,6 +129,18 @@ def credential_active(conn, clinic_id, credential_id, scopes=("bolna", "tools"))
     )
 
 
+def active_secret_hash(conn, clinic_id, credential_id, scopes=("bolna", "tools")) -> bytes | None:
+    """The stored secret_hash of the credential when credential_active() holds, else None.
+    Verification compares it with the digest of the secret Bolna returns (never plaintext)."""
+    row = conn.execute(
+        "SELECT secret_hash FROM tenant_credentials WHERE clinic_id=%s AND id=%s"
+        " AND scope = ANY(%s)"
+        " AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
+        (clinic_id, credential_id, list(scopes)),
+    ).fetchone()
+    return None if row is None else bytes(row["secret_hash"])
+
+
 def calendar_ready(conn, clinic_id) -> bool:
     """An active calendar account, and at least one active doctor mapped to a booking
     calendar through an active account (its own, or the clinic's only active account)."""

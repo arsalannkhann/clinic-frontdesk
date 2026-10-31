@@ -42,9 +42,11 @@ Steps:
   attempt sees the assignment in the listing). Never purchases.
 - verify (number_assigned): the recorded tool credential and webhook credential must be
   active; get_agent must return the recorded id and name, every expected tool URL, (where
-  the token is readable) the recorded credential id and (where the read exposes
-  webhook_url, which GET /v2/agent does not document) the expected webhook URL naming the
-  recorded webhook credential (webhook_mismatch otherwise); the number must be routed to the
+  the token is readable) the recorded credential id with its secret (the digest of the
+  returned secret equals the stored secret_hash; credential_mismatch otherwise) and (where
+  the read exposes webhook_url, which GET /v2/agent does not document) the expected webhook
+  URL naming the recorded webhook credential, its secret compared the same way
+  (webhook_mismatch otherwise); the number must be routed to the
   agent. Any mismatch goes to manual_review (resume at the step to redo). The outcome is ok,
   or names what could not be compared: token_unchecked (masked api_token),
   webhook_unchecked (no webhook_url in the read, or webhook_credential_id NULL: a row
@@ -56,6 +58,7 @@ retryable errors retry with backoff; a dead-lettered job (retries exhausted, lea
 moves the state to manual_review in the dead-letter transaction (on_dead).
 """
 
+import hmac
 import logging
 from datetime import timedelta
 
@@ -410,8 +413,21 @@ def _agent_recorded(conn, job, row, clinic, agent_id, credential_id, webhook_id,
             attempt_webhook_credential_id=None,
         )
     if swapped is None:
+        # A concurrent bolna set-agent recorded another agent: the one just written is not
+        # the clinic's and must not keep working credentials (activate-manual refuses a row
+        # that still records them). The attempt's are revoked with the review.
         conn.rollback()
-        return _finish(conn, job, row, "manual_review", "agent", "agent_conflict")
+        return _finish(
+            conn,
+            job,
+            row,
+            "manual_review",
+            "agent",
+            "agent_conflict",
+            agent_create_pending=False if created else row["agent_create_pending"],
+            attempt_credential_id=None,
+            attempt_webhook_credential_id=None,
+        )
     # The agent now carries the new credentials: earlier provisioning credentials of both
     # labels (from attempts whose outcome was unknown, or a previous agent version) are
     # revoked.
@@ -473,16 +489,23 @@ def _verify(conn, job, port, row) -> bool:
         }
     except ValueError:
         return _finish(conn, job, row, "failed", "verify", "agent_config_invalid")
-    active = row["tool_credential_id"] is not None and service.credential_active(
-        conn, job.clinic_id, row["tool_credential_id"]
+    # The stored digests of the recorded credentials' secrets (None: inactive or absent).
+    tool_hash = (
+        None
+        if row["tool_credential_id"] is None
+        else service.active_secret_hash(conn, job.clinic_id, row["tool_credential_id"])
     )
     # NULL webhook_credential_id: provisioned before migration 017; not managed, not checked.
     managed_webhook = row["webhook_credential_id"]
-    if active and managed_webhook is not None:
-        active = service.credential_active(
+    webhook_hash = (
+        None
+        if managed_webhook is None
+        else service.active_secret_hash(
             conn, job.clinic_id, managed_webhook, (service.WEBHOOK_SCOPE,)
         )
+    )
     conn.commit()
+    active = tool_hash is not None and (managed_webhook is None or webhook_hash is not None)
     if not active:
         return _finish(
             conn,
@@ -510,11 +533,19 @@ def _verify(conn, job, port, row) -> bool:
             conn, job, row, "manual_review", "verify", "tools_mismatch", resume="calendar_connected"
         )
     # None: Bolna masked the token (only that counts as unchecked). UNREADABLE (absent or
-    # not a tool credential) fails like a different credential.
-    readable = [token_id for token_id in agent.token_credential_ids if token_id is not None]
+    # not a tool credential) fails like a different credential, and so does the recorded id
+    # with another secret (every call would 401): its digest must equal the stored hash.
+    readable = [
+        (token_id, digest)
+        for token_id, digest in zip(
+            agent.token_credential_ids, agent.token_secret_digests, strict=True
+        )
+        if token_id is not None
+    ]
     expected_credential = row["tool_credential_id"].hex
     if not agent.token_credential_ids or any(
-        token_id != expected_credential for token_id in readable
+        token_id != expected_credential or not _same_secret(digest, tool_hash)
+        for token_id, digest in readable
     ):
         return _finish(
             conn,
@@ -532,6 +563,10 @@ def _verify(conn, job, port, row) -> bool:
     if webhook_checked and (
         agent.webhook_base != agent_config.gateway_url(base) + agent_config.WEBHOOK_PATH
         or agent.webhook_credential_id not in (None, managed_webhook.hex)
+        or (
+            agent.webhook_credential_id is not None
+            and not _same_secret(agent.webhook_secret_digest, webhook_hash)
+        )
     ):
         return _finish(
             conn,
@@ -557,6 +592,11 @@ def _verify(conn, job, port, row) -> bool:
         (False, False): "token_and_webhook_unchecked",
     }[(token_checked, webhook_checked)]
     return _finish(conn, job, row, "verified", "verify", outcome)
+
+
+def _same_secret(digest, stored) -> bool:
+    """The digest of the secret Bolna returned equals the stored secret_hash."""
+    return digest is not None and stored is not None and hmac.compare_digest(digest, stored)
 
 
 def on_dead(conn, job):

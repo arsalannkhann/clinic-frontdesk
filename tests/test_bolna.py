@@ -23,7 +23,7 @@ from clinic_voice.api import app
 from clinic_voice.bolna import agent_config, gateway
 from clinic_voice.cli import DEMO_CLINIC_ID as CLINIC
 from clinic_voice.cli import DOCTOR_ID, SERVICE_ID
-from clinic_voice.config import get_settings
+from clinic_voice.config import Settings, get_settings
 from clinic_voice.crypto import CryptoError, Keyring, phone_hash
 from clinic_voice.db import connect
 from clinic_voice.providers.bolna import BolnaClient, Execution, FakeBolna, PhoneNumber
@@ -649,6 +649,57 @@ def test_compiler_rejects_unsafe_webhook_urls():
     ):
         with pytest.raises(ValueError):
             compiled(webhook_url=url)
+
+
+def test_compiler_rejects_a_trailing_slash_after_the_webhook_token():
+    # The token must be the last path segment: Bolna would post to a path that 404s.
+    for url in (
+        f"{GATEWAY}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}/",
+        f"{GATEWAY}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}//",
+    ):
+        with pytest.raises(ValueError):
+            compiled(webhook_url=url)
+
+
+def test_redact_removes_credentials_anywhere_by_shape():
+    """redact() replaces every credential-shaped string, wherever it sits in a URL (not
+    only as the last segment), and every tool api_token."""
+    payload = compiled(webhook_url=agent_config.webhook_url(GATEWAY, SYNTHETIC_WEBHOOK_TOKEN))
+    bolna_token = "cvb_" + "2" * 32 + "." + "C" * 43
+    config = payload["agent_config"]
+    # Not producible by the compiler; redact() must still not leak them.
+    config["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}/"
+    params = config["tasks"][0]["tools_config"]["api_tools"]["tools_params"]
+    first = next(iter(params.values()))
+    first["url"] = f"{GATEWAY}/v1/bolna/tools/{bolna_token}/check?t={SYNTHETIC_TOKEN}"
+    redacted = agent_config.redact(payload)
+    text = json.dumps(redacted)
+    for secret in (SYNTHETIC_WEBHOOK_TOKEN, SYNTHETIC_TOKEN, bolna_token, "B" * 43, "C" * 43):
+        assert secret not in text
+    assert redacted["agent_config"]["webhook_url"] == (
+        f"{GATEWAY}/v1/webhooks/bolna/{agent_config.REDACTED}/"
+    )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:pass@voice.example.test",
+        "https://user@voice.example.test",
+        "https://:pass@voice.example.test",
+        "http://user:pass@127.0.0.1:8000",
+    ],
+)
+def test_urls_with_userinfo_are_rejected(url):
+    with pytest.raises(ValueError):
+        agent_config.gateway_url(url)
+    with pytest.raises(ValueError):
+        agent_config.webhook_url(url, SYNTHETIC_WEBHOOK_TOKEN)
+    with pytest.raises(ValueError):
+        compiled(webhook_url=f"{url}/v1/webhooks/bolna/{SYNTHETIC_WEBHOOK_TOKEN}")
+    for name in ("bolna_gateway_base_url", "bolna_api_base", "google_redirect_uri"):
+        with pytest.raises(ValueError):
+            Settings(database_url="postgresql://unused/unused", **{name: url})
 
 
 def test_cli_compile_agent_prints_redacted(env, capsys, monkeypatch):

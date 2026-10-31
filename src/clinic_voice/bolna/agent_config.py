@@ -14,15 +14,21 @@ segment (ADR 0007); redact() strips that too.
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from clinic_voice.bolna.gateway import SUPPORTED_LANGUAGES
 from clinic_voice.config import LOOPBACK_HOSTS
-from clinic_voice.credentials import GATEWAY_SCOPES, parse, parse_any
+from clinic_voice.credentials import GATEWAY_SCOPES, PREFIXES, parse, parse_any
 
 REDACTED = "<redacted>"
+# Anything shaped like a tenant credential (credentials.PATTERNS, any scope), unanchored and
+# with a secret of any length, so redact() finds tokens wherever they sit in a string.
+CREDENTIAL_SHAPE = re.compile(
+    rf"(?:{'|'.join(sorted(PREFIXES.values()))})_[0-9a-f]{{32}}\.[A-Za-z0-9_-]+"
+)
 WEBHOOK_PATH = "/v1/webhooks/bolna"
 PROMPTS = Path(__file__).resolve().parents[3] / "agents" / "prompts"
 # Call-context variables rendered by Bolna into prompts and tool params (SOURCE_REVIEW).
@@ -182,11 +188,18 @@ TOOLS = (
 )
 
 
+def _no_userinfo(parts, what: str) -> None:
+    # user:pass@ would be sent to Bolna in the agent and logged with the URL by proxies.
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"{what} must not carry a username or password")
+
+
 def gateway_url(value: str) -> str:
     parts = urlsplit(value or "")
     host = (parts.hostname or "").lower()
     if parts.query or parts.fragment or not host:
         raise ValueError("gateway URL must be an absolute base URL")
+    _no_userinfo(parts, "gateway URL")
     if parts.scheme != "https" and not (parts.scheme == "http" and host in LOOPBACK_HOSTS):
         raise ValueError("gateway URL must be https (http only for localhost)")
     return value.rstrip("/")
@@ -205,6 +218,12 @@ def _checked_webhook_url(value: str) -> str:
     host = (parts.hostname or "").lower()
     if parts.query or parts.fragment or not host:
         raise ValueError("webhook URL must be an absolute URL")
+    _no_userinfo(parts, "webhook URL")
+    segment = parts.path.rpartition("/")[2]
+    if segment != REDACTED and parse(segment, "webhook") is None:
+        # The token is the last path segment (webhook_url()); nothing may follow it (no
+        # trailing slash), and only a webhook credential's shape is redact()ed by shape.
+        raise ValueError("webhook URL must end with a webhook token")
     if parts.scheme != "https" and not (parts.scheme == "http" and host in LOOPBACK_HOSTS):
         raise ValueError("webhook URL must be https (http only for localhost)")
     return value
@@ -388,18 +407,27 @@ def compile_agent(
     }
 
 
+def _redact_shapes(value):
+    if isinstance(value, str):
+        return CREDENTIAL_SHAPE.sub(REDACTED, value)
+    if isinstance(value, dict):
+        return {key: _redact_shapes(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_shapes(item) for item in value]
+    return value
+
+
 def redact(payload: dict) -> dict:
-    """A deep copy with every tool api_token and the webhook URL's token replaced."""
+    """A copy with every tool api_token replaced and every credential-shaped string (the
+    webhook URL's token, wherever it sits) redacted. The original is left intact."""
     result = copy.deepcopy(payload)
     config = result.get("agent_config", {})
-    if isinstance(config.get("webhook_url"), str):
-        config["webhook_url"] = config["webhook_url"].rsplit("/", 1)[0] + "/" + REDACTED
     for task in config.get("tasks", []):
         params = task.get("tools_config", {}).get("api_tools", {}).get("tools_params", {})
         for entry in params.values():
             if "api_token" in entry:
                 entry["api_token"] = f"Bearer {REDACTED}"
-    return result
+    return _redact_shapes(result)
 
 
 def load_clinic(conn, clinic_id) -> dict:

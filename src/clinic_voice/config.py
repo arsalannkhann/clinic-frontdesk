@@ -13,6 +13,8 @@ def _https_or_loopback(value: str | None, name: str) -> str | None:
         return None
     parts = urlsplit(value)
     host = (parts.hostname or "").lower()
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"{name} must not carry a username or password")
     if parts.scheme == "https" and host:
         return value
     if parts.scheme == "http" and host in LOOPBACK_HOSTS:
