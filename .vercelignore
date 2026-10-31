@@ -1,0 +1,16 @@
+# API project (repository root). Only pyproject.toml, index.py, vercel.json and src/ are
+# needed at runtime; the web app (web/) is its own Vercel project.
+web/
+dashboard/
+tests/
+docs/
+agents/
+migrations/
+.github/
+.claude/
+.venv/
+.env
+.env.*
+compose.yaml
+Dockerfile
+*.md
