@@ -104,7 +104,9 @@ def test_login_and_me(database, client):
     assert r.status_code == 200
     token = r.json()["token"]
     me = client.get("/v1/staff/me", headers=auth(token))
-    assert me.json() == {"id": str(user["id"]), "email": "admin.case@example.test", "role": "admin"}
+    body = me.json()
+    assert body.pop("clinic")["id"] == str(CLINIC)
+    assert body == {"id": str(user["id"]), "email": "admin.case@example.test", "role": "admin"}
     with connect(database) as conn:
         stored = conn.execute("SELECT secret_hash FROM staff_sessions").fetchone()
     assert bytes(stored["secret_hash"]) == credentials.digest(token.split(".", 1)[1])

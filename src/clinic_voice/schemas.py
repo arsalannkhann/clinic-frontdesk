@@ -185,6 +185,45 @@ class ClinicConfig(StrictModel):
     # Owner decision (T12, ADR 0008): booking reference in confirmation/reminder messages.
     # Off by default: the reference is a verification factor on inbound calls.
     include_reference_in_messages: bool
+    # Website and chat profile (P2). public_slug and public_enabled are read-only here.
+    public_slug: str | None = None
+    public_enabled: bool = False
+    public_tagline: str = ""
+    public_address: str = ""
+    public_map_url: str | None = None
+    public_phone_display: str = ""
+    public_email: str = ""
+    public_hours_note: str = ""
+    public_about: str = ""
+    public_voice_number: str | None = None
+    public_chat_enabled: bool = False
+    # Caller number of staff callback calls (owner only).
+    bolna_outbound_from_number: str | None = None
+
+
+def _profile_text(max_length: int):
+    return Annotated[
+        str,
+        BeforeValidator(_profile_plain),
+        StringConstraints(strip_whitespace=True, max_length=max_length),
+    ]
+
+
+def _profile_plain(value):
+    # Marketing copy: no control characters except line breaks and tabs.
+    if isinstance(value, str) and re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", value):
+        raise ValueError("control characters are not allowed")
+    return value
+
+
+ProfileEmail = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, max_length=254, pattern=r"^$|^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    ),
+]
+MapUrl = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^https://\S{1,492}$")]
+PublicNumber = Annotated[str, StringConstraints(pattern=r"^\+[1-9][0-9]{6,14}$")]
 
 
 class ClinicUpdate(PatchModel):
@@ -202,6 +241,16 @@ class ClinicUpdate(PatchModel):
     scripts_approved: bool | None = None  # Owner only.
     test_calls_enabled: bool | None = None  # Owner only.
     include_reference_in_messages: bool | None = None  # Owner only.
+    public_tagline: _profile_text(160) | None = None
+    public_address: _profile_text(300) | None = None
+    public_map_url: MapUrl | None = None
+    public_phone_display: _profile_text(32) | None = None
+    public_email: ProfileEmail | None = None
+    public_hours_note: _profile_text(300) | None = None
+    public_about: _profile_text(2000) | None = None
+    public_voice_number: PublicNumber | None = None
+    public_chat_enabled: bool | None = None
+    bolna_outbound_from_number: PublicNumber | None = None  # Owner only.
 
     @model_validator(mode="after")
     def _quiet_window(self):

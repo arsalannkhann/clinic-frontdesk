@@ -13,6 +13,7 @@ from psycopg import Error as DatabaseError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from clinic_voice import staff as staff_service
+from clinic_voice import staff_platform
 from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
 from clinic_voice.bolna.gateway import refuse_context, require_line
 from clinic_voice.chat import KEY_PREFIX as CHAT_KEY_PREFIX
@@ -28,6 +29,7 @@ from clinic_voice.routes_calendar import oauth_router
 from clinic_voice.routes_chat import router as chat_router
 from clinic_voice.routes_internal import router as internal_router
 from clinic_voice.routes_public import router as public_router
+from clinic_voice.routes_staff import router as staff_router
 from clinic_voice.routes_webhooks import router as webhooks_router
 from clinic_voice.schemas import (
     CONTEXT_CODES,
@@ -41,6 +43,7 @@ from clinic_voice.schemas import (
     SessionResponse,
     SlotQuery,
     SlotResponse,
+    StaffMe,
     StaffUser,
     StaffUserCreate,
     StaffUserDetail,
@@ -199,6 +202,7 @@ app.include_router(bolna_router)
 app.include_router(webhooks_router)
 app.include_router(public_router)
 app.include_router(chat_router)
+app.include_router(staff_router)
 app.include_router(internal_router)
 
 PUBLIC_PATHS = ("/v1/public/", "/v1/chat/")
@@ -378,9 +382,11 @@ def staff_logout(staff=Depends(staff_session)):
     return Response(status_code=204)
 
 
-@app.get("/v1/staff/me", response_model=StaffUser)
+@app.get("/v1/staff/me", response_model=StaffMe)
 def staff_me(staff=Depends(staff_session)):
-    return staff_service.public(staff)
+    """The signed-in staff member and their clinic {id, name, timezone, public_slug}."""
+    with database() as conn:
+        return staff_platform.me(conn, staff)
 
 
 @app.post("/v1/staff/me/password", status_code=204)
