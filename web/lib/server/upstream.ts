@@ -8,7 +8,8 @@ import { clientIp, isSameOriginWrite, readSessionToken } from "./request";
  * The BFF core: one place that talks to the FastAPI origin.
  *
  * - Only an allowlisted set of headers goes upstream: Accept, Content-Type, the client IP as
- *   `X-Forwarded-For`, an `Idempotency-Key` when valid, and for staff routes the session
+ *   `X-Client-IP` (and `X-Forwarded-For`), `X-Proxy-Secret` from the server-only
+ *   PUBLIC_PROXY_SECRET, an `Idempotency-Key` when valid, and for staff routes the session
  *   token from the httpOnly cookie as `Authorization: Bearer`. Cookies are never forwarded.
  * - Every fetch has a timeout. Network failures and timeouts become a friendly 503.
  * - Error bodies are normalised to `{"error": {"code", "message"}}`.
@@ -72,7 +73,13 @@ export async function callUpstream(
 
   const headers = new Headers({ Accept: "application/json" });
   if (request.body !== null) headers.set("Content-Type", "application/json");
-  if (request.ip) headers.set("X-Forwarded-For", request.ip);
+  if (request.ip) {
+    // Vercel rewrites X-Forwarded-For between functions, so the API reads the browser IP from
+    // X-Client-IP and trusts it only alongside the shared proxy secret.
+    headers.set("X-Client-IP", request.ip);
+    headers.set("X-Forwarded-For", request.ip);
+  }
+  if (config.proxySecret) headers.set("X-Proxy-Secret", config.proxySecret);
   if (request.token) headers.set("Authorization", `Bearer ${request.token}`);
   if (request.idempotencyKey) headers.set("Idempotency-Key", request.idempotencyKey);
 

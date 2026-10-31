@@ -24,7 +24,11 @@ export interface ServerConfig {
   chatTimeoutMs: number;
   mock: boolean;
   production: boolean;
+  /** Shared secret the API uses to trust `X-Client-IP`; null in mock mode or when unset. */
+  proxySecret: string | null;
 }
+
+const SECRET = /^[\x21-\x7e]{16,256}$/;
 
 function positiveInt(raw: string | undefined, fallback: number): number {
   const value = Number(raw);
@@ -61,7 +65,12 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   }
   const slug = env.CLINIC_SLUG?.trim() || DEFAULT_SLUG;
   if (!SLUG.test(slug)) throw new ConfigError("CLINIC_SLUG must match [a-z0-9-]{3,40}.");
+  const secret = env.PUBLIC_PROXY_SECRET?.trim() || null;
+  if (secret && !SECRET.test(secret)) {
+    throw new ConfigError("PUBLIC_PROXY_SECRET must be 16-256 printable ASCII characters without spaces.");
+  }
   return {
+    proxySecret: apiBaseUrl === null ? null : secret,
     apiBaseUrl,
     slug,
     timeoutMs: positiveInt(env.API_TIMEOUT_MS, 10_000),
