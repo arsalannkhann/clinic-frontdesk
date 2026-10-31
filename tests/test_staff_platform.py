@@ -504,6 +504,128 @@ def test_call_now_without_bolna_or_outside_the_clinic(env):
     assert env["bolna"].calls == []
 
 
+# --- Review fixes: unexpected port errors, reopen, parallel clicks ---------------------------
+
+
+class ExplodingBolna(FakeBolna):
+    """A port whose outbound call raises something that is not a ProviderError."""
+
+    def start_outbound_call(self, *args, **kwargs):
+        self.calls.append(("start_outbound_call", args))
+        raise RuntimeError("synthetic adapter bug")
+
+
+def reopen(env, headers, request_id):
+    return env["client"].post(f"/v1/staff/callbacks/{request_id}/reopen", headers=h(headers))
+
+
+def test_call_now_unexpected_error_is_unknown_never_null(env, caplog):
+    caplog.set_level(logging.INFO)
+    owner = login(env)
+    enable_outbound(env["url"])
+    request_id = callback(env["url"])
+    env["port"]["bolna"] = ExplodingBolna()
+    r = call_now(env, owner, request_id)
+    assert r.status_code == 202 and r.json() == {"status": "calling", "execution_id": None}
+    row = callback_row(env["url"], request_id)
+    assert row["status"] == "calling" and row["call_outcome"] == "unknown"
+    assert "error=RuntimeError" in caplog.text and "synthetic adapter bug" not in caplog.text
+    # Never redialled by a repeated click.
+    assert call_now(env, owner, request_id).status_code == 202
+    assert len(env["port"]["bolna"].calls) == 1
+    listed = env["client"].get("/v1/staff/callbacks", headers=h(owner)).json()
+    assert listed[0]["call_outcome"] == "unknown"
+
+
+def test_reopen_lets_staff_retry_a_placed_or_unknown_call(env):
+    owner, viewer = login(env), login(env, "viewer")
+    enable_outbound(env["url"], daily_contact_budget=2)
+    request_id = callback(env["url"])
+    assert call_now(env, owner, request_id).status_code == 202
+    first = callback_row(env["url"], request_id)
+    assert reopen(env, viewer, request_id).status_code == 403
+    r = reopen(env, owner, request_id)
+    assert r.status_code == 200 and r.json() == {"id": str(request_id), "status": "open"}
+    row = callback_row(env["url"], request_id)
+    assert row["status"] == "open" and row["call_outcome"] is None
+    assert row["call_contact_day"] is None and row["outbound_execution_id"] is None
+    with connect(env["url"]) as conn:
+        (attempt,) = conn.execute("SELECT * FROM callback_call_attempts").fetchall()
+    assert attempt["callback_request_id"] == request_id and attempt["outcome"] == "placed"
+    assert attempt["execution_id"] == first["outbound_execution_id"]
+    assert attempt["contact_day"] == NOW.date() and str(attempt["reopened_by"]) == owner["_id"]
+    assert "callback.reopened" in actions(env["url"])
+    assert len(env["bolna"].calls) == 1  # Reopening never dials.
+    # Reopening an open request changes nothing.
+    assert reopen(env, owner, request_id).json() == {"id": str(request_id), "status": "open"}
+    # A deliberate retry dials again; both calls count against today's budget of 2.
+    assert call_now(env, owner, request_id).status_code == 202
+    assert len(env["bolna"].calls) == 2
+    assert_code(call_now(env, owner, callback(env["url"])), 409, "budget_exhausted")
+    # Resolved requests cannot be reopened; unknown ones can.
+    env["client"].post(
+        f"/v1/staff/callbacks/{request_id}/resolve", json={"status": "done"}, headers=h(owner)
+    )
+    assert_code(reopen(env, owner, request_id), 409, "callback_resolved")
+    assert reopen(env, owner, uuid4()).status_code == 404
+
+
+def test_reopen_refuses_a_call_still_being_placed_until_it_is_stale(env):
+    owner = login(env)
+    enable_outbound(env["url"])
+    request_id = callback(env["url"])
+    # The state a "Call now" leaves between its commit and the provider's answer.
+    with connect(env["url"]) as conn:
+        conn.execute(
+            "UPDATE callback_requests SET status='calling', call_requested_at=%s,"
+            " call_contact_day=%s WHERE id=%s",
+            (env["clock"]["now"], NOW.date(), request_id),
+        )
+    assert_code(reopen(env, owner, request_id), 409, "call_in_progress")
+    env["clock"]["now"] += timedelta(minutes=6)
+    assert reopen(env, owner, request_id).status_code == 200
+    with connect(env["url"]) as conn:
+        outcome = conn.execute("SELECT outcome FROM callback_call_attempts").fetchone()["outcome"]
+    assert outcome == "unknown"
+
+
+def test_reopen_after_a_timeout_and_tenant_isolation(env):
+    owner = login(env)
+    enable_outbound(env["url"])
+    request_id = callback(env["url"])
+    env["bolna"].timeout_after_call = True
+    call_now(env, owner, request_id)
+    other = login(env, "owner", other_clinic(env["url"])[0])
+    assert reopen(env, other, request_id).status_code == 404
+    assert reopen(env, owner, request_id).status_code == 200
+
+
+def test_parallel_call_now_clicks_dial_once(env):
+    import threading
+
+    owner = login(env)
+    enable_outbound(env["url"])
+    request_id = callback(env["url"])
+    barrier = threading.Barrier(5)
+    responses = []
+
+    def click():
+        barrier.wait()
+        responses.append(call_now(env, owner, request_id))
+
+    threads = [threading.Thread(target=click) for _ in range(5)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    assert [r.status_code for r in responses] == [202] * 5
+    assert all(r.json()["status"] == "calling" for r in responses)
+    assert len(env["bolna"].calls) == 1
+    row = callback_row(env["url"], request_id)
+    assert row["status"] == "calling" and row["call_outcome"] == "placed"
+    assert actions(env["url"]).count("callback.call_requested") == 1
+
+
 # --- Conversations ---------------------------------------------------------------------------
 
 

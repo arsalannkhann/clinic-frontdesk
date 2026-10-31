@@ -219,13 +219,16 @@ def lock_budget_day(conn, clinic_id, day: date) -> None:
 def budget_used(conn, clinic_id, day: date, statuses, exclude=None) -> int:
     """Contacts counted against the clinic-local day's budget: reminders in `statuses`
     (except `exclude`) plus staff-placed callback calls of that day (callbacks.py), which
-    share the budget. The caller holds that day's budget lock."""
+    share the budget: a request's current call and the earlier calls of reopened requests
+    (callback_call_attempts). The caller holds that day's budget lock."""
     return conn.execute(
         """SELECT (SELECT count(*) FROM reminders WHERE clinic_id=%(clinic)s
             AND contact_day=%(day)s AND status = ANY(%(statuses)s)
             AND (%(exclude)s::uuid IS NULL OR id <> %(exclude)s::uuid))
         + (SELECT count(*) FROM callback_requests WHERE clinic_id=%(clinic)s
-            AND call_contact_day=%(day)s) AS n""",
+            AND call_contact_day=%(day)s)
+        + (SELECT count(*) FROM callback_call_attempts WHERE clinic_id=%(clinic)s
+            AND contact_day=%(day)s) AS n""",
         {"clinic": clinic_id, "day": day, "statuses": list(statuses), "exclude": exclude},
     ).fetchone()["n"]
 

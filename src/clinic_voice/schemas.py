@@ -1103,6 +1103,10 @@ class StaffCallbackOut(StrictModel):
     resolved_at: AwareDatetime | None
     execution_id: str | None
     call_requested_at: AwareDatetime | None
+    # Outcome of the current call: placed, unknown (timeout or unexpected error; the call may
+    # have been placed) or failed (the request is open again). A 'calling' request whose
+    # outcome is placed or unknown can be reopened.
+    call_outcome: str | None = None
     synthetic: bool
 
 
@@ -1119,6 +1123,11 @@ class StaffCallbackResolved(StrictModel):
     id: UUID
     status: Literal["done", "dismissed"]
     resolved_at: AwareDatetime
+
+
+class StaffCallbackReopened(StrictModel):
+    id: UUID
+    status: Literal["open"]
 
 
 class StaffOutboundStatus(StrictModel):

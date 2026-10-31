@@ -61,7 +61,10 @@ committed before that lock always suppresses the send.
 
 Staff callback calls (P2, callbacks.py) take the contact-budget lock of today, then the
 callback_requests row FOR UPDATE, then the clinic row FOR SHARE, and nothing else, so they
-fit the contact order above (budget lock before the clinic row) and share its budget.
+fit the contact order above (budget lock before the clinic row) and share its budget. A
+reopen (callbacks.reopen) takes only the callback_requests row FOR UPDATE, then inserts a
+callback_call_attempts row and clears the request's call fields in the same transaction;
+the day's budget count is unchanged by it, so it takes no budget lock.
 
 Web and chat bookings (P1/P2, public.py and chat.py) go through service.reserve, so they take
 level 1 (their channel-prefixed idempotency key), then a gate at level 1b: the clinic row FOR
