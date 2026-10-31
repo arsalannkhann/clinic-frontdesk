@@ -7,6 +7,8 @@ import "server-only";
 
 import { sessionCookieName } from "@/lib/session-cookie";
 
+import { configuredSiteOrigin, trustForwardedFor } from "./config";
+
 export { sessionCookieName };
 
 export interface CookieOptions {
@@ -49,12 +51,21 @@ export function readSessionToken(headers: Headers): string | null {
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
-/** The origin this request was addressed to, as the browser saw it. */
-export function requestOrigin(request: Request): string | null {
+/**
+ * This site's own origin for the CSRF check. `SITE_URL` wins when it is set, so nothing the
+ * client sends can change it. Without it (local development) the `Host` header is used;
+ * `X-Forwarded-Host` is never consulted, and `X-Forwarded-Proto` only when forwarded headers
+ * are trusted (Vercel).
+ */
+export function requestOrigin(request: Request, env: NodeJS.ProcessEnv = process.env): string | null {
+  const configured = configuredSiteOrigin(env);
+  if (configured) return configured;
   const url = new URL(request.url);
-  const host = request.headers.get("x-forwarded-host")?.split(",")[0]?.trim() || request.headers.get("host") || url.host;
-  const proto =
-    request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim() || url.protocol.replace(/:$/, "");
+  const host = request.headers.get("host") || url.host;
+  const forwardedProto = trustForwardedFor(env)
+    ? request.headers.get("x-forwarded-proto")?.split(",")[0]?.trim()
+    : undefined;
+  const proto = forwardedProto || url.protocol.replace(/:$/, "");
   if (!host || (proto !== "http" && proto !== "https")) return null;
   return `${proto}://${host}`.toLowerCase();
 }
@@ -90,11 +101,17 @@ function validIp(value: string | undefined | null): string | null {
 }
 
 /**
- * The client IP. Vercel's edge overwrites `x-forwarded-for` with the connecting client as
- * the first entry (and sets `x-real-ip`), so the first hop is the client. Anything that is
- * not an IP literal is dropped rather than forwarded.
+ * The client IP, or null when forwarded headers are not trusted (`TRUST_FORWARDED_FOR`,
+ * default on Vercel only): then no `X-Client-IP` is sent at all. Vercel sets
+ * `x-vercel-forwarded-for` itself, so it is preferred; then the first `x-forwarded-for` hop
+ * (Vercel's edge overwrites that header with the connecting client first), then `x-real-ip`.
+ * Anything that is not an IP literal is dropped rather than forwarded.
  */
-export function clientIp(headers: Headers): string | null {
-  const first = headers.get("x-forwarded-for")?.split(",")[0];
-  return validIp(first) ?? validIp(headers.get("x-real-ip"));
+export function clientIp(headers: Headers, trustForwarded: boolean): string | null {
+  if (!trustForwarded) return null;
+  return (
+    validIp(headers.get("x-vercel-forwarded-for")?.split(",")[0]) ??
+    validIp(headers.get("x-forwarded-for")?.split(",")[0]) ??
+    validIp(headers.get("x-real-ip"))
+  );
 }

@@ -4,14 +4,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { login, logout } from "@/lib/server/auth";
 import { ConfigError, readConfig } from "@/lib/server/config";
 import { normaliseError } from "@/lib/server/errors";
-import { clientIp, isSameOriginWrite, readSessionToken } from "@/lib/server/request";
-import { adminHandler, chatHandler, publicHandler, staffHandler } from "@/lib/server/routes";
-import { pickQuery, safeSegments } from "@/lib/server/upstream";
+import { clientIp, isSameOriginWrite, readSessionToken, requestOrigin } from "@/lib/server/request";
+import { ADMIN_ROUTES, adminHandler, chatHandler, publicHandler, STAFF_ROUTES, staffHandler } from "@/lib/server/routes";
+import { pickQuery, readJsonBody, readLimitedText, safeSegments } from "@/lib/server/upstream";
+import { missingProductionSettings } from "@/instrumentation";
 
 const SITE = "http://localhost:3000";
 const API = "https://api.example.test";
 const TOKEN = "tok_abcdefghijklmnop1234";
 const PROXY_SECRET = "test-proxy-secret-0123456789";
+const ID = "0b5d1c1e-7a52-4f0e-9a51-3c1a8f0d0001";
 
 type FetchCall = { url: string; init: RequestInit };
 let calls: FetchCall[];
@@ -28,6 +30,7 @@ beforeEach(() => {
   vi.stubEnv("CLINIC_SLUG", "aster-dental");
   vi.stubEnv("SITE_URL", "");
   vi.stubEnv("PUBLIC_PROXY_SECRET", PROXY_SECRET);
+  vi.stubEnv("TRUST_FORWARDED_FOR", "true");
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init: RequestInit) => {
@@ -182,14 +185,82 @@ describe("staff and admin proxy", () => {
 
   it("rejects cross-origin writes (CSRF) before calling the API", async () => {
     const response = await adminHandler(
-      request("/api/admin/appointments/a1/cancel", {
+      request(`/api/admin/appointments/${ID}/cancel`, {
         method: "POST",
         headers: { cookie: `staff_session=${TOKEN}`, origin: "https://evil.example" },
         body: "{}",
       }),
-      ctx(["appointments", "a1", "cancel"]),
+      ctx(["appointments", ID, "cancel"]),
     );
     expect(response.status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("forwards exactly the allowlisted staff and admin routes", async () => {
+    const cookie = { cookie: `staff_session=${TOKEN}` };
+    const cases: [typeof staffHandler, string, readonly { method: string; pattern: string }[]][] = [
+      [staffHandler, "staff", STAFF_ROUTES],
+      [adminHandler, "admin", ADMIN_ROUTES],
+    ];
+    let expected = 0;
+    for (const [handler, area, routes] of cases) {
+      for (const route of routes) {
+        const segments = route.pattern.split("/").map((part) => (part === "{id}" ? ID : part));
+        const path = segments.join("/");
+        const write = route.method !== "GET" && route.method !== "DELETE";
+        const response = await handler(
+          request(`/api/${area}/${path}`, { method: route.method, headers: cookie, body: write ? "{}" : undefined }),
+          ctx(segments),
+        );
+        expect(response.status, `${route.method} ${area}/${path}`).toBe(200);
+        expected += 1;
+        expect(calls[expected - 1]!.url).toBe(`${API}/v1/${area}/${path}`);
+        expect(calls[expected - 1]!.init.method).toBe(route.method);
+      }
+    }
+    expect(STAFF_ROUTES.length + ADMIN_ROUTES.length).toBe(27);
+  });
+
+  it("404s anything outside the staff and admin allowlists without calling the API", async () => {
+    const cookie = { cookie: `staff_session=${TOKEN}` };
+    const staffCases: [string, string[]][] = [
+      ["DELETE", ["me"]],
+      ["POST", ["calendar"]],
+      ["GET", ["bookings"]],
+      ["POST", ["callbacks", "not-a-uuid", "call"]],
+      ["POST", ["callbacks", ID, "delete"]],
+      ["PATCH", ["callbacks", ID]],
+      ["GET", ["conversations", ID, "export"]],
+      ["GET", ["users"]],
+      ["GET", ["bolna", "agents"]],
+      ["POST", ["logout"]],
+    ];
+    for (const [method, segments] of staffCases) {
+      const response = await staffHandler(
+        request(`/api/staff/${segments.join("/")}`, { method, headers: cookie, body: method === "GET" || method === "DELETE" ? undefined : "{}" }),
+        ctx(segments),
+      );
+      expect(response.status, `${method} staff/${segments.join("/")}`).toBe(404);
+    }
+    const adminCases: [string, string[]][] = [
+      ["DELETE", ["clinic"]],
+      ["PUT", ["clinic"]],
+      ["DELETE", ["doctors", ID]],
+      ["POST", ["doctors", ID, "hours"]],
+      ["GET", ["exceptions", ID]],
+      ["PATCH", ["exceptions", ID]],
+      ["POST", ["appointments", ID, "reschedule"]],
+      ["GET", ["credentials"]],
+      ["POST", ["users"]],
+      ["PATCH", ["services", "abc"]],
+    ];
+    for (const [method, segments] of adminCases) {
+      const response = await adminHandler(
+        request(`/api/admin/${segments.join("/")}`, { method, headers: cookie, body: method === "GET" || method === "DELETE" ? undefined : "{}" }),
+        ctx(segments),
+      );
+      expect(response.status, `${method} admin/${segments.join("/")}`).toBe(404);
+    }
     expect(calls).toHaveLength(0);
   });
 
@@ -284,6 +355,20 @@ describe("public and chat proxy", () => {
     ]);
     const other = await chatHandler(request("/api/chat/sessions/abc", { method: "POST", body: "{}" }), ctx(["sessions", "abc"]));
     expect(other.status).toBe(404);
+    expect(calls).toHaveLength(3);
+  });
+
+  it("forwards GET of a chat transcript and nothing else by GET", async () => {
+    await chatHandler(request("/api/chat/sessions/abc"), ctx(["sessions", "abc"]));
+    expect(calls.map((c) => c.url)).toEqual([`${API}/v1/chat/sessions/abc`]);
+    expect(calls[0]!.init.method).toBe("GET");
+    for (const segments of [["sessions"], ["sessions", "abc", "messages"], ["sessions", "abc", "proposals", "p1", "confirm"], ["other", "abc"]]) {
+      const response = await chatHandler(request(`/api/chat/${segments.join("/")}`), ctx(segments));
+      expect(response.status).toBe(404);
+    }
+    const deleted = await chatHandler(request("/api/chat/sessions/abc", { method: "DELETE" }), ctx(["sessions", "abc"]));
+    expect(deleted.status).toBe(404);
+    expect(calls).toHaveLength(1);
   });
 });
 
@@ -351,6 +436,20 @@ describe("errors and availability", () => {
     expect(body.error.message).not.toMatch(/psycopg/);
   });
 
+  it("never passes a 5xx envelope message through", async () => {
+    const leaked = { error: { code: "provider_error", message: "Bolna 500: key cvt_abc at 10.0.0.4" } };
+    expect(normaliseError(502, leaked)).toEqual({
+      error: { code: "provider_error", message: "A connected service is unavailable. Try again later." },
+    });
+    expect(normaliseError(500, leaked).error.message).toBe("Something went wrong on our side. Try again shortly.");
+    respond = () => json(leaked, 500);
+    const response = await publicHandler(request("/api/public/services"), ctx(["services"]));
+    expect(response.status).toBe(500);
+    expect(await response.text()).not.toMatch(/Bolna|cvt_|10\.0\.0\.4/);
+    // 4xx envelope messages are written for patients and still pass through.
+    expect(normaliseError(409, { error: { code: "slot_unavailable", message: "Taken." } }).error.message).toBe("Taken.");
+  });
+
   it("summarises validation errors by field", () => {
     const body = normaliseError(422, { detail: [{ loc: ["body", "phone"], msg: "bad" }] });
     expect(body).toEqual({ error: { code: "validation_error", message: "Some values are invalid: phone." } });
@@ -391,6 +490,45 @@ describe("errors and availability", () => {
     expect(response.status).toBe(413);
     expect(calls).toHaveLength(0);
   });
+
+  it("enforces the body limit while streaming, without a Content-Length", async () => {
+    let pulled = 0;
+    let cancelled = false;
+    const endless = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        pulled += 1;
+        controller.enqueue(new Uint8Array(4096).fill(0x61));
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const streamed = new Request(`${SITE}/api/public/bookings`, {
+      method: "POST",
+      headers: { host: "localhost:3000", origin: SITE, "content-type": "application/json" },
+      body: endless,
+      duplex: "half",
+    } as RequestInit);
+    const response = await readJsonBody(streamed);
+    expect(response).toBeInstanceOf(Response);
+    expect((response as Response).status).toBe(413);
+    expect(cancelled).toBe(true);
+    // 32 KiB in 4 KiB chunks: it stops on the first chunk past the limit.
+    expect(pulled).toBeLessThanOrEqual(10);
+  });
+
+  it("reads a body under the limit intact, including multi-byte text", async () => {
+    const encoder = new TextEncoder();
+    const parts = [encoder.encode('{"name":"Ana'), encoder.encode('ya ✓"}')];
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const part of parts) controller.enqueue(part);
+        controller.close();
+      },
+    });
+    expect(await readLimitedText(stream, 1024)).toBe('{"name":"Anaya ✓"}');
+    expect(await readLimitedText(null, 1024)).toBe("");
+  });
 });
 
 describe("request helpers", () => {
@@ -414,9 +552,36 @@ describe("request helpers", () => {
   });
 
   it("forwards only an IP literal from the first hop", () => {
-    expect(clientIp(new Headers({ "x-forwarded-for": "198.51.100.4, 10.0.0.1" }))).toBe("198.51.100.4");
-    expect(clientIp(new Headers({ "x-forwarded-for": "<script>", "x-real-ip": "2001:db8::1" }))).toBe("2001:db8::1");
-    expect(clientIp(new Headers())).toBeNull();
+    expect(clientIp(new Headers({ "x-forwarded-for": "198.51.100.4, 10.0.0.1" }), true)).toBe("198.51.100.4");
+    expect(clientIp(new Headers({ "x-forwarded-for": "<script>", "x-real-ip": "2001:db8::1" }), true)).toBe("2001:db8::1");
+    expect(clientIp(new Headers(), true)).toBeNull();
+  });
+
+  it("prefers Vercel's x-vercel-forwarded-for, then x-forwarded-for", () => {
+    const headers = new Headers({ "x-vercel-forwarded-for": "192.0.2.10", "x-forwarded-for": "198.51.100.4" });
+    expect(clientIp(headers, true)).toBe("192.0.2.10");
+    expect(clientIp(new Headers({ "x-vercel-forwarded-for": "junk", "x-forwarded-for": "198.51.100.4" }), true)).toBe("198.51.100.4");
+  });
+
+  it("reads no client IP when forwarded headers are not trusted", () => {
+    expect(clientIp(new Headers({ "x-vercel-forwarded-for": "192.0.2.10", "x-forwarded-for": "198.51.100.4", "x-real-ip": "198.51.100.5" }), false)).toBeNull();
+  });
+
+  it("compares Origin with SITE_URL when set, never with X-Forwarded-Host", () => {
+    vi.stubEnv("SITE_URL", "https://clinic.example");
+    const spoofed = new Request("https://clinic.example/api/x", {
+      method: "POST",
+      headers: { host: "clinic.example", origin: "https://evil.example", "x-forwarded-host": "evil.example", "x-forwarded-proto": "https" },
+    });
+    expect(requestOrigin(spoofed)).toBe("https://clinic.example");
+    expect(isSameOriginWrite(spoofed)).toBe(false);
+    const own = new Request("https://clinic.example/api/x", { method: "POST", headers: { host: "evil.example", origin: "https://clinic.example" } });
+    expect(isSameOriginWrite(own)).toBe(true);
+  });
+
+  it("ignores X-Forwarded-Host without SITE_URL too", () => {
+    const spoofed = post({ origin: "https://evil.example", "x-forwarded-host": "evil.example", "x-forwarded-proto": "https" });
+    expect(isSameOriginWrite(spoofed)).toBe(false);
   });
 
   it("validates path segments and queries", () => {
@@ -442,6 +607,37 @@ describe("configuration", () => {
     vi.stubEnv("NODE_ENV", "production");
     expect(() => readConfig({} as NodeJS.ProcessEnv)).toThrow(ConfigError);
     expect(() => readConfig({ API_BASE_URL: "http://api.example.test" } as unknown as NodeJS.ProcessEnv)).toThrow(/https/);
+  });
+
+  it("fails clearly in production without PUBLIC_PROXY_SECRET", () => {
+    vi.stubEnv("NODE_ENV", "production");
+    expect(() => readConfig({ API_BASE_URL: API } as unknown as NodeJS.ProcessEnv)).toThrow(/PUBLIC_PROXY_SECRET/);
+    expect(() => readConfig({ API_BASE_URL: API, PUBLIC_PROXY_SECRET: "  " } as unknown as NodeJS.ProcessEnv)).toThrow(ConfigError);
+    expect(readConfig({ API_BASE_URL: API, PUBLIC_PROXY_SECRET: PROXY_SECRET } as unknown as NodeJS.ProcessEnv).proxySecret).toBe(PROXY_SECRET);
+  });
+
+  it("refuses to start in production without API_BASE_URL or PUBLIC_PROXY_SECRET", () => {
+    const env = (values: Record<string, string>) => values as unknown as NodeJS.ProcessEnv;
+    expect(missingProductionSettings(env({ NODE_ENV: "production" }))).toEqual(["API_BASE_URL", "PUBLIC_PROXY_SECRET"]);
+    expect(missingProductionSettings(env({ NODE_ENV: "production", API_BASE_URL: API }))).toEqual(["PUBLIC_PROXY_SECRET"]);
+    expect(missingProductionSettings(env({ NODE_ENV: "production", API_BASE_URL: API, PUBLIC_PROXY_SECRET: PROXY_SECRET }))).toEqual([]);
+    expect(missingProductionSettings(env({ NODE_ENV: "development" }))).toEqual([]);
+  });
+
+  it("trusts forwarded client IPs on Vercel by default and elsewhere only when told to", () => {
+    const env = (values: Record<string, string>) => values as unknown as NodeJS.ProcessEnv;
+    expect(readConfig(env({ API_BASE_URL: API })).trustForwardedFor).toBe(false);
+    expect(readConfig(env({ API_BASE_URL: API, VERCEL: "1" })).trustForwardedFor).toBe(true);
+    expect(readConfig(env({ API_BASE_URL: API, VERCEL: "1", TRUST_FORWARDED_FOR: "false" })).trustForwardedFor).toBe(false);
+    expect(readConfig(env({ API_BASE_URL: API, TRUST_FORWARDED_FOR: "true" })).trustForwardedFor).toBe(true);
+  });
+
+  it("sends no X-Client-IP when forwarded headers are not trusted", async () => {
+    vi.stubEnv("TRUST_FORWARDED_FOR", "false");
+    await publicHandler(request("/api/public/services", { headers: { "x-forwarded-for": "203.0.113.9" } }), ctx(["services"]));
+    expect(upstreamHeaders().get("x-client-ip")).toBeNull();
+    expect(upstreamHeaders().get("x-forwarded-for")).toBeNull();
+    expect(upstreamHeaders().get("x-proxy-secret")).toBe(PROXY_SECRET);
   });
 
   it("rejects a malformed slug", () => {

@@ -68,7 +68,7 @@ export async function login(request: Request, deps: UpstreamDeps = {}): Promise<
         search: "",
         body: JSON.stringify(credentials),
         token: null,
-        ip: clientIp(request.headers),
+        ip: clientIp(request.headers, cfg.trustForwardedFor),
         idempotencyKey: null,
       },
       cfg.timeoutMs,
@@ -118,7 +118,7 @@ export async function logout(request: Request, deps: UpstreamDeps = {}): Promise
     try {
       // Revoke server-side; the cookie is cleared whatever the API answers.
       await callUpstream(
-        { method: "POST", path: "/v1/staff/logout", search: "", body: null, token, ip: clientIp(request.headers), idempotencyKey: null },
+        { method: "POST", path: "/v1/staff/logout", search: "", body: null, token, ip: clientIp(request.headers, cfg.trustForwardedFor), idempotencyKey: null },
         cfg.timeoutMs,
         { ...deps, config: cfg },
       );

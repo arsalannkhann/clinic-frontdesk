@@ -24,8 +24,10 @@ export interface ServerConfig {
   chatTimeoutMs: number;
   mock: boolean;
   production: boolean;
-  /** Shared secret the API uses to trust `X-Client-IP`; null in mock mode or when unset. */
+  /** Shared secret the API uses to trust `X-Client-IP`; null in mock mode. Required in production. */
   proxySecret: string | null;
+  /** Read the client IP from forwarded headers (default: on Vercel only). Off sends no X-Client-IP. */
+  trustForwardedFor: boolean;
 }
 
 const SECRET = /^[\x21-\x7e]{16,256}$/;
@@ -69,8 +71,14 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   if (secret && !SECRET.test(secret)) {
     throw new ConfigError("PUBLIC_PROXY_SECRET must be 16-256 printable ASCII characters without spaces.");
   }
+  if (production && !secret) {
+    throw new ConfigError(
+      "PUBLIC_PROXY_SECRET is not set. Set it to the secret the API expects in X-Proxy-Secret; it is required in production.",
+    );
+  }
   return {
     proxySecret: apiBaseUrl === null ? null : secret,
+    trustForwardedFor: trustForwardedFor(env),
     apiBaseUrl,
     slug,
     timeoutMs: positiveInt(env.API_TIMEOUT_MS, 10_000),
@@ -78,6 +86,30 @@ export function readConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     mock: apiBaseUrl === null,
     production,
   };
+}
+
+/**
+ * Whether forwarded client-IP headers can be believed. Vercel's edge overwrites them, so the
+ * default is on there (the `VERCEL` env var is set) and off elsewhere, where a client could
+ * write any value. `TRUST_FORWARDED_FOR=true|false` overrides the default.
+ */
+export function trustForwardedFor(env: NodeJS.ProcessEnv = process.env): boolean {
+  const raw = env.TRUST_FORWARDED_FOR?.trim().toLowerCase();
+  if (raw === "true" || raw === "1" || raw === "yes") return true;
+  if (raw === "false" || raw === "0" || raw === "no") return false;
+  return Boolean(env.VERCEL?.trim());
+}
+
+/** The origin from `SITE_URL`, or null when it is unset or invalid. */
+export function configuredSiteOrigin(env: NodeJS.ProcessEnv = process.env): string | null {
+  const raw = env.SITE_URL?.trim();
+  if (!raw) return null;
+  try {
+    const url = new URL(raw);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.origin.toLowerCase() : null;
+  } catch {
+    return null;
+  }
 }
 
 function isLoopback(hostname: string): boolean {
