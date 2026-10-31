@@ -4,7 +4,7 @@
   "functions": {
     "index.py": {
       "maxDuration": 30,
-      "excludeFiles": "{web/**,dashboard/**,tests/**,docs/**,agents/**,migrations/**,.github/**,.claude/**}"
+      "excludeFiles": "{web/**,dashboard/**,tests/**,docs/**,agents/scenarios/**,agents/flow.yaml,agents/README.md,migrations/**,.github/**,.claude/**}"
     }
   }
 }

@@ -994,9 +994,11 @@ def test_review_keeps_held_and_possibly_held_webhook_credentials(env):
     assert active(env, hand)
 
 
-@pytest.mark.parametrize("refusal", ["provider_permanent", "agent_config_invalid"])
+@pytest.mark.parametrize(
+    "refusal", ["provider_permanent", "agent_config_invalid", "prompt_unavailable"]
+)
 def test_refused_write_gives_its_webhook_credential_up_and_keeps_the_earlier_one(
-    env, monkeypatch, refusal
+    env, monkeypatch, tmp_path, refusal
 ):
     owner = headers(env)
     connect_calendar(env)
@@ -1007,6 +1009,14 @@ def test_refused_write_gives_its_webhook_credential_up_and_keeps_the_earlier_one
     assert earlier["attempt_webhook_credential_id"] is not None
     if refusal == "provider_permanent":
         env["fake"].fail_next("create_agent", 1, ProviderPermanent)
+    elif refusal == "prompt_unavailable":
+        from clinic_voice.bolna import agent_config
+
+        # The prompt file is missing from the deployment bundle: a real FileNotFoundError.
+        original, missing = agent_config.load_prompt, tmp_path / "prompts"
+        monkeypatch.setattr(
+            agent_config, "load_prompt", lambda name="receptionist": original(name, missing)
+        )
     else:
         from clinic_voice.bolna import agent_config
 
