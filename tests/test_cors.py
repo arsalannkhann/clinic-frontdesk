@@ -1,9 +1,12 @@
 """Dashboard CORS (T11): only configured origins, only staff/admin paths, no credentials."""
 
+from contextlib import nullcontext
+
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from clinic_voice import api, staff_platform
 from clinic_voice.api import app
 from clinic_voice.config import Settings, get_settings
 from clinic_voice.deps import staff_session
@@ -157,7 +160,7 @@ def test_unhandled_error_is_still_raised_to_the_server(make_client):
         client.get("/v1/staff/me", headers={"Origin": ALLOWED})
 
 
-def test_staff_and_admin_responses_are_no_store(make_client):
+def test_staff_and_admin_responses_are_no_store(make_client, monkeypatch):
     client = make_client()  # Independent of CORS configuration.
     for path in ("/v1/staff/me", "/v1/admin/clinic", "/v1/admin/appointments"):
         r = client.get(path)
@@ -169,6 +172,21 @@ def test_staff_and_admin_responses_are_no_store(make_client):
         "email": "owner@example.test",
         "role": "owner",
     }
+    # /v1/staff/me also reads the clinic; this test runs without a database.
+    monkeypatch.setattr(
+        staff_platform,
+        "me",
+        lambda conn, staff: {
+            **{k: staff[k] for k in ("id", "email", "role")},
+            "clinic": {
+                "id": staff["clinic_id"],
+                "name": "x",
+                "timezone": "UTC",
+                "public_slug": None,
+            },
+        },
+    )
+    monkeypatch.setattr(api, "database", nullcontext)
     r = client.get("/v1/staff/me")
     assert r.status_code == 200
     assert r.headers["cache-control"] == "no-store"
