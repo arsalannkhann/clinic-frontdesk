@@ -1128,6 +1128,49 @@ def test_seeded_clinic_serves_the_public_api(empty, monkeypatch):
     assert {sid for d in doctors for sid in d["service_ids"]} == {s["id"] for s in services}
 
 
+# --- Synthetic contacts (P2 review fix A4) -----------------------------------------------
+
+
+def test_seeded_patients_are_never_contacted(empty, monkeypatch):
+    from clinic_voice import reminders
+
+    seed_platform.seed(empty, get_settings())
+    clinic_id = seed_platform.CLINIC_ID
+    with connect(empty) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM consents").fetchone()["n"] == 0
+        flags = conn.execute("SELECT DISTINCT synthetic FROM patients").fetchall()
+        assert [f["synthetic"] for f in flags] == [True]
+        callbacks = conn.execute("SELECT DISTINCT synthetic FROM callback_requests").fetchall()
+        assert [c["synthetic"] for c in callbacks] == [True]
+        conn.execute(
+            "UPDATE clinics SET outbound_enabled=true, quiet_hours_start='23:59',"
+            " quiet_hours_end='00:00', bolna_outbound_agent_id=%s WHERE id=%s",
+            (str(uuid4()), clinic_id),
+        )
+        conn.commit()
+        assert reminders.schedule_due(conn) == 0
+        # Even a patient who somehow holds consent is refused at planning and at send time.
+        row = conn.execute(
+            "SELECT id, patient_id, version FROM appointments WHERE status='confirmed'"
+            " AND starts_at > now() + interval '2 days' LIMIT 1"
+        ).fetchone()
+        patient_id = row["patient_id"]
+        conn.execute(
+            "INSERT INTO consents (id,clinic_id,patient_id,purpose,source)"
+            " SELECT gen_random_uuid(), %s, %s, p, 'staff'"
+            " FROM unnest(ARRAY['booking_confirmation','reminder_call','reminder_message']) p",
+            (clinic_id, patient_id),
+        )
+        conn.commit()
+        assert reminders.schedule_due(conn) == 0
+        assert reminders.on_confirmed(conn, clinic_id, row["id"], row["version"]) == 0
+        for channel in ("call", "message"):
+            refused = reminders.refusal(conn, clinic_id, patient_id, row["id"], "reminder", channel)
+            assert refused == "synthetic_contact"
+        assert conn.execute("SELECT count(*) AS n FROM reminders").fetchone()["n"] == 0
+        conn.rollback()
+
+
 # --- Retention (P2 review fix A2) --------------------------------------------------------
 
 

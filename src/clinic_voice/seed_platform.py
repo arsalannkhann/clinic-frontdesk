@@ -21,9 +21,11 @@ invariants as live bookings:
   ledger's busy time); the exclusion constraint still guards them. Their state is what the
   worker would have left: confirmed with the ledger event recorded and a done
   calendar.create job, or cancelled at version 2 with a done calendar.cancel job.
-Each appointment gets its own patient (patients.create_from_form) with contact consent.
-No staff user is created (an owner runs `clinic-voice staff create-owner`), and
-outbound_enabled stays off, so nothing is ever sent to the fictional numbers.
+Each appointment gets its own patient (patients.create_from_form) without contact consent.
+Seeded patients and callback requests carry the synthetic mark (migration 019), which every
+outbound path refuses (synthetic_contact), so nothing is ever sent to the fictional numbers
+even if an owner turns outbound_enabled on. No staff user is created (an owner runs
+`clinic-voice staff create-owner`), and outbound_enabled stays off.
 """
 
 import random
@@ -244,6 +246,7 @@ LAST_NAMES = [
 # channel -> consent source (migration 018)
 CHANNELS = {"voice": "voice_call", "web": "web", "chat": "chat", "staff": "staff"}
 CHANNEL_WEIGHTS = (("voice", 35), ("web", 35), ("chat", 15), ("staff", 15))
+CONTACT_PURPOSES = ("booking_confirmation", "reminder_call", "reminder_message")
 CALLBACKS = [
     ("web", "Asked about the cost of clear aligners for a teenager.", "open"),
     ("voice", "Wants to move a check-up to a Saturday.", "open"),
@@ -375,20 +378,21 @@ def _patient(conn, keyring, hash_key, person, channel, starts_at, settings):
     from clinic_voice.crypto import phone_hash
 
     name, phone = person
-    return patients.create_from_form(
+    # No contact consent: the fictional numbers may belong to real people. The synthetic
+    # mark (migration 019) makes every outbound path refuse them as well.
+    patient_id = patients.create_from_form(
         conn,
         keyring,
         CLINIC_ID,
-        patients.PatientDetails(
-            name=name,
-            consents={
-                p: True for p in ("booking_confirmation", "reminder_call", "reminder_message")
-            },
-        ),
+        patients.PatientDetails(name=name, consents={p: False for p in CONTACT_PURPOSES}),
         (phone, phone_hash(hash_key, phone)),
         starts_at + timedelta(days=settings.patient_retention_days),
         CHANNELS[channel],
     )
+    conn.execute(
+        "UPDATE patients SET synthetic=true WHERE clinic_id=%s AND id=%s", (CLINIC_ID, patient_id)
+    )
+    return patient_id
 
 
 def _doctor_services(conn) -> dict[UUID, list[UUID]]:
@@ -595,6 +599,10 @@ def _callbacks(conn, keyring, hash_key, people) -> int:
         name, phone = people.next()
         request_id, _ = store_callback(
             conn, keyring, hash_key, CLINIC_ID, name, phone, reason, source
+        )
+        conn.execute(
+            "UPDATE callback_requests SET synthetic=true WHERE clinic_id=%s AND id=%s",
+            (CLINIC_ID, request_id),
         )
         if status == "done":
             conn.execute(

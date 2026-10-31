@@ -180,12 +180,15 @@ def context(conn, clinic_id, appointment_id, lock=None):
 
 def refusal(conn, clinic_id, patient_id, appointment_id, purpose, channel) -> str | None:
     """None if this patient may be contacted about this appointment for (purpose, channel),
-    else a reason code: no_patient, no_consent or opted_out. An opt-out matches when it is
+    else a reason code: no_patient, synthetic_contact (a seeded fictional patient, migration
+    019; never contacted), no_consent or opted_out. An opt-out matches when it is
     patient-wide (staff) or for this appointment (Bolna tool)."""
     if patient_id is None:
         return "no_patient"
     row = conn.execute(
-        """SELECT EXISTS (SELECT 1 FROM consents WHERE clinic_id=%(clinic)s
+        """SELECT EXISTS (SELECT 1 FROM patients WHERE clinic_id=%(clinic)s
+            AND id=%(patient)s AND synthetic) AS synthetic,
+        EXISTS (SELECT 1 FROM consents WHERE clinic_id=%(clinic)s
             AND patient_id=%(patient)s AND purpose=%(consent)s AND revoked_at IS NULL) AS consented,
         EXISTS (SELECT 1 FROM contact_preferences WHERE clinic_id=%(clinic)s
             AND patient_id=%(patient)s AND purpose IN (%(purpose)s, 'all')
@@ -200,6 +203,8 @@ def refusal(conn, clinic_id, patient_id, appointment_id, purpose, channel) -> st
             "channel": channel,
         },
     ).fetchone()
+    if row["synthetic"]:
+        return "synthetic_contact"
     if row["opted_out"]:
         return "opted_out"
     if not row["consented"]:
@@ -212,10 +217,16 @@ def lock_budget_day(conn, clinic_id, day: date) -> None:
 
 
 def budget_used(conn, clinic_id, day: date, statuses, exclude=None) -> int:
+    """Contacts counted against the clinic-local day's budget: reminders in `statuses`
+    (except `exclude`) plus staff-placed callback calls of that day (callbacks.py), which
+    share the budget. The caller holds that day's budget lock."""
     return conn.execute(
-        "SELECT count(*) AS n FROM reminders WHERE clinic_id=%s AND contact_day=%s"
-        " AND status = ANY(%s) AND (%s::uuid IS NULL OR id <> %s::uuid)",
-        (clinic_id, day, list(statuses), exclude, exclude),
+        """SELECT (SELECT count(*) FROM reminders WHERE clinic_id=%(clinic)s
+            AND contact_day=%(day)s AND status = ANY(%(statuses)s)
+            AND (%(exclude)s::uuid IS NULL OR id <> %(exclude)s::uuid))
+        + (SELECT count(*) FROM callback_requests WHERE clinic_id=%(clinic)s
+            AND call_contact_day=%(day)s) AS n""",
+        {"clinic": clinic_id, "day": day, "statuses": list(statuses), "exclude": exclude},
     ).fetchone()["n"]
 
 
@@ -352,11 +363,22 @@ def _plannable(ctx, version=None) -> bool:
     )
 
 
+def synthetic_patient(conn, clinic_id, patient_id) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM patients WHERE clinic_id=%s AND id=%s AND synthetic",
+            (clinic_id, patient_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def on_confirmed(conn, clinic_id, appointment_id, version) -> int:
     """Plan the confirmation message and reminders of an appointment that this transaction
-    has just set confirmed (the caller holds the appointment row). Does not commit."""
+    has just set confirmed (the caller holds the appointment row). Does not commit. A
+    synthetic (seeded) patient gets no contact rows at all."""
     ctx = context(conn, clinic_id, appointment_id)
-    if not _plannable(ctx, version):
+    if not _plannable(ctx, version) or synthetic_patient(conn, clinic_id, ctx["patient_id"]):
         return 0
     lock_planning(conn, clinic_id, appointment_id)
     now = service.utc_now()
@@ -381,6 +403,8 @@ def schedule_due(conn, limit=BACKFILL_BATCH) -> int:
         """SELECT a.clinic_id, a.id FROM appointments a
         JOIN clinics c ON c.id = a.clinic_id AND c.outbound_enabled
         WHERE a.status = 'confirmed' AND a.patient_id IS NOT NULL
+        AND NOT EXISTS (SELECT 1 FROM patients s WHERE s.clinic_id = a.clinic_id
+            AND s.id = a.patient_id AND s.synthetic)
         AND a.starts_at - make_interval(mins => c.reminder_lead_minutes) >= %(now)s
         AND a.starts_at - make_interval(mins => c.reminder_lead_minutes) < %(until)s
         AND EXISTS (
