@@ -3346,7 +3346,7 @@
           "chat"
         ],
         "summary": "Get Session",
-        "description": "The visible transcript (user and assistant text), the open proposal, quick replies.",
+        "description": "The newest 100 visible messages (user and assistant text), the open proposal, quick\nreplies.",
         "operationId": "get_session_v1_chat_sessions__session_id__get",
         "parameters": [
           {
@@ -4116,6 +4116,96 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/StaffCallbackResolved"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Bad Gateway"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/staff/callbacks/{callback_id}/reopen": {
+      "post": {
+        "tags": [
+          "staff"
+        ],
+        "summary": "Reopen Callback",
+        "description": "Return a request whose call was placed or whose outcome is unknown to open, so a\nmissed call can be retried deliberately with another \"Call now\". Never dials.",
+        "operationId": "reopen_callback_v1_staff_callbacks__callback_id__reopen_post",
+        "parameters": [
+          {
+            "name": "callback_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Callback Id"
+            }
+          },
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StaffCallbackReopened"
                 }
               }
             }
@@ -8434,6 +8524,11 @@
             },
             "type": "array",
             "title": "Exceptions"
+          },
+          "truncated": {
+            "type": "boolean",
+            "title": "Truncated",
+            "default": false
           }
         },
         "additionalProperties": false,
@@ -8572,6 +8667,17 @@
             ],
             "title": "Call Requested At"
           },
+          "call_outcome": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Call Outcome"
+          },
           "synthetic": {
             "type": "boolean",
             "title": "Synthetic"
@@ -8593,6 +8699,27 @@
           "synthetic"
         ],
         "title": "StaffCallbackOut"
+      },
+      "StaffCallbackReopened": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "status": {
+            "type": "string",
+            "const": "open",
+            "title": "Status"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "id",
+          "status"
+        ],
+        "title": "StaffCallbackReopened"
       },
       "StaffCallbackResolve": {
         "properties": {
