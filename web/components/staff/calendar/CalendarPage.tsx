@@ -12,6 +12,8 @@ import {
   isCovered,
   layoutColumn,
   nowOffset,
+  safeColour,
+  SLOT_MINUTES,
   slotAt,
   visibleWindow,
   type TimeWindow,
@@ -24,6 +26,7 @@ import {
   dayKey,
   formatDayKey,
   formatTime,
+  hhmm,
   minutesLabel,
   startOfWeek,
   todayKey,
@@ -43,6 +46,7 @@ import { AppointmentBlock } from "./AppointmentBlock";
 
 const HOUR_PX = 72;
 const PX = HOUR_PX / 60;
+const ALL = "all";
 
 type View = "day" | "week";
 
@@ -61,13 +65,37 @@ function exceptionsFor(exceptions: readonly ScheduleException[], doctorId: strin
   return exceptions.filter((e) => e.doctor_id === null || doctorId === null || e.doctor_id === doctorId);
 }
 
+/**
+ * The first free 15-minute start for `doctorId` on `day`: inside the visible window, not in
+ * the past, not covered by an active appointment or blocked time. Null when the day is full.
+ * Used as the default time for "Add booking", which is the keyboard route to booking.
+ */
+export function firstFreeMinute(
+  day: string,
+  doctorId: string,
+  timeZone: string,
+  window: TimeWindow,
+  appointments: readonly CalendarAppointment[],
+  exceptions: readonly ScheduleException[],
+  now: number | null,
+): number | null {
+  const active = appointments.filter((a) => a.doctor_id === doctorId && a.status !== "cancelled");
+  const blocked = exceptionsFor(exceptions, doctorId);
+  for (let minute = window.start; minute < window.end; minute += SLOT_MINUTES) {
+    if (now !== null && Date.parse(zonedToIso(`${day}T${hhmm(minute)}`, timeZone)) < now) continue;
+    if (isCovered(minute, day, timeZone, active) || isCovered(minute, day, timeZone, blocked)) continue;
+    return minute;
+  }
+  return null;
+}
+
 function Gutter({ window }: { window: TimeWindow }) {
   return (
     <div className="relative border-r border-line" style={{ height: (window.end - window.start) * PX }} aria-hidden="true">
       {gridLines(window)
         .filter((line) => line.major)
         .map((line) => (
-          <span key={line.minute} className="absolute right-2 -translate-y-1/2 text-[0.7rem] text-ink-3 tnum" style={{ top: (line.minute - window.start) * PX }}>
+          <span key={line.minute} className="absolute right-2 -translate-y-1/2 text-xs text-ink-2 tnum" style={{ top: (line.minute - window.start) * PX }}>
             {line.minute === window.start ? "" : minutesLabel(line.minute)}
           </span>
         ))}
@@ -106,13 +134,14 @@ function Column({
   const nowTop = now === null ? null : nowOffset(now, dayKeyValue, timeZone, window);
   const past = now !== null && dayKeyValue < dayKey(now, timeZone);
 
+  // Pointer shortcut only; keyboard users book with the column's "+" button or Add booking.
   function onClick(event: MouseEvent<HTMLDivElement>) {
     if (!canBook || !onBook || past || event.target !== event.currentTarget) return;
     const rect = event.currentTarget.getBoundingClientRect();
     const minute = slotAt((event.clientY - rect.top) / PX, window);
     if (minute === null) return;
     if (isCovered(minute, dayKeyValue, timeZone, active) || isCovered(minute, dayKeyValue, timeZone, exceptions)) return;
-    if (now !== null && Date.parse(zonedToIso(`${dayKeyValue}T${String(Math.floor(minute / 60)).padStart(2, "0")}:${String(minute % 60).padStart(2, "0")}`, timeZone)) < now) return;
+    if (now !== null && Date.parse(zonedToIso(`${dayKeyValue}T${hhmm(minute)}`, timeZone)) < now) return;
     onBook(minute);
   }
 
@@ -130,7 +159,7 @@ function Column({
           className="hatch pointer-events-none absolute inset-x-0 border-y border-line-strong/60 bg-sunk/50 px-2 py-1"
           style={{ top: entry.top * PX, height: entry.height * PX }}
         >
-          <span className="text-[0.7rem] font-semibold text-ink-2">
+          <span className="text-xs font-semibold text-ink-2">
             {exceptionKind(entry.item.kind).text}
             {entry.item.label ? `: ${entry.item.label}` : ""}
           </span>
@@ -152,6 +181,47 @@ function Column({
         </div>
       ) : null}
     </div>
+  );
+}
+
+function AppointmentRow({
+  a,
+  timeZone,
+  onOpen,
+  doctor,
+  dense,
+}: {
+  a: CalendarAppointment;
+  timeZone: string;
+  onOpen: (a: CalendarAppointment) => void;
+  doctor?: CalendarDoctor;
+  dense?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(a)}
+      className={cx("flex w-full items-start gap-3 text-left hover:bg-sunk/50", dense ? "px-3 py-2" : "px-4 py-3")}
+    >
+      <span aria-hidden="true" className={cx("mt-1 w-1 shrink-0 rounded-full", dense ? "h-7" : "h-9")} style={{ background: safeColour(a.colour) }} />
+      <span className={cx("shrink-0 font-semibold tnum", dense ? "w-14 text-sm" : "w-16")}>{formatTime(a.starts_at, timeZone)}</span>
+      <span className="min-w-0 flex-1">
+        <span className={cx("block truncate font-semibold", dense && "text-sm", a.status === "cancelled" && "line-through opacity-70")}>
+          {a.patient_name ?? "Patient"}
+        </span>
+        <span className={cx("block truncate text-ink-2", dense ? "text-xs" : "text-sm")}>
+          {doctor ? (
+            <>
+              <span aria-hidden="true" className="mr-1 inline-block size-1.5 rounded-full align-middle" style={{ background: safeColour(doctor.colour) }} />
+              {doctor.name}
+            </>
+          ) : (
+            a.service_name
+          )}
+        </span>
+      </span>
+      {a.status !== "confirmed" && a.status !== "cancelled" ? <LabelBadge label={appointmentStatus(a.status)} /> : null}
+    </button>
   );
 }
 
@@ -179,17 +249,111 @@ function MobileDayList({
       ))}
       {appointments.map((a) => (
         <li key={a.id}>
-          <button type="button" onClick={() => onOpen(a)} className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-sunk/50">
-            <span aria-hidden="true" className="mt-1 h-9 w-1 shrink-0 rounded-full" style={{ background: a.colour ?? "var(--color-ink-3)" }} />
-            <span className="w-16 shrink-0 font-semibold tnum">{formatTime(a.starts_at, timeZone)}</span>
-            <span className="min-w-0 flex-1">
-              <span className={cx("block truncate font-semibold", a.status === "cancelled" && "line-through opacity-70")}>{a.patient_name ?? "Patient"}</span>
-              <span className="block truncate text-sm text-ink-2">{a.service_name}</span>
-            </span>
-            {a.status !== "confirmed" ? <LabelBadge label={appointmentStatus(a.status)} /> : null}
-          </button>
+          <AppointmentRow a={a} timeZone={timeZone} onOpen={onOpen} />
         </li>
       ))}
+    </ol>
+  );
+}
+
+/**
+ * The week as seven day cards: used for "All dentists" (where a 7-day grid with every
+ * dentist's lanes is unreadable) and for one dentist on small screens. Each card has the
+ * day's count, per-dentist counts when showing everyone, and the appointments as a list.
+ */
+function WeekList({
+  days,
+  appointments,
+  exceptions,
+  doctors,
+  showDoctors,
+  timeZone,
+  now,
+  onOpen,
+  onDay,
+  onBook,
+}: {
+  days: string[];
+  appointments: CalendarAppointment[];
+  exceptions: ScheduleException[];
+  doctors: CalendarDoctor[];
+  showDoctors: boolean;
+  timeZone: string;
+  now: number | null;
+  onOpen: (a: CalendarAppointment) => void;
+  onDay: (day: string) => void;
+  onBook?: (day: string) => void;
+}) {
+  const byId = new Map(doctors.map((d) => [d.id, d]));
+  const today = now === null ? null : dayKey(now, timeZone);
+  return (
+    <ol className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4 2xl:grid-cols-7">
+      {days.map((day) => {
+        const list = appointments
+          .filter((a) => a.status !== "cancelled" && clipToDay(a, day, timeZone))
+          .sort((x, y) => Date.parse(x.starts_at) - Date.parse(y.starts_at));
+        const blocks = exceptions.filter((e) => clipToDay(e, day, timeZone));
+        const past = today !== null && day < today;
+        return (
+          <li key={day} className={cx("flex flex-col rounded-lg border border-line bg-raised", past && "bg-sunk/35")}>
+            <div className="flex items-start justify-between gap-2 border-b border-line px-3 py-2">
+              <div>
+                <button
+                  type="button"
+                  onClick={() => onDay(day)}
+                  className={cx("rounded-sm font-semibold hover:text-accent", day === today && "text-accent")}
+                  aria-label={`${formatDayKey(day, "long")}: open the day view`}
+                >
+                  {formatDayKey(day, "short")}
+                </button>
+                <p className="text-xs text-ink-2 tnum">{list.length === 1 ? "1 appointment" : `${list.length} appointments`}</p>
+              </div>
+              {onBook && !past ? (
+                <button
+                  type="button"
+                  onClick={() => onBook(day)}
+                  className="rounded-sm p-1 text-ink-3 hover:bg-sunk hover:text-ink"
+                  aria-label={`Add a booking on ${formatDayKey(day, "long")}`}
+                >
+                  <CalendarPlus className="size-4" aria-hidden="true" />
+                </button>
+              ) : null}
+            </div>
+            {showDoctors && list.length > 0 ? (
+              <ul className="flex flex-wrap gap-x-3 gap-y-1 border-b border-line px-3 py-2 text-xs text-ink-2" aria-label="By dentist">
+                {doctors.map((d) => {
+                  const count = list.filter((a) => a.doctor_id === d.id).length;
+                  if (!count) return null;
+                  return (
+                    <li key={d.id} className="flex items-center gap-1">
+                      <span aria-hidden="true" className="size-1.5 rounded-full" style={{ background: safeColour(d.colour) }} />
+                      {d.name.replace(/^Dr\.?\s+/, "")} <span className="font-semibold text-ink tnum">{count}</span>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : null}
+            {blocks.map((e) => (
+              <p key={e.id} className="hatch border-b border-line px-3 py-2 text-xs">
+                <span className="font-semibold">{exceptionKind(e.kind).text}</span>
+                {e.label ? `: ${e.label}` : ""}
+                {e.doctor_id && showDoctors ? ` · ${byId.get(e.doctor_id)?.name ?? ""}` : ""}
+              </p>
+            ))}
+            {list.length === 0 ? (
+              <p className="px-3 py-4 text-sm text-ink-3">Nothing booked.</p>
+            ) : (
+              <ol className="divide-y divide-line">
+                {list.map((a) => (
+                  <li key={a.id}>
+                    <AppointmentRow a={a} timeZone={timeZone} onOpen={onOpen} doctor={showDoctors ? byId.get(a.doctor_id) : undefined} dense />
+                  </li>
+                ))}
+              </ol>
+            )}
+          </li>
+        );
+      })}
     </ol>
   );
 }
@@ -199,8 +363,8 @@ export function CalendarPage() {
   const catalog = useCatalog();
   const [view, setView] = useState<View>("day");
   const [day, setDay] = useState<string | null>(null);
-  const [mobileDoctor, setMobileDoctor] = useState<string | null>(null);
-  const [weekDoctor, setWeekDoctor] = useState<string>("all");
+  /** The dentist shown on the phone day list and in the week view; "all" is week-only. */
+  const [focusDoctor, setFocusDoctor] = useState<string | null>(null);
   const [open, setOpen] = useState<CalendarAppointment | null>(null);
   const [draft, setDraft] = useState<BookingDraft | null>(null);
   const now = useNow();
@@ -225,7 +389,10 @@ export function CalendarPage() {
   const window = useMemo(() => visibleWindow([...appointments, ...exceptions.filter((e) => e.kind !== "holiday")], days, zone), [appointments, exceptions, days, zone]);
 
   const holiday = exceptions.find((e) => e.doctor_id === null && e.kind === "holiday" && days.some((d) => clipToDay(e, d, zone)));
-  const selectedMobileDoctor = mobileDoctor ?? doctors[0]?.id ?? null;
+  const knownFocus = focusDoctor === ALL || doctors.some((d) => d.id === focusDoctor) ? focusDoctor : null;
+  // Week view defaults to one dentist: a seven-day grid of every dentist's lanes is unreadable.
+  const weekDoctor = knownFocus ?? doctors[0]?.id ?? ALL;
+  const dayDoctor = knownFocus && knownFocus !== ALL ? knownFocus : (doctors[0]?.id ?? null);
   const doctorNames = useMemo(() => new Map(doctors.map((d) => [d.id, d.name])), [doctors]);
 
   const drawerAppointment: DrawerAppointment | null = open
@@ -247,12 +414,52 @@ export function CalendarPage() {
       : `${formatDayKey(days[0]!, "short")} – ${formatDayKey(days[6]!, "short")}`;
   const canBook = canWrite && !!catalog.publicDoctors && !!catalog.publicServices;
   const bookableDoctors = (catalog.publicDoctors ?? []).filter((d) => doctors.some((c) => c.id === d.id));
+  const isBookable = (doctorId: string | null): doctorId is string => !!doctorId && bookableDoctors.some((d) => d.id === doctorId);
+
+  /** Open the booking dialog (with its dentist, date and time pickers) at the first free slot. */
+  function book(targetDay: string, doctorId: string | null, minute?: number) {
+    const doctor = isBookable(doctorId) ? doctorId : bookableDoctors[0]?.id;
+    if (!doctor) return;
+    const free = minute ?? firstFreeMinute(targetDay, doctor, zone, window, appointments, exceptions, now) ?? window.start + 60;
+    setDraft({ doctorId: doctor, date: targetDay, minute: free });
+  }
+
+  function addBooking() {
+    if (!day) return;
+    const today = todayKey(zone);
+    const target = view === "day" ? day : days.includes(today) ? today : days[0]!;
+    book(target, view === "week" ? (weekDoctor === ALL ? null : weekDoctor) : dayDoctor);
+  }
+
+  const singleWeek = view === "week" && weekDoctor !== ALL;
+  const gridHint = canBook ? <span className="max-md:hidden"> Click an empty slot to book, or use Add booking.</span> : null;
+  const description = (
+    <>
+      Clinic time ({zoneAbbreviation(zone)}).
+      {view === "day" || singleWeek ? gridHint : canBook ? " Choose a dentist to see their week as a grid." : null}
+    </>
+  );
+
+  const doctorPicker = (includeAll: boolean, value: string | null) => (
+    <Field label="Dentist" className="flex-row! items-center gap-2!">
+      {(props) => (
+        <Select {...props} value={value ?? ""} onChange={(e) => setFocusDoctor(e.target.value)} className="h-9 w-full text-sm sm:w-60">
+          {doctors.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.name} ({appointments.filter((a) => a.doctor_id === d.id && a.status !== "cancelled" && days.some((k) => clipToDay(a, k, zone))).length})
+            </option>
+          ))}
+          {includeAll ? <option value={ALL}>All dentists (summary)</option> : null}
+        </Select>
+      )}
+    </Field>
+  );
 
   return (
     <div>
       <PageHeader
         title={title}
-        description={`Clinic time (${zoneAbbreviation(zone)}). ${canWrite ? "Click an empty slot to book." : ""}`}
+        description={description}
         actions={
           <>
             <div className="flex items-center gap-1">
@@ -276,13 +483,8 @@ export function CalendarPage() {
               ]}
             />
             {canWrite ? (
-              <Button
-                size="sm"
-                disabled={!canBook || !day || bookableDoctors.length === 0}
-                icon={<CalendarPlus className="size-4" aria-hidden="true" />}
-                onClick={() => day && setDraft({ doctorId: selectedMobileDoctor ?? bookableDoctors[0]!.id, date: day, minute: 10 * 60 })}
-              >
-                New booking
+              <Button size="sm" disabled={!canBook || !day || bookableDoctors.length === 0} icon={<CalendarPlus className="size-4" aria-hidden="true" />} onClick={addBooking}>
+                Add booking
               </Button>
             ) : null}
           </>
@@ -318,22 +520,12 @@ export function CalendarPage() {
         <EmptyState title="No active dentists">Add or reactivate a dentist in Settings to see their diary here.</EmptyState>
       ) : view === "day" ? (
         <>
-          {/* Phones and small tablets: one dentist at a time. */}
+          {/* Phones and small tablets: one dentist at a time, as a list. */}
           <div className="md:hidden">
-            <Field label="Dentist" className="mb-4">
-              {(props) => (
-                <Select {...props} value={selectedMobileDoctor ?? ""} onChange={(e) => setMobileDoctor(e.target.value)}>
-                  {doctors.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {d.name} ({appointments.filter((a) => a.doctor_id === d.id && a.status !== "cancelled").length})
-                    </option>
-                  ))}
-                </Select>
-              )}
-            </Field>
+            <div className="mb-4">{doctorPicker(false, dayDoctor)}</div>
             <MobileDayList
-              appointments={appointments.filter((a) => a.doctor_id === selectedMobileDoctor && clipToDay(a, day, zone))}
-              exceptions={exceptionsFor(exceptions, selectedMobileDoctor).filter((e) => clipToDay(e, day, zone))}
+              appointments={appointments.filter((a) => a.doctor_id === dayDoctor && clipToDay(a, day, zone))}
+              exceptions={exceptionsFor(exceptions, dayDoctor).filter((e) => clipToDay(e, day, zone))}
               timeZone={zone}
               onOpen={setOpen}
             />
@@ -353,17 +545,17 @@ export function CalendarPage() {
                     <div key={d.id} className="sticky top-0 z-20 flex items-center justify-between gap-2 border-r border-b border-line bg-raised px-3 py-2 last:border-r-0">
                       <div className="min-w-0">
                         <p className="flex items-center gap-2 truncate text-sm font-semibold">
-                          <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ background: d.colour ?? "var(--color-ink-3)" }} />
+                          <span aria-hidden="true" className="size-2 shrink-0 rounded-full" style={{ background: safeColour(d.colour) }} />
                           {d.name}
                         </p>
-                        <p className="text-xs text-ink-3 tnum">{leave ? exceptionKind(leave.kind).text : `${count} booked`}</p>
+                        <p className="text-xs text-ink-2 tnum">{leave ? exceptionKind(leave.kind).text : `${count} booked`}</p>
                       </div>
-                      {canBook ? (
+                      {canBook && isBookable(d.id) ? (
                         <button
                           type="button"
-                          onClick={() => setDraft({ doctorId: d.id, date: day, minute: window.start + 60 })}
+                          onClick={() => book(day, d.id)}
                           className="rounded-sm p-1 text-ink-3 hover:bg-sunk hover:text-ink"
-                          aria-label={`New booking for ${d.name}`}
+                          aria-label={`Add a booking for ${d.name}`}
                         >
                           <CalendarPlus className="size-4" aria-hidden="true" />
                         </button>
@@ -384,9 +576,9 @@ export function CalendarPage() {
                     appointments={appointments.filter((a) => a.doctor_id === d.id)}
                     exceptions={exceptionsFor(exceptions, d.id)}
                     now={now}
-                    canBook={canBook}
+                    canBook={canBook && isBookable(d.id)}
                     onOpen={setOpen}
-                    onBook={(minute) => setDraft({ doctorId: d.id, date: day, minute })}
+                    onBook={(minute) => book(day, d.id, minute)}
                   />
                 ))}
               </div>
@@ -394,65 +586,111 @@ export function CalendarPage() {
           </div>
         </>
       ) : (
-        <div className="overflow-hidden rounded-lg border border-line bg-raised">
-          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-line px-4 py-2">
-            <Field label="Show" className="flex-row! items-center gap-2!">
-              {(props) => (
-                <Select {...props} value={weekDoctor} onChange={(e) => setWeekDoctor(e.target.value)} className="h-8 w-56 text-sm">
-                  <option value="all">All dentists</option>
-                  {doctors.map((d) => (
-                    <option key={d.id} value={d.id}>
-                      {d.name}
-                    </option>
-                  ))}
-                </Select>
-              )}
-            </Field>
-            <p className="text-sm text-ink-3 tnum">
-              {appointments.filter((a) => a.status !== "cancelled" && (weekDoctor === "all" || a.doctor_id === weekDoctor)).length} appointments this week
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            {doctorPicker(true, weekDoctor)}
+            <p className="text-sm text-ink-2 tnum">
+              {appointments.filter((a) => a.status !== "cancelled" && (weekDoctor === ALL || a.doctor_id === weekDoctor)).length} appointments this week
+              {weekDoctor === ALL ? " across all dentists" : ""}
             </p>
           </div>
-          <div className="max-h-[calc(100dvh-16rem)] overflow-auto">
-            <div className="grid min-w-max" style={{ gridTemplateColumns: `4.25rem repeat(7, minmax(8.5rem, 1fr))` }}>
-              <div className="sticky top-0 left-0 z-30 border-r border-b border-line bg-raised" />
-              {days.map((d) => (
-                <div key={d} className="sticky top-0 z-20 border-r border-b border-line bg-raised px-2 py-1.5 last:border-r-0">
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setDay(d);
-                      setView("day");
-                    }}
-                    className={cx("rounded-sm text-sm font-semibold hover:text-accent", now !== null && d === dayKey(now, zone) && "text-accent")}
-                  >
-                    {formatDayKey(d, "short")}
-                  </button>
-                </div>
-              ))}
-              <div className="sticky left-0 z-10 bg-raised">
-                <Gutter window={window} />
-              </div>
-              {days.map((d) => (
-                <Column
-                  key={d}
-                  label={formatDayKey(d, "long")}
-                  dayKeyValue={d}
+
+          {singleWeek ? (
+            <>
+              <div className="md:hidden">
+                <WeekList
+                  days={days}
+                  appointments={appointments.filter((a) => a.doctor_id === weekDoctor)}
+                  exceptions={exceptionsFor(exceptions, weekDoctor)}
+                  doctors={doctors}
+                  showDoctors={false}
                   timeZone={zone}
-                  window={window}
-                  appointments={appointments.filter((a) => weekDoctor === "all" || a.doctor_id === weekDoctor)}
-                  exceptions={exceptionsFor(exceptions, weekDoctor === "all" ? null : weekDoctor).filter((e) => weekDoctor !== "all" || e.doctor_id === null)}
                   now={now}
-                  canBook={false}
                   onOpen={setOpen}
-                  doctorNames={doctorNames}
+                  onDay={(d) => {
+                    setDay(d);
+                    setView("day");
+                  }}
+                  onBook={canBook && isBookable(weekDoctor) ? (d) => book(d, weekDoctor) : undefined}
                 />
-              ))}
-            </div>
-          </div>
+              </div>
+              <div className="hidden overflow-hidden rounded-lg border border-line bg-raised md:block">
+                <div className="max-h-[calc(100dvh-16rem)] overflow-auto">
+                  <div className="grid min-w-max" style={{ gridTemplateColumns: `4.25rem repeat(7, minmax(8.5rem, 1fr))` }}>
+                    <div className="sticky top-0 left-0 z-30 border-r border-b border-line bg-raised" />
+                    {days.map((d) => {
+                      const past = now !== null && d < dayKey(now, zone);
+                      return (
+                        <div key={d} className="sticky top-0 z-20 flex items-center justify-between gap-1 border-r border-b border-line bg-raised px-2 py-1.5 last:border-r-0">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDay(d);
+                              setView("day");
+                            }}
+                            className={cx("rounded-sm text-sm font-semibold hover:text-accent", now !== null && d === dayKey(now, zone) && "text-accent")}
+                            aria-label={`${formatDayKey(d, "long")}: open the day view`}
+                          >
+                            {formatDayKey(d, "short")}
+                          </button>
+                          {canBook && isBookable(weekDoctor) && !past ? (
+                            <button
+                              type="button"
+                              onClick={() => book(d, weekDoctor)}
+                              className="rounded-sm p-1 text-ink-3 hover:bg-sunk hover:text-ink"
+                              aria-label={`Add a booking for ${doctorNames.get(weekDoctor) ?? "this dentist"} on ${formatDayKey(d, "long")}`}
+                            >
+                              <CalendarPlus className="size-4" aria-hidden="true" />
+                            </button>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                    <div className="sticky left-0 z-10 bg-raised">
+                      <Gutter window={window} />
+                    </div>
+                    {days.map((d) => (
+                      <Column
+                        key={d}
+                        label={`${doctorNames.get(weekDoctor) ?? "Dentist"}, ${formatDayKey(d, "long")}`}
+                        dayKeyValue={d}
+                        timeZone={zone}
+                        window={window}
+                        appointments={appointments.filter((a) => a.doctor_id === weekDoctor)}
+                        exceptions={exceptionsFor(exceptions, weekDoctor)}
+                        now={now}
+                        canBook={canBook && isBookable(weekDoctor)}
+                        onOpen={setOpen}
+                        onBook={(minute) => book(d, weekDoctor, minute)}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <WeekList
+              days={days}
+              appointments={appointments}
+              exceptions={exceptions}
+              doctors={doctors}
+              showDoctors
+              timeZone={zone}
+              now={now}
+              onOpen={setOpen}
+              onDay={(d) => {
+                setDay(d);
+                setView("day");
+              }}
+              onBook={canBook ? (d) => book(d, null) : undefined}
+            />
+          )}
         </div>
       )}
 
-      <Legend />
+      {/* The legend explains the time grid; the phone lists and the all-dentists week summary
+          use plain words and badges instead. */}
+      {data && doctors.length > 0 && (view === "day" || singleWeek) ? <Legend className="max-md:hidden" /> : null}
 
       <AppointmentDrawer appointment={drawerAppointment} onClose={() => setOpen(null)} onChanged={() => void calendar.mutate()} />
       {canBook ? (
@@ -468,9 +706,9 @@ export function CalendarPage() {
   );
 }
 
-function Legend() {
+function Legend({ className }: { className?: string }) {
   return (
-    <ul className="mt-4 flex flex-wrap gap-x-5 gap-y-2 text-xs text-ink-2" aria-label="Legend">
+    <ul className={cx("mt-4 flex flex-wrap gap-x-5 gap-y-2 text-xs text-ink-2", className)} aria-label="Legend">
       <li className="flex items-center gap-1.5">
         <span className="size-1.5 rounded-full bg-ok" aria-hidden="true" /> Synced to calendar
       </li>
