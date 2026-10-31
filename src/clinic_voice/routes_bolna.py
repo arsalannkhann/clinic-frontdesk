@@ -8,6 +8,11 @@ credential alone selects the clinic; call-context fields in the body never do. T
 /v1/tools/* API refuses bolna-scope tokens (deps.tool_caller).
 Responses are private (no-store) and carry no patient data or caller number.
 
+Unsubstituted call context: a body whose execution_id, from_number or agent_id still holds
+its template ("{from_number}", "%(agent_id)s", a bare variable name) fails validation
+(schemas.BolnaCallContext) and gets 422 code context_unsubstituted with a speakable
+handoff sentence and the field names, before the line gate and before any call session.
+
 Line gating (T10, gateway.require_line), before anything is written: booking-changing tools
 (reserve-slot, cancel-booking, reschedule-booking, opt-out) need provisioning state active,
 or verified with the owner's test_calls_enabled; context and read-only tools (check-slots,
@@ -73,12 +78,20 @@ async def reject_duplicate_keys(request: Request):
         return
 
 
-# Authentication runs first (an unauthenticated request gets 401 before any body check); the
-# endpoints' own Depends(tenant) reuses this result (FastAPI caches it per request).
+def authenticated(request: Request, clinic_id=Depends(tenant)):
+    """Router-wide authentication. Records the clinic on the request so the validation
+    handler can name it when it refuses an unsubstituted call context (api.py)."""
+    request.state.bolna_clinic_id = clinic_id
+
+
+# Authentication runs first: FastAPI solves dependencies before it validates the body, so an
+# unauthenticated request gets 401 before any body check, including the unsubstituted
+# call-context 422. The endpoints' own Depends(tenant) reuses this result (FastAPI caches it
+# per request).
 router = APIRouter(
     prefix="/v1/bolna",
     tags=["bolna"],
-    dependencies=[Depends(tenant), Depends(reject_duplicate_keys)],
+    dependencies=[Depends(authenticated), Depends(reject_duplicate_keys)],
 )
 NO_STORE = {"Cache-Control": "no-store"}
 

@@ -22,12 +22,13 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 
 from clinic_voice import patients, reminders, service
 from clinic_voice.crypto import CryptoError, Keyring, decode_hash_key, phone_hash
 from clinic_voice.domain import spoken_reference
 from clinic_voice.patients import session_aad
-from clinic_voice.schemas import CONSENT_UNCLEAR, ReservationRequest
+from clinic_voice.schemas import CONSENT_UNCLEAR, UNSUBSTITUTED_CODE, ReservationRequest
 
 log = logging.getLogger("clinic_voice.bolna")
 
@@ -56,6 +57,9 @@ NOT_ACCEPTING = (
     "This line isn't accepting bookings yet. Please call the clinic directly and the team will"
     " help you."
 )
+CONTEXT_UNSUBSTITUTED = (
+    "I can't use the booking system on this call. Offer to pass the caller to clinic staff."
+)
 # Provisioning states (migration 015) in which the line answers at all, and in which it may
 # change bookings. verified also allows changes while the owner has test calls enabled.
 LINE_OPEN = ("verified", "active")
@@ -83,6 +87,25 @@ def require_line(conn, clinic_id, changes: bool, lock: bool = False) -> None:
         return
     conn.rollback()
     raise HTTPException(403, NOT_ACCEPTING)
+
+
+def refuse_unsubstituted(clinic_id, tool: str, fields: list[str]) -> JSONResponse:
+    """422 for a tool request whose call-context fields still hold their templates
+    (schemas.unsubstituted): Bolna did not fill execution_id/from_number/agent_id, or the
+    agent's tool parameters do not reference them. Nothing has been written (validation runs
+    before the endpoint, so before the line gate and the call session). Answers and logs
+    field names only, never the values, the credential or the body."""
+    log.warning(
+        "call context unsubstituted clinic=%s tool=%s fields=%s",
+        clinic_id,
+        tool,
+        ",".join(fields),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": CONTEXT_UNSUBSTITUTED, "code": UNSUBSTITUTED_CODE, "fields": fields},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def session_crypto(settings) -> tuple[Keyring, bytes]:

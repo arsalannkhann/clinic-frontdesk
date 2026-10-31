@@ -15,6 +15,7 @@ from pydantic import (
     StringConstraints,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 
 class StrictModel(BaseModel):
@@ -415,13 +416,54 @@ CatalogName = Annotated[
 ]
 
 
+CONTEXT_FIELDS = ("execution_id", "from_number", "agent_id")
+UNSUBSTITUTED_CODE = "context_unsubstituted"
+# Names of Bolna call-context variables (docs/SOURCE_REVIEW.md). A value equal to one of them
+# is the variable's name, not its value.
+CONTEXT_VARIABLE_NAMES = frozenset(CONTEXT_FIELDS + ("call_sid", "to_number"))
+_SPECIFIER = re.compile(r"%\(\w*\)s")
+
+
+def unsubstituted(value) -> bool:
+    """True when a call-context value is a template rather than data: it contains a brace
+    ("{from_number}", "{{execution_id}}"), a %(name)s specifier, or is a variable name itself
+    (trimmed, any case). Deliberately narrow: an empty or otherwise malformed value is not a
+    placeholder (an empty from_number is a withheld number, as before)."""
+    if not isinstance(value, str):
+        return False
+    return (
+        "{" in value
+        or "}" in value
+        or _SPECIFIER.search(value) is not None
+        or value.strip().casefold() in CONTEXT_VARIABLE_NAMES
+    )
+
+
+# Every /v1/bolna/* tool body. A call-context field still holding its template fails
+# validation with type UNSUBSTITUTED_CODE (field names in ctx, never values), which api.py
+# turns into the dedicated 422. It runs before the field validators, so a literal
+# "{execution_id}" is reported as unsubstituted rather than as a malformed UUID. (A comment,
+# not a docstring, so the OpenAPI contract is unchanged.)
 class BolnaCallContext(StrictModel):
     execution_id: UUID
     # The number that initiated the call. Stored encrypted when it is E.164, else ignored
-    # (withheld numbers, unrendered templates). Never echoed.
+    # (withheld or malformed numbers; an unrendered template is refused). Never echoed.
     from_number: ProviderNumber = ""
     # Recorded when it is a UUID (Bolna agent ids are), else ignored like from_number.
     agent_id: Annotated[str, BeforeValidator(_no_control_characters), Field(max_length=64)] = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _substituted(cls, data):
+        if isinstance(data, dict):
+            fields = [name for name in CONTEXT_FIELDS if unsubstituted(data.get(name))]
+            if fields:
+                raise PydanticCustomError(
+                    UNSUBSTITUTED_CODE,
+                    "call context variables were not substituted",
+                    {"fields": fields},
+                )
+        return data
 
 
 class BolnaSlotQuery(BolnaCallContext):
