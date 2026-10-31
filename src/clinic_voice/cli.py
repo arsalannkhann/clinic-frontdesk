@@ -451,7 +451,11 @@ def main(argv=None):
 
         from clinic_voice.api import app
 
-        print(json.dumps(app.openapi(), indent=2))
+        # FastAPI takes response descriptions from http.HTTPStatus, whose 422 phrase changed in
+        # Python 3.13; pin the RFC 9110 phrase so the committed contract matches on every
+        # supported Python.
+        text = json.dumps(app.openapi(), indent=2)
+        print(text.replace('"Unprocessable Entity"', '"Unprocessable Content"'))
         return
     if args.command == "generate-key":
         from clinic_voice.crypto import generate_key
