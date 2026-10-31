@@ -621,9 +621,14 @@ HANDLERS = {
 }
 
 
+TOOL_FAILED = {"error": "tool_failed"}
+
+
 def run_tool(turn, name, arguments) -> dict:
     """Run one tool call; any refusal is a small error object for the model, never an
-    exception (and never the arguments, which may hold a phone number)."""
+    exception (and never the arguments, which may hold a phone number). An unexpected
+    failure (e.g. OverflowError from an out-of-range date) is {"error": "tool_failed"} and
+    only its class name is logged, so the call still gets a result."""
     if name not in HANDLERS:
         return {"error": "unknown_tool"}
     if arguments is None:
@@ -632,46 +637,87 @@ def run_tool(turn, name, arguments) -> dict:
         return HANDLERS[name](turn, arguments)
     except ValidationError:
         return {"error": "invalid_arguments"}
+    except Exception as error:
+        log.error(
+            "chat tool failed session=%s tool=%s error=%s",
+            turn.session["id"],
+            name,
+            type(error).__name__,
+        )
+        return dict(TOOL_FAILED)
 
 
 # --- A turn ----------------------------------------------------------------------------------
 
 
-def _model_messages(messages) -> list[dict]:
-    """The stored transcript as OpenAI-format messages (the newest HISTORY_MESSAGES,
-    starting at a user message so no tool result is orphaned)."""
+def _answered(messages) -> list[dict]:
+    """The stored transcript as OpenAI-format messages, keeping an assistant message with
+    tool calls only when every one of its tool_call_ids has a result right after it (and
+    those results only). A turn interrupted between the two (a crash, an older bug) would
+    otherwise send an unanswered tool call, which strict providers reject on every later
+    turn. Its text, if any, is kept as plain assistant text."""
     result = []
-    for m in messages:
+    index = 0
+    while index < len(messages):
+        m = messages[index]
+        index += 1
         doc = m["document"]
         if doc is None:
             continue
         if m["role"] == "user":
             result.append({"role": "user", "content": doc.get("text", "")})
         elif m["role"] == "assistant":
-            entry = {"role": "assistant", "content": doc.get("text") or ""}
-            if doc.get("tool_calls"):
-                entry["tool_calls"] = [
-                    {
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {
-                            "name": call["name"],
-                            "arguments": json.dumps(call.get("arguments") or {}),
-                        },
-                    }
-                    for call in doc["tool_calls"]
-                ]
-            result.append(entry)
-        elif m["role"] == "tool":
+            calls = [c for c in doc.get("tool_calls") or [] if isinstance(c, dict)]
+            if not calls:
+                result.append({"role": "assistant", "content": doc.get("text") or ""})
+                continue
+            results = {}
+            while index < len(messages) and messages[index]["role"] == "tool":
+                tool_doc = messages[index]["document"] or {}
+                results.setdefault(str(tool_doc.get("tool_call_id", "")), tool_doc)
+                index += 1
+            ids = [str(call.get("id", "")) for call in calls]
+            if len(set(ids)) != len(ids) or any(i not in results for i in ids):
+                if doc.get("text"):
+                    result.append({"role": "assistant", "content": doc["text"]})
+                continue
             result.append(
                 {
-                    "role": "tool",
-                    "tool_call_id": doc.get("tool_call_id", ""),
-                    "content": json.dumps(doc.get("result", {}), ensure_ascii=False),
+                    "role": "assistant",
+                    "content": doc.get("text") or "",
+                    "tool_calls": [
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call["name"],
+                                "arguments": json.dumps(call.get("arguments") or {}),
+                            },
+                        }
+                        for call in calls
+                    ],
                 }
             )
+            for call_id in ids:
+                result.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": json.dumps(
+                            results[call_id].get("result", {}), ensure_ascii=False
+                        ),
+                    }
+                )
         elif m["role"] == "system":
             result.append({"role": "assistant", "content": doc.get("text", "")})
+        # A tool result without its assistant message just before it is dropped.
+    return result
+
+
+def _model_messages(messages) -> list[dict]:
+    """The stored transcript as OpenAI-format messages (only answered tool calls,
+    _answered), the newest HISTORY_MESSAGES, starting at a user message."""
+    result = _answered(messages)
     result = result[-HISTORY_MESSAGES:]
     while result and result[0]["role"] != "user":
         result.pop(0)
@@ -744,6 +790,7 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
         messages = _model_messages(transcript(conn, keyring, session["clinic_id"], session["id"]))
     messages = [{"role": "system", "content": prompt}, *messages]
     rounds = 0
+    pending: list[str] = []  # Stored tool calls still without a stored result.
     try:
         while True:
             tools = TOOLS if rounds < MAX_TOOL_ROUNDS else []
@@ -758,6 +805,7 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
             rounds += 1
             stored = [{"id": c.id, "name": c.name, "arguments": c.arguments} for c in calls]
             _store(url, keyring, session, "assistant", {"text": reply.text, "tool_calls": stored})
+            pending = [c.id for c in calls]
             messages.append(
                 {
                     "role": "assistant",
@@ -786,6 +834,7 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
                     {"tool_call_id": call.id, "result": result},
                     tool_name=name,
                 )
+                pending.remove(call.id)
                 log.info(
                     "chat tool session=%s tool=%s outcome=%s",
                     session["id"],
@@ -808,7 +857,30 @@ def _converse(turn, llm) -> tuple[str, list[str]]:
         )
     except Exception as error:  # Never a 500 for the patient; type only in the log.
         log.error("chat turn failed session=%s error=%s", session["id"], type(error).__name__)
+    _answer_pending(turn, pending)
     return fallback_text(turn.clinic), FALLBACK_QUICK_REPLIES
+
+
+def _answer_pending(turn, pending) -> None:
+    """Store a tool_failed result for every stored tool call of this turn that has none,
+    so the transcript never holds an unanswered call (best effort: _answered also drops
+    such calls when building the model's history)."""
+    for call_id in list(pending):
+        try:
+            _store(
+                turn.url,
+                turn.keyring,
+                turn.session,
+                "tool",
+                {"tool_call_id": call_id, "result": dict(TOOL_FAILED)},
+            )
+        except Exception as error:
+            log.error(
+                "chat placeholder tool result failed session=%s error=%s",
+                turn.session["id"],
+                type(error).__name__,
+            )
+            return
 
 
 # --- Confirm ---------------------------------------------------------------------------------

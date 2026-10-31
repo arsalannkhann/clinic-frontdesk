@@ -662,3 +662,96 @@ def test_access_log_redacts_session_ids():
 def test_session_ids_are_random_128_bit(env):
     ids = {start(env) for _ in range(3)}
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
+
+
+# --- Review fixes: tool failures never orphan a tool call ------------------------------------
+
+
+def _assert_every_tool_call_answered(model_messages):
+    """The OpenAI contract strict providers enforce: each assistant tool_calls message is
+    followed by exactly one tool result per call id."""
+    for index, message in enumerate(model_messages):
+        if message["role"] == "tool":
+            assert index > 0
+        if message.get("tool_calls"):
+            ids = [c["id"] for c in message["tool_calls"]]
+            after = model_messages[index + 1 : index + 1 + len(ids)]
+            assert [m["role"] for m in after] == ["tool"] * len(ids)
+            assert [m["tool_call_id"] for m in after] == ids
+
+
+def test_an_unexpected_tool_exception_is_a_tool_failed_result(env, caplog):
+    caplog.set_level(logging.INFO)
+    session = start(env)
+    bad = call(
+        "propose_booking",
+        service_id=str(SERVICE_ID),
+        doctor_id=str(DOCTOR_ID),
+        starts_at="0001-01-01T00:00:00+05:00",  # astimezone() raises OverflowError.
+    )
+    env["fake"].script = [LLMReply(None, [bad]), LLMReply("Which day would suit you?")]
+    r = say(env, session, "book the first possible time")
+    assert r.status_code == 200
+    assert r.json()["messages"][0]["text"] == "Which day would suit you?"
+    second = env["fake"].calls[1]["messages"]
+    assert json.loads(second[-1]["content"]) == {"error": "tool_failed"}
+    _assert_every_tool_call_answered(second)
+    assert "error=OverflowError" in caplog.text and "0001-01-01" not in caplog.text
+    # The next turn's history is still valid for a strict provider.
+    say(env, session, "tomorrow then")
+    _assert_every_tool_call_answered(env["fake"].calls[-1]["messages"])
+
+
+def test_a_turn_failing_mid_tools_stores_placeholder_results(env, monkeypatch):
+    session = start(env)
+    env["fake"].script = [LLMReply(None, [call("clinic_info"), call("list_services")])]
+
+    def explode(turn, name, arguments):
+        raise RuntimeError("synthetic failure outside the tool")
+
+    monkeypatch.setattr(chat, "run_tool", explode)
+    body = say(env, session, "hello").json()
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    keyring = Keyring.from_setting(KEYS)
+    row = session_row(env["url"])
+    with connect(env["url"]) as conn:
+        stored = chat.transcript(conn, keyring, CLINIC, row["id"])
+    calls = [m for m in stored if m["role"] == "assistant" and m["document"].get("tool_calls")]
+    results = [m["document"] for m in stored if m["role"] == "tool"]
+    ids = [c["id"] for c in calls[0]["document"]["tool_calls"]]
+    assert [r["tool_call_id"] for r in results] == ids
+    assert all(r["result"] == {"error": "tool_failed"} for r in results)
+
+
+def test_history_drops_assistant_tool_calls_without_results(env):
+    session = start(env)
+    keyring = Keyring.from_setting(KEYS)
+    row = session_row(env["url"])
+    with connect(env["url"]) as conn:
+        chat.append(conn, keyring, row, "user", {"text": "earlier question"})
+        # An interrupted older turn: two calls, only one answered.
+        chat.append(
+            conn,
+            keyring,
+            row,
+            "assistant",
+            {
+                "text": None,
+                "tool_calls": [
+                    {"id": "c_old1", "name": "clinic_info", "arguments": {}},
+                    {"id": "c_old2", "name": "list_services", "arguments": {}},
+                ],
+            },
+        )
+        chat.append(conn, keyring, row, "tool", {"tool_call_id": "c_old1", "result": {}})
+        # A stray result with no call before it.
+        chat.append(conn, keyring, row, "tool", {"tool_call_id": "c_stray", "result": {}})
+    env["fake"].script = [LLMReply("Hello again")]
+    assert say(env, session, "are you there?").status_code == 200
+    sent = env["fake"].calls[0]["messages"]
+    assert not any(m.get("tool_calls") for m in sent)
+    assert not any(m["role"] == "tool" for m in sent)
+    assert [m["content"] for m in sent if m["role"] == "user"] == [
+        "earlier question",
+        "are you there?",
+    ]
