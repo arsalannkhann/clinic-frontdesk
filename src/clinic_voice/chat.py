@@ -755,12 +755,27 @@ def _answered(messages) -> list[dict]:
 
 def _model_messages(messages) -> list[dict]:
     """The stored transcript as OpenAI-format messages (only answered tool calls,
-    _answered), the newest HISTORY_MESSAGES, starting at a user message."""
-    result = _answered(messages)
-    result = result[-HISTORY_MESSAGES:]
-    while result and result[0]["role"] != "user":
-        result.pop(0)
-    return result
+    _answered), trimmed by whole turns: a turn is a user message and everything after it up
+    to the next one. Whole turns are dropped oldest first until at most HISTORY_MESSAGES
+    remain, but the newest turn (the current user message) is always kept, however long.
+    Messages before the first user message (the greeting) are dropped, so the history
+    always starts with a user message and never splits a tool call from its results."""
+    turns: list[list[dict]] = []
+    for message in _answered(messages):
+        if message["role"] == "user":
+            turns.append([message])
+        elif turns:
+            turns[-1].append(message)
+    if not turns:
+        return []
+    kept = [turns[-1]]
+    size = len(turns[-1])
+    for turn in reversed(turns[:-1]):
+        if size + len(turn) > HISTORY_MESSAGES:
+            break
+        kept.append(turn)
+        size += len(turn)
+    return [message for turn in reversed(kept) for message in turn]
 
 
 def fallback_text(clinic) -> str:

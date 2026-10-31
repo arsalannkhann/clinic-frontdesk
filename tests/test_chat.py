@@ -747,6 +747,61 @@ def test_session_ids_are_random_128_bit(env):
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
 
 
+# --- Review fixes: history is trimmed by whole turns -----------------------------------------
+
+
+def _stored(role, document):
+    return {"role": role, "document": document}
+
+
+def _tool_turn(n):
+    return [
+        _stored("user", {"text": f"question {n}"}),
+        _stored(
+            "assistant",
+            {"text": None, "tool_calls": [{"id": f"c{n}", "name": "clinic_info", "arguments": {}}]},
+        ),
+        _stored("tool", {"tool_call_id": f"c{n}", "result": {"n": n}}),
+        _stored("assistant", {"text": f"answer {n}"}),
+    ]
+
+
+def test_history_trimming_keeps_whole_turns_and_the_current_message(monkeypatch):
+    transcript = [_stored("assistant", {"text": "greeting"})]
+    for n in range(5):
+        transcript += _tool_turn(n)
+    transcript.append(_stored("user", {"text": "current"}))
+    for limit in (1, 4, 5, 6, 9, 13, 100):
+        monkeypatch.setattr(chat, "HISTORY_MESSAGES", limit)
+        result = chat._model_messages(transcript)
+        assert result[-1] == {"role": "user", "content": "current"}
+        assert result[0]["role"] == "user"
+        older = result[:-1]
+        assert len(older) % 4 == 0  # Only whole turns.
+        assert len(result) <= max(limit, 1)
+        # The newest turns are the ones kept.
+        kept = [m["content"] for m in older if m["role"] == "user"]
+        assert kept == [f"question {n}" for n in range(5 - len(older) // 4, 5)]
+        _assert_every_tool_call_answered(result)
+    monkeypatch.setattr(chat, "HISTORY_MESSAGES", 100)
+    assert "greeting" not in json.dumps(chat._model_messages(transcript))
+
+
+def test_a_long_conversation_sends_whole_turns(env, monkeypatch):
+    monkeypatch.setattr(chat, "HISTORY_MESSAGES", 6)
+    session = start(env)
+    for n in range(4):
+        env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply(f"answer {n}")]
+        say(env, session, f"question {n}")
+    env["fake"].script = [LLMReply("last answer")]
+    say(env, session, "the current question")
+    sent = env["fake"].calls[-1]["messages"][1:]  # Without the system prompt.
+    assert sent[-1] == {"role": "user", "content": "the current question"}
+    assert [m["role"] for m in sent] == ["user", "assistant", "tool", "assistant", "user"]
+    assert sent[0]["content"] == "question 3"
+    _assert_every_tool_call_answered(sent)
+
+
 # --- Review fixes: confirm gate (clinic row lock, hidden services, parallel confirms) --------
 
 
