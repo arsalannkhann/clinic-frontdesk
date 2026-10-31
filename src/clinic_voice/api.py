@@ -313,7 +313,16 @@ def ready():
                 raise HTTPException(503, "Schema not ready")
     except DatabaseError:
         raise HTTPException(503, "Database unavailable") from None
-    return {"status": "ready", "integrations": "not_configured"}
+    result = {"status": "ready", "integrations": "not_configured"}
+    # Configuration problems that leave part of the API refusing requests. Names only,
+    # never values. The instance still serves staff and gateway traffic, so this stays 200.
+    problems = []
+    if get_settings().proxy_gate_missing():
+        problems.append("public_proxy_secret_missing")
+    if problems:
+        result["status"] = "degraded"
+        result["problems"] = problems
+    return result
 
 
 # Generic tool API. Authenticated by a tools-scope credential only (a bolna-scope credential,

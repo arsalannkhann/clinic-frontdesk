@@ -1338,6 +1338,49 @@ def test_repeated_proxy_secret_lines_are_refused(env, monkeypatch):
     assert_envelope(r, 403, "forbidden")
 
 
+@pytest.mark.parametrize("app_env", ["production", "staging", "Production"])
+def test_production_without_the_secret_fails_closed(env, monkeypatch, app_env):
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.delenv("PUBLIC_PROXY_SECRET", raising=False)
+    get_settings.cache_clear()
+    client = env["client"]
+    for path in ("", "/services", "/doctors"):
+        assert_envelope(client.get(f"{BASE}{path}"), 503, "unavailable")
+    assert_envelope(client.post(f"{BASE}/bookings", json=booking()), 503, "unavailable")
+    assert_envelope(client.post("/v1/chat/clinics/demo-clinic/sessions"), 503, "unavailable")
+    assert_envelope(client.get("/v1/chat/sessions/" + "a" * 32), 503, "unavailable")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+        assert conn.execute("SELECT count(*) AS n FROM chat_sessions").fetchone()["n"] == 0
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json() == {
+        "status": "degraded",
+        "integrations": "not_configured",
+        "problems": ["public_proxy_secret_missing"],
+    }
+    # Staff and health paths are not behind the gate.
+    assert client.get("/health/live").status_code == 200
+    # With the secret set, production serves the BFF and readiness is clean again.
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    assert client.get(BASE, headers={"X-Proxy-Secret": PROXY_SECRET}).status_code == 200
+    assert client.get("/health/ready").json()["status"] == "ready"
+    assert PROXY_SECRET not in client.get("/health/ready").text
+
+
+@pytest.mark.parametrize("app_env", ["development", "test"])
+def test_local_environments_keep_the_open_edge(env, monkeypatch, app_env):
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.delenv("PUBLIC_PROXY_SECRET", raising=False)
+    get_settings.cache_clear()
+    assert env["client"].get(BASE).status_code == 200
+    assert env["client"].get("/health/ready").json() == {
+        "status": "ready",
+        "integrations": "not_configured",
+    }
+
+
 def test_client_ip_header_is_trusted_only_with_the_secret(env, monkeypatch):
     monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
     monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")

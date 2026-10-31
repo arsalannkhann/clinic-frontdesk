@@ -12,9 +12,13 @@ With PUBLIC_PROXY_SECRET set:
   request that proved the secret, and only when it parses as one IP address (otherwise the
   request falls into the shared "unknown" bucket, failing closed).
 
-With the secret unset (local development) nothing is required and the address is the
-socket peer, or the TRUSTED_PROXY_HOPS-th X-Forwarded-For entry from the right
-(routes_webhooks.client_address), as before.
+With the secret unset in a local environment (APP_ENV development or test) nothing is
+required and the address is the socket peer, or the TRUSTED_PROXY_HOPS-th X-Forwarded-For
+entry from the right (routes_webhooks.client_address), as before. With it unset anywhere
+else (APP_ENV defaults to production) the gate fails closed: every request on these paths
+is 503 unavailable, and /health/ready lists `public_proxy_secret_missing`, so a deployment
+that forgot the secret neither serves the open internet nor counts every visitor in one
+rate-limit bucket.
 """
 
 import hmac
@@ -51,9 +55,14 @@ def _parse_ip(value: str | None):
 
 def require_proxy(request: Request) -> None:
     """Router dependency: with PUBLIC_PROXY_SECRET set, refuse requests without the secret.
-    Several header lines are refused too (an attacker-added line must not pass)."""
-    secret = get_settings().public_proxy_secret
+    Several header lines are refused too (an attacker-added line must not pass). Without
+    the secret outside a local environment: 503 unavailable."""
+    settings = get_settings()
+    secret = settings.public_proxy_secret
     if secret is None:
+        if settings.proxy_gate_missing():
+            log.error("public request refused code=unavailable reason=proxy_secret_missing")
+            raise PublicError(503, "unavailable", "Temporarily unavailable")
         return
     values = request.headers.getlist(PROXY_HEADER)
     supplied = values[0] if len(values) == 1 else ""
