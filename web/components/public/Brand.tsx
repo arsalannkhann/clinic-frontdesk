@@ -25,14 +25,18 @@ export function AsterMark({ className }: { className?: string }) {
   );
 }
 
+/**
+ * The wordmark. Below `sm` only the first word shows (the short wordmark), so the header
+ * never wraps at 360 px; the link's accessible name is always the full clinic name.
+ */
 export function BrandLink({ name, href = "/", className }: { name: string; href?: string; className?: string }) {
   const [first, ...rest] = name.split(" ");
   return (
-    <Link href={href} className={cx("group inline-flex items-center gap-2.5 rounded-sm", className)}>
-      <AsterMark />
-      <span className="font-display text-[1.35rem] leading-none tracking-[-0.01em] text-ink">
+    <Link href={href} aria-label={name} className={cx("group inline-flex min-w-0 items-center gap-2.5 rounded-sm", className)}>
+      <AsterMark className="shrink-0" />
+      <span aria-hidden="true" className="font-display text-[1.35rem] leading-none tracking-[-0.01em] whitespace-nowrap text-ink">
         {first}
-        {rest.length ? <span className="text-ink-2 italic"> {rest.join(" ")}</span> : null}
+        {rest.length ? <span className="text-ink-2 italic max-sm:hidden"> {rest.join(" ")}</span> : null}
       </span>
     </Link>
   );
