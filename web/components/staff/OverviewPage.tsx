@@ -220,7 +220,7 @@ export function OverviewPage() {
         onOpen={openDrawer}
       />
 
-      <div className="mt-8 grid gap-6 xl:grid-cols-[1.4fr_1fr]">
+      <div className="mt-8 grid grid-cols-[minmax(0,1fr)] gap-6 xl:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)]">
         <Panel
           title="Today's schedule"
           action={
