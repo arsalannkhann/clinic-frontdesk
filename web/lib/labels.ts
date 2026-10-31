@@ -105,3 +105,23 @@ export const CALL_FAILURES: Record<string, string> = {
 
 /** Shown for a demo (synthetic) record, whose Call now is always disabled. */
 export const DEMO_RECORD = "Demo record — calls disabled";
+
+/**
+ * What happened to the current call of a call-back (`call_outcome`), for requests in the
+ * Calling state. A failed call returns the request to Open, so "failed" reads as history.
+ */
+export const CALL_OUTCOMES: Record<string, string> = {
+  placed: "The call was placed. If it didn't reach the patient, reopen the request to try again.",
+  unknown: "We couldn't confirm the call went through — check with the patient or reopen to try again.",
+  failed: "The call couldn't be placed. Reopen the request to try again.",
+};
+
+/** Shown on an open request whose last call failed (the API reopened it). */
+export const LAST_CALL_FAILED = "The last call couldn't be placed.";
+
+/** Why a reopen (POST staff/callbacks/{id}/reopen) was refused, by code. */
+export const REOPEN_FAILURES: Record<string, string> = {
+  call_in_progress: "The call is still being placed. Try again in a moment.",
+  callback_resolved: "This request has already been resolved.",
+  not_found: "This request no longer exists.",
+};

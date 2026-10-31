@@ -47,8 +47,12 @@ async function load(resource: Resource): Promise<unknown | null> {
       }
       return null;
     }
+    // The API refuses /v1/public/* without the proxy secret (403), and answers 503 when it has
+    // none configured; either way this returns null and the page shows its fallback.
+    const headers: Record<string, string> = { Accept: "application/json" };
+    if (config.proxySecret) headers["X-Proxy-Secret"] = config.proxySecret;
     const response = await fetch(`${config.apiBaseUrl}${path}`, {
-      headers: { Accept: "application/json" },
+      headers,
       next: { revalidate: REVALIDATE_SECONDS, tags: [`clinic:${config.slug}`] },
       signal: AbortSignal.timeout(config.timeoutMs),
     });

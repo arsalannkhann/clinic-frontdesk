@@ -177,6 +177,8 @@ export interface CalendarResponse {
   doctors: CalendarDoctor[];
   appointments: CalendarAppointment[];
   exceptions: ScheduleException[];
+  /** True when the range held more appointments than one read returns (the earliest are kept). */
+  truncated?: boolean;
 }
 
 export interface StaffBookingRequest {
@@ -204,8 +206,21 @@ export interface CallbackItem {
   resolved_at: string | null;
   execution_id: string | null;
   call_requested_at: string | null;
+  /**
+   * Outcome of the current call: placed, unknown (a timeout or unexpected error; the call may
+   * have gone through) or failed (the request is open again). Null before a call has an outcome.
+   */
+  call_outcome?: CallOutcome | null;
   /** Seeded demo data: never dialled. */
   synthetic: boolean;
+}
+
+export type CallOutcome = "placed" | "unknown" | "failed";
+
+/** 200 from POST /v1/staff/callbacks/{id}/reopen (owner/admin). Nothing is dialled. */
+export interface CallbackReopened {
+  id: string;
+  status: "open";
 }
 
 /** 202 from POST /v1/staff/callbacks/{id}/call; execution_id is null after a provider timeout. */

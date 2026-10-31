@@ -51,6 +51,9 @@ const ALL = "all";
 const BOOKING_START = 7 * 60;
 const BOOKING_END = 21 * 60;
 
+/** One calendar read returns at most 2,000 appointments (the earliest); `truncated` says more exist. */
+export const TRUNCATED_NOTICE = "Showing the first 2,000 appointments — narrow the range";
+
 type View = "day" | "week";
 
 function useNow(intervalMs = 60_000): number | null {
@@ -520,6 +523,12 @@ export function CalendarPage() {
         <p className="mb-4 rounded-md border border-line bg-sunk/70 px-3 py-2 text-sm">
           <span className="font-semibold">Clinic closed</span>
           {holiday.label ? `: ${holiday.label}` : ""} ({formatDayKey(dayKey(holiday.starts_at, zone), "short")})
+        </p>
+      ) : null}
+
+      {data?.truncated ? (
+        <p role="status" className="mb-4 text-sm text-ink-3">
+          {TRUNCATED_NOTICE}
         </p>
       ) : null}
 

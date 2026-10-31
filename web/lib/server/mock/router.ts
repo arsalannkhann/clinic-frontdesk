@@ -167,6 +167,11 @@ function hoursFor(doctorId: string, date: string, state: State): [number, number
 
 const ACTIVE: ReadonlySet<BookingStatus> = new Set(["pending_sync", "confirmed", "needs_review"]);
 
+/** The admin service row (one per doctor) of a public service. */
+function adminServiceId(serviceId: string, doctorId: string): string {
+  return `${serviceId.slice(0, 24)}${doctorId.slice(-12)}`;
+}
+
 function seedState(): State {
   const today = istDate(Date.now());
   const random = rng(`aster:${today}`);
@@ -256,7 +261,7 @@ function seedState(): State {
       d.service_ids.map((sid) => {
         const s = SERVICES.find((x) => x.id === sid)!;
         return {
-          id: `${sid.slice(0, 24)}${d.id.slice(-12)}`,
+          id: adminServiceId(sid, d.id),
           doctor_id: d.id,
           name: s.name,
           duration_minutes: s.duration_minutes,
@@ -346,6 +351,7 @@ function seedState(): State {
     resolved_at: i === 3 ? isoIst(now - (i * 95) * MINUTE) : null,
     execution_id: null,
     call_requested_at: null,
+    call_outcome: null,
     // Seeded demo data, like the API's: never dialled. One open request is a live-looking
     // record so the Call now flow can be tried (mock mode still dials nothing).
     synthetic: i !== 0,
@@ -516,6 +522,9 @@ function computeSlots(
       if (doctorId && doctor.id !== doctorId) continue;
       if (!doctor.service_ids.includes(serviceId)) continue;
       if (!state.doctors.find((d) => d.id === doctor.id)?.active) continue;
+      // A deactivated service has no slots, so a chat confirm of it is slot_unavailable (as
+      // in the API, for a hidden or deactivated service).
+      if (state.services.find((s) => s.id === adminServiceId(serviceId, doctor.id))?.active === false) continue;
       for (const [open, close] of hoursFor(doctor.id, date, state)) {
         for (let start = open; start + service.duration_minutes * MINUTE <= close; start += service.duration_minutes * MINUTE) {
           const end = start + service.duration_minutes * MINUTE;
@@ -927,6 +936,9 @@ function staffAppointment(appt: Appt, role: Role) {
   };
 }
 
+/** staff_platform.MAX_CALENDAR_APPOINTMENTS: the most appointments one calendar read returns. */
+const MAX_CALENDAR_APPOINTMENTS = 2000;
+
 function range(url: URLSearchParams): { from: number; to: number } | null {
   const from = Date.parse(url.get("from") ?? "");
   const to = Date.parse(url.get("to") ?? "");
@@ -942,14 +954,14 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
   if (first === "calendar" && method === "GET") {
     const r = range(url);
     if (!r || r.to - r.from > 31 * DAY) return fail(422, "invalid_range", "Choose a range of up to 31 days.");
+    const inRange = state.appts.filter((a) => a.starts < r.to && a.ends > r.from).sort((a, b) => a.starts - b.starts);
     return ok({
       timezone: MOCK_TZ,
       doctors: DOCTORS.filter((d) => state.doctors.find((x) => x.id === d.id)?.active).map((d) => ({ id: d.id, name: d.name, colour: d.colour })),
-      appointments: state.appts
-        .filter((a) => a.starts < r.to && a.ends > r.from)
-        .sort((a, b) => a.starts - b.starts)
-        .map((a) => calendarAppointment(a, user.role)),
+      // Like the API: the earliest MAX_CALENDAR_APPOINTMENTS, and truncated when more exist.
+      appointments: inRange.slice(0, MAX_CALENDAR_APPOINTMENTS).map((a) => calendarAppointment(a, user.role)),
       exceptions: state.exceptions.filter((e) => Date.parse(e.starts_at) < r.to && Date.parse(e.ends_at) > r.from),
+      truncated: inRange.length > MAX_CALENDAR_APPOINTMENTS,
     });
   }
   if (first === "bookings" && rest.length === 1 && method === "POST") {
@@ -1001,7 +1013,23 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
       item.status = "calling";
       item.execution_id = `mock-${hex(8)}`;
       item.call_requested_at = isoIst(Date.now());
+      item.call_outcome = "placed";
       return ok({ status: "calling", execution_id: item.execution_id }, 202);
+    }
+    if (action === "reopen" && method === "POST") {
+      if (!canWrite(user)) return forbidden();
+      // Like the API: never dials; open stays open, resolved is refused, and a call without
+      // an outcome yet is still being placed.
+      if (item.status === "open") return ok({ id: item.id, status: "open" });
+      if (item.status === "done" || item.status === "dismissed") return fail(409, "callback_resolved", "This request is already resolved.");
+      if (item.call_outcome !== "placed" && item.call_outcome !== "unknown") {
+        return fail(409, "call_in_progress", "The call is still being placed; try again shortly.");
+      }
+      item.status = "open";
+      item.execution_id = null;
+      item.call_requested_at = null;
+      item.call_outcome = null;
+      return ok({ id: item.id, status: "open" });
     }
     if (action === "resolve" && method === "POST") {
       if (!canWrite(user)) return forbidden();

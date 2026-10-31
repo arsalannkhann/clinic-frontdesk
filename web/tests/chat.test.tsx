@@ -18,6 +18,7 @@ import {
   readStoredSession,
   SESSION_KEY,
   storeSession,
+  TURN_IN_PROGRESS,
   validMessage,
 } from "@/lib/chat";
 
@@ -115,6 +116,20 @@ describe("chat reducer", () => {
     expect(limited).toMatchObject({ pending: null, error: CONVERSATION_LIMIT });
     expect(limited.quickReplies).toEqual([NEW_CHAT, ...FALLBACK_REPLIES]);
     expect(chatReducer(limited, { type: "reset" })).toBe(initialChat);
+  });
+
+  it("takes a refused message back while an earlier turn is still being answered", () => {
+    const sent = chatReducer(started, { type: "send", text: "And on Friday?" });
+    const busy = chatReducer(sent, { type: "turnBusy", unsend: true });
+    expect(busy).toMatchObject({ typing: false, error: null, notice: TURN_IN_PROGRESS, pending: null });
+    expect(busy.lines.map((l) => l.text)).toEqual(["Hello"]);
+    // A retry of a message already on screen keeps it, and can be tried again.
+    const failed = chatReducer(sent, { type: "replyFailed", message: "x" });
+    const retried = chatReducer(chatReducer(failed, { type: "retrying" }), { type: "turnBusy", unsend: false });
+    expect(retried).toMatchObject({ notice: TURN_IN_PROGRESS, pending: "And on Friday?" });
+    expect(retried.lines.map((l) => l.text)).toEqual(["Hello", "And on Friday?"]);
+    // The next message clears the notice.
+    expect(chatReducer(busy, { type: "send", text: "Hi" }).notice).toBeNull();
   });
 
   it("falls back to options that work without the assistant", () => {
@@ -446,6 +461,57 @@ describe("chat panel flow", () => {
     // DOM order: the offer, then the card, then the later reply.
     expect(offer.compareDocumentPosition(booked) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(booked.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("keeps the text and says so when the server is still answering the last message", async () => {
+    const user = userEvent.setup();
+    handlers.push((c) => (c.url === "/api/chat/sessions" ? json({ session_id: SESSION, greeting: "Hi", quick_replies: [] }, 201) : undefined));
+    handlers.push((c) =>
+      c.url.endsWith("/messages")
+        ? json({ error: { code: "turn_in_progress", message: "The assistant is still answering your previous message" } }, 409)
+        : undefined,
+    );
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    expect(await screen.findByText("Hi")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Message"), "Is Saturday open?{Enter}");
+    expect(await screen.findByText(TURN_IN_PROGRESS)).toBeInTheDocument();
+    expect(screen.getByLabelText("Message")).toHaveValue("Is Saturday open?");
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    // The refused message is not left in the transcript as if it had been sent.
+    expect(within(screen.getByRole("log")).queryByText("Is Saturday open?")).not.toBeInTheDocument();
+  });
+
+  it("sends nothing more while a reply is pending, and keeps what is typed", async () => {
+    const user = userEvent.setup();
+    let release: (() => void) | null = null;
+    handlers.push((c) => (c.url === "/api/chat/sessions" ? json({ session_id: SESSION, greeting: "Hi", quick_replies: [] }, 201) : undefined));
+    vi.mocked(globalThis.fetch).mockImplementation(async (url, init) => {
+      const call = { url: String(url), init: init ?? {} };
+      calls.push(call);
+      if (call.url.endsWith("/messages")) {
+        await new Promise<void>((resolve) => (release = resolve));
+        return json(reply("Yes, from 9 am."));
+      }
+      for (const handler of handlers) {
+        const response = handler(call);
+        if (response) return response;
+      }
+      return json({ error: { code: "not_found", message: "Not found" } }, 404);
+    });
+    render(<ChatPanel clinicName="Aster" timeZone={IST} callHref={null} />);
+    expect(await screen.findByText("Hi")).toBeInTheDocument();
+    const input = screen.getByLabelText("Message");
+    await user.type(input, "Open Saturday?{Enter}");
+    await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/messages"))).toHaveLength(1));
+    await user.type(input, "And Sunday?{Enter}");
+    expect(calls.filter((c) => c.url.endsWith("/messages"))).toHaveLength(1);
+    expect(input).toHaveValue("And Sunday?");
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    release!();
+    expect(await screen.findByText("Yes, from 9 am.")).toBeInTheDocument();
+    expect(input).toHaveValue("And Sunday?");
+    await user.type(input, "{Enter}");
+    await waitFor(() => expect(calls.filter((c) => c.url.endsWith("/messages"))).toHaveLength(2));
   });
 
   it("offers working fallbacks when the assistant is unavailable", async () => {

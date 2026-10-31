@@ -100,6 +100,9 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   const sessionRef = useRef<string | null>(null);
   const confirmKey = useRef<Map<string, string>>(new Map());
   const [lastAnimated, setLastAnimated] = useState<string | null>(null);
+  // One message at a time: set while a send is in flight, so Enter, a quick reply or Try again
+  // can't send a second message before the first is answered.
+  const inFlight = useRef(false);
 
   const startSession = useCallback(async (): Promise<string | null> => {
     dispatch({ type: "starting" });
@@ -173,9 +176,21 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
     if (last?.role === "assistant") setLastAnimated(last.id);
   }, [state.lines]);
 
-  async function send(text: string, retried = false): Promise<void> {
+  /** Sends one message; false when nothing was sent because a reply is still pending. */
+  async function send(text: string, retried = false): Promise<boolean> {
     const message = validMessage(text);
-    if (!message) return;
+    if (!message) return false;
+    if (inFlight.current) return false;
+    inFlight.current = true;
+    try {
+      await deliver(message, retried);
+    } finally {
+      inFlight.current = false;
+    }
+    return true;
+  }
+
+  async function deliver(message: string, retried: boolean): Promise<void> {
     let id = sessionRef.current;
     dispatch(retried ? { type: "retrying" } : { type: "send", text: message });
     if (!id) id = await startSession();
@@ -196,7 +211,14 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
         sessionRef.current = null;
         dispatch({ type: "sessionLost" });
         const fresh = await startSession();
-        if (fresh) return send(message, true);
+        if (fresh) return deliver(message, true);
+      }
+      if (error instanceof ApiError && error.code === "turn_in_progress") {
+        // The server is still answering an earlier message (another tab, or a reply that
+        // outlived its request). Nothing was sent: the text goes back in the input.
+        dispatch({ type: "turnBusy", unsend: !retried });
+        if (!retried) setDraft((current) => (current.trim() ? current : message));
+        return;
       }
       if (error instanceof ApiError && error.code === "conversation_limit") {
         dispatch({ type: "replyFailed", message: CONVERSATION_LIMIT, final: true });
@@ -258,18 +280,23 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   }
 
   function changeProposal() {
+    if (inFlight.current) return;
     dispatch({ type: "withdraw" });
     void send("Show me a different time");
   }
 
+  const busy = state.typing || state.status === "starting";
+
   function onSubmit(event: FormEvent) {
     event.preventDefault();
+    // Enter submits the form even while the send button is disabled: keep the text until the
+    // pending reply has arrived.
+    if (busy || inFlight.current) return;
     const text = draft;
+    if (!validMessage(text)) return;
     setDraft("");
     void send(text);
   }
-
-  const busy = state.typing || state.status === "starting";
 
   // The card sits right after the message that offered it; if that line is gone, at the end.
   const card =
@@ -333,11 +360,21 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
             ))}
           </div>
         ) : null}
+        {state.notice ? (
+          <div role="status" className="self-start text-sm text-ink-3">
+            <p>{state.notice}</p>
+            {state.pending ? (
+              <button type="button" disabled={busy} onClick={() => void send(state.pending!, true)} className="mt-1 inline-flex items-center gap-1 font-semibold text-accent hover:underline">
+                <RotateCcw className="size-3.5" aria-hidden="true" /> Try again
+              </button>
+            ) : null}
+          </div>
+        ) : null}
         {state.error ? (
           <div role="alert" className="rounded-md border border-warn/30 bg-warn-tint/70 px-3 py-2 text-sm text-ink">
             <p>{state.error}</p>
             {state.pending ? (
-              <button type="button" onClick={() => void send(state.pending!, true)} className="mt-1 inline-flex items-center gap-1 font-semibold text-accent hover:underline">
+              <button type="button" disabled={busy} onClick={() => void send(state.pending!, true)} className="mt-1 inline-flex items-center gap-1 font-semibold text-accent hover:underline">
                 <RotateCcw className="size-3.5" aria-hidden="true" /> Try again
               </button>
             ) : null}

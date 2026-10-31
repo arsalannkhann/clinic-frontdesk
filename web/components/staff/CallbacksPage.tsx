@@ -1,13 +1,23 @@
 "use client";
 
-import { Phone } from "lucide-react";
+import { Phone, RotateCcw } from "lucide-react";
 import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { api, ApiError, errorMessage, withQuery } from "@/lib/api/client";
-import type { CallbackItem, CallbackResolved, CallbackStatus, CallStarted, OutboundStatus } from "@/lib/api/types";
-import { CALL_FAILURES, CALL_REFUSALS, callbackSource, callbackStatus, DEMO_RECORD } from "@/lib/labels";
+import type { CallbackItem, CallbackReopened, CallbackResolved, CallbackStatus, CallStarted, OutboundStatus } from "@/lib/api/types";
+import {
+  CALL_FAILURES,
+  CALL_OUTCOMES,
+  CALL_REFUSALS,
+  callbackSource,
+  callbackStatus,
+  DEMO_RECORD,
+  LAST_CALL_FAILED,
+  REOPEN_FAILURES,
+} from "@/lib/labels";
+import { cx } from "@/lib/cx";
 import { formatShortDate, formatTime } from "@/lib/time";
 import { Badge, LabelBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
@@ -59,6 +69,30 @@ export function callFailure(error: unknown): { code: string; text: string; clini
   return { code, text: errorMessage(error), clinicWide: false, refresh: false };
 }
 
+/**
+ * What the current call's outcome means for staff, or null when there is nothing to say: in
+ * Calling, the outcome of the call; on an open request, a note that its last call failed.
+ */
+export function callOutcomeNote(item: Pick<CallbackItem, "status" | "call_outcome">): string | null {
+  const outcome = item.call_outcome ?? null;
+  if (!outcome) return null;
+  if (item.status === "calling") return CALL_OUTCOMES[outcome] ?? null;
+  if (item.status === "open" && outcome === "failed") return LAST_CALL_FAILED;
+  return null;
+}
+
+/** Reopen is offered on a Calling request once its call has an outcome (owner/admin only). */
+export function canReopen(item: Pick<CallbackItem, "status" | "call_outcome">, canWrite: boolean): boolean {
+  return canWrite && item.status === "calling" && !!item.call_outcome && item.call_outcome in CALL_OUTCOMES;
+}
+
+/** What a refused reopen means, and whether the list is stale (the request moved on). */
+export function reopenFailure(error: unknown): { text: string; refresh: boolean } {
+  const code = error instanceof ApiError ? (error.status === 404 ? "not_found" : error.code) : "";
+  if (code in REOPEN_FAILURES) return { text: REOPEN_FAILURES[code]!, refresh: code !== "call_in_progress" };
+  return { text: errorMessage(error), refresh: false };
+}
+
 export function CallbacksPage() {
   const { clinic, canWrite, timeZone } = useStaff();
   const toast = useToast();
@@ -101,6 +135,30 @@ export function CallbacksPage() {
         toast.show(message.text, "error");
         if (message.refresh) void list.mutate();
       }
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function reopen(item: CallbackItem) {
+    const who = item.name ?? "this patient";
+    const yes = await confirm({
+      title: `Reopen the request from ${who}?`,
+      body: "This moves the request back to Open so you can try again with Call now. Nothing is dialled until someone presses Call now, and the earlier call still counts towards that day's contact limit.",
+      confirmLabel: "Reopen",
+      cancelLabel: "Keep as is",
+      tone: "primary",
+    });
+    if (!yes) return;
+    setBusy(`reopen:${item.id}`);
+    try {
+      await api<CallbackReopened>(`/api/staff/callbacks/${encodeURIComponent(item.id)}/reopen`, { method: "POST", body: {} });
+      toast.show(`Reopened the request from ${who}. It's back under Open.`);
+      void list.mutate();
+    } catch (error) {
+      const failure = reopenFailure(error);
+      toast.show(failure.text, "error");
+      if (failure.refresh) void list.mutate();
     } finally {
       setBusy(null);
     }
@@ -153,7 +211,9 @@ export function CallbacksPage() {
           </EmptyState>
         ) : (
           <ul className="flex flex-col gap-3">
-            {list.data.map((item) => (
+            {list.data.map((item) => {
+              const note = callOutcomeNote(item);
+              return (
               <li key={item.id} className="flex flex-col gap-3 rounded-lg border border-line bg-raised p-4 sm:flex-row sm:items-start sm:justify-between">
                 <div className="min-w-0">
                   <div className="flex flex-wrap items-center gap-2">
@@ -168,6 +228,9 @@ export function CallbacksPage() {
                     Requested {formatShortDate(item.created_at, timeZone)}, {formatTime(item.created_at, timeZone)}
                     {item.call_requested_at ? `. Call placed ${formatTime(item.call_requested_at, timeZone)}` : ""}
                   </p>
+                  {note ? (
+                    <p className={cx("mt-1 text-sm", item.call_outcome === "placed" ? "text-ink-2" : "font-semibold text-ink")}>{note}</p>
+                  ) : null}
                   {item.synthetic && item.status === "open" && canWrite ? (
                     <p id={`demo-${item.id}`} className="mt-1 text-xs font-semibold text-ink-2">
                       {DEMO_RECORD}
@@ -189,6 +252,18 @@ export function CallbacksPage() {
                         Call now
                       </Button>
                     ) : null}
+                    {canReopen(item, canWrite) ? (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        icon={<RotateCcw className="size-4" aria-hidden="true" />}
+                        disabled={!!busy}
+                        loading={busy === `reopen:${item.id}`}
+                        onClick={() => void reopen(item)}
+                      >
+                        Reopen
+                      </Button>
+                    ) : null}
                     <Button size="sm" variant="secondary" disabled={!!busy} loading={busy === `done:${item.id}`} onClick={() => void resolve(item, "done")}>
                       Mark done
                     </Button>
@@ -198,7 +273,8 @@ export function CallbacksPage() {
                   </div>
                 ) : null}
               </li>
-            ))}
+              );
+            })}
           </ul>
         )}
       </Tabs>

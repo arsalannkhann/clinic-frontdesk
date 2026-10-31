@@ -131,4 +131,58 @@ describe("dev mock API", () => {
     expect((await patch({ public_voice_number: "98000 00001" })).status).toBe(422);
     expect((await patch({ public_slug: "other" })).status).toBe(422);
   });
+
+  it("reports the call outcome and reopens a called request without dialling", async () => {
+    const owner = await signIn("owner@asterdental.example");
+    const viewer = await signIn("viewer@asterdental.example");
+    expect((await call("PATCH", "/v1/admin/clinic", { token: owner, body: JSON.stringify({ outbound_enabled: true }) })).status).toBe(200);
+    const open = (await call("GET", "/v1/staff/callbacks", { token: owner, search: "?status=open" })).body as { id: string; synthetic: boolean; call_outcome: string | null }[];
+    const live = open.find((item) => !item.synthetic)!;
+    expect(live.call_outcome).toBeNull();
+    const reopen = (id: string, token = owner) => call("POST", `/v1/staff/callbacks/${id}/reopen`, { token, body: "{}" });
+    // An open request is returned unchanged.
+    expect((await reopen(live.id)).body).toEqual({ id: live.id, status: "open" });
+
+    expect((await call("POST", `/v1/staff/callbacks/${live.id}/call`, { token: owner, body: "{}" })).status).toBe(202);
+    const calling = (await call("GET", "/v1/staff/callbacks", { token: owner, search: "?status=calling" })).body as { id: string; call_outcome: string }[];
+    expect(calling.find((item) => item.id === live.id)?.call_outcome).toBe("placed");
+
+    expect((await reopen(live.id, viewer)).status).toBe(403);
+    const reopened = await reopen(live.id);
+    expect(reopened.status).toBe(200);
+    expect(reopened.body).toEqual({ id: live.id, status: "open" });
+    const again = (await call("GET", "/v1/staff/callbacks", { token: owner, search: "?status=open" })).body as Record<string, unknown>[];
+    expect(again.find((item) => item.id === live.id)).toMatchObject({ status: "open", call_outcome: null, call_requested_at: null, execution_id: null });
+
+    await call("POST", `/v1/staff/callbacks/${live.id}/resolve`, { token: owner, body: JSON.stringify({ status: "done" }) });
+    expect(((await reopen(live.id)).body as { error: { code: string } }).error.code).toBe("callback_resolved");
+    expect((await reopen("0b5d1c1e-7a52-4f0e-9a51-3c1a8f0d0999")).status).toBe(404);
+  });
+
+  it("says whether the calendar read was truncated", async () => {
+    const owner = await signIn("owner@asterdental.example");
+    const from = new Date(Date.now() - 3 * 86_400_000).toISOString();
+    const to = new Date(Date.now() + 7 * 86_400_000).toISOString();
+    const result = await call("GET", "/v1/staff/calendar", { token: owner, search: `?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}` });
+    expect(result.status).toBe(200);
+    expect((result.body as { truncated: boolean }).truncated).toBe(false);
+  });
+
+  it("refuses a chat confirm of a deactivated service as slot_unavailable", async () => {
+    const owner = await signIn("owner@asterdental.example");
+    const created = await call("POST", "/v1/chat/clinics/aster-dental/sessions", { body: "{}" });
+    const id = (created.body as { session_id: string }).session_id;
+    const turn = await call("POST", `/v1/chat/sessions/${id}/messages`, { body: JSON.stringify({ text: "I'd like a check-up" }) });
+    const proposal = (turn.body as { proposal: { id: string; doctor_name: string; service_name: string } }).proposal;
+    const doctors = (await call("GET", "/v1/admin/doctors", { token: owner })).body as { id: string; name: string }[];
+    const doctor = doctors.find((d) => d.name === proposal.doctor_name)!;
+    const services = (await call("GET", "/v1/admin/services", { token: owner })).body as { id: string; doctor_id: string; name: string }[];
+    const service = services.find((s) => s.doctor_id === doctor.id && s.name === proposal.service_name)!;
+    expect((await call("PATCH", `/v1/admin/services/${service.id}`, { token: owner, body: JSON.stringify({ active: false }) })).status).toBe(200);
+    const confirm = await call("POST", `/v1/chat/sessions/${id}/proposals/${proposal.id}/confirm`, {
+      body: JSON.stringify({ name: "Ananya Krishnan", phone: "+919876543210", consent_contact: true }),
+    });
+    expect(confirm.status).toBe(409);
+    expect((confirm.body as { error: { code: string } }).error.code).toBe("slot_unavailable");
+  });
 });

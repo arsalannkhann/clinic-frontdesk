@@ -32,6 +32,8 @@ export interface ChatState {
   error: string | null;
   /** The last user text, for a retry after a failure. */
   pending: string | null;
+  /** A quiet status line (not an error), such as a turn the server is still answering. */
+  notice: string | null;
 }
 
 export const initialChat: ChatState = {
@@ -47,6 +49,7 @@ export const initialChat: ChatState = {
   booking: null,
   error: null,
   pending: null,
+  notice: null,
 };
 
 export type ChatAction =
@@ -59,6 +62,8 @@ export type ChatAction =
   | { type: "retrying" }
   | { type: "reply"; reply: ChatReply }
   | { type: "replyFailed"; message: string; final?: boolean }
+  /** 409 turn_in_progress: nothing was sent; `unsend` takes the new message back off screen. */
+  | { type: "turnBusy"; unsend: boolean }
   | { type: "sessionLost" }
   | { type: "reset" }
   | { type: "confirming" }
@@ -83,6 +88,9 @@ export const CONFIRM_ERRORS: Record<string, string> = {
   idempotency_conflict: "Your details changed after the first attempt. Check them and press Confirm booking again.",
   consent_required: "Tick the box to let the clinic contact you about this appointment. It's needed to book.",
 };
+
+/** Shown when the server is still answering an earlier message (409 turn_in_progress). */
+export const TURN_IN_PROGRESS = "Still answering your last message…";
 
 /** The reply to a message once the conversation is too long to continue. */
 export const CONVERSATION_LIMIT =
@@ -166,10 +174,11 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         typing: true,
         quickReplies: [],
         error: null,
+        notice: null,
         pending: action.text,
       };
     case "retrying":
-      return { ...state, typing: true, error: null, quickReplies: [] };
+      return { ...state, typing: true, error: null, notice: null, quickReplies: [] };
     case "reply": {
       const lines = action.reply.messages
         .filter((m) => m.role === "assistant" && m.text.trim())
@@ -190,6 +199,7 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         proposalError: null,
         booking: proposal ? null : state.booking,
         pending: null,
+        notice: null,
       };
     }
     case "replyFailed":
@@ -200,6 +210,20 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
         quickReplies: action.final ? [NEW_CHAT, ...FALLBACK_REPLIES] : FALLBACK_REPLIES,
         pending: action.final ? null : state.pending,
       };
+    case "turnBusy": {
+      // The server refused the message unread, so it comes off the transcript (the widget puts
+      // it back in the input) unless it was a retry of one already shown.
+      const last = state.lines.findLastIndex((line) => line.role === "user");
+      const lines = action.unsend && last >= 0 ? [...state.lines.slice(0, last), ...state.lines.slice(last + 1)] : state.lines;
+      return {
+        ...state,
+        lines,
+        typing: false,
+        error: null,
+        notice: TURN_IN_PROGRESS,
+        pending: action.unsend ? null : state.pending,
+      };
+    }
     case "reset":
       return initialChat;
     case "sessionLost":

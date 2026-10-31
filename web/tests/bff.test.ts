@@ -8,6 +8,7 @@ import { clientIp, isSameOriginWrite, readSessionToken, requestOrigin } from "@/
 import { ADMIN_ROUTES, adminHandler, chatHandler, publicHandler, STAFF_ROUTES, staffHandler } from "@/lib/server/routes";
 import { pickQuery, readJsonBody, readLimitedText, safeSegments } from "@/lib/server/upstream";
 import { missingProductionSettings } from "@/instrumentation";
+import { getClinic, getDoctors, getServices } from "@/lib/server/publicData";
 
 const SITE = "http://localhost:3000";
 const API = "https://api.example.test";
@@ -218,7 +219,7 @@ describe("staff and admin proxy", () => {
         expect(calls[expected - 1]!.init.method).toBe(route.method);
       }
     }
-    expect(STAFF_ROUTES.length + ADMIN_ROUTES.length).toBe(27);
+    expect(STAFF_ROUTES.length + ADMIN_ROUTES.length).toBe(28);
   });
 
   it("404s anything outside the staff and admin allowlists without calling the API", async () => {
@@ -228,6 +229,8 @@ describe("staff and admin proxy", () => {
       ["POST", ["calendar"]],
       ["GET", ["bookings"]],
       ["POST", ["callbacks", "not-a-uuid", "call"]],
+      ["POST", ["callbacks", "not-a-uuid", "reopen"]],
+      ["GET", ["callbacks", ID, "reopen"]],
       ["POST", ["callbacks", ID, "delete"]],
       ["PATCH", ["callbacks", ID]],
       ["GET", ["conversations", ID, "export"]],
@@ -414,6 +417,22 @@ describe("client IP and proxy secret", () => {
     respond = () => json({ detail: "bad" }, 400);
     const response = await publicHandler(request("/api/public/services"), ctx(["services"]));
     expect(await response.text()).not.toContain(PROXY_SECRET);
+  });
+
+  it("sends the secret on server-side public page reads, and falls back when the API refuses", async () => {
+    respond = () => json({ name: "Aster Dental Studio", timezone: "Asia/Kolkata" });
+    expect((await getClinic())?.name).toBe("Aster Dental Studio");
+    expect(calls[0]!.url).toBe(`${API}/v1/public/clinics/aster-dental`);
+    expect(upstreamHeaders().get("x-proxy-secret")).toBe(PROXY_SECRET);
+    // An API without its own PUBLIC_PROXY_SECRET answers 503 unavailable on every public
+    // route: the pages get null and render their fallback profile, never an error page.
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    respond = () => json({ error: { code: "unavailable", message: "Temporarily unavailable" } }, 503);
+    expect(await getClinic()).toBeNull();
+    expect(await getServices()).toBeNull();
+    expect(await getDoctors()).toBeNull();
+    expect(error.mock.calls.flat().join(" ")).not.toContain(PROXY_SECRET);
+    error.mockRestore();
   });
 
   it("omits the secret in mock mode and when unset", () => {

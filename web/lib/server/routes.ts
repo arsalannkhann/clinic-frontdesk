@@ -109,6 +109,8 @@ export const STAFF_ROUTES: readonly StaffRoute[] = [
   { method: "GET", pattern: "callbacks", query: ["status"] },
   { method: "POST", pattern: "callbacks/{id}/call" },
   { method: "POST", pattern: "callbacks/{id}/resolve" },
+  // Back to open after a placed, unknown or failed call (owner/admin). Never dials.
+  { method: "POST", pattern: "callbacks/{id}/reopen" },
   { method: "GET", pattern: "conversations", query: ["channel"] },
   { method: "GET", pattern: "conversations/{id}" },
   { method: "GET", pattern: "stats" },
