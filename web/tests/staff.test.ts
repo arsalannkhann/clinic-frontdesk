@@ -9,11 +9,41 @@ import { canWriteRole } from "@/components/staff/StaffContext";
 
 describe("staff helpers", () => {
   it("only returns to a staff page after sign-in", () => {
-    expect(safeNext("/staff/calendar?view=week")).toBe("/staff/calendar?view=week");
-    expect(safeNext("/staff")).toBe("/staff");
-    for (const bad of [null, "", "https://evil.example", "//evil.example", "/staffevil", "/staff\\..\\x", "/staff/login", "/book"]) {
-      expect(safeNext(bad)).toBe("/staff");
+    const origin = "https://clinic.example";
+    expect(safeNext("/staff/calendar?view=week", origin)).toBe("/staff/calendar?view=week");
+    expect(safeNext("/staff", origin)).toBe("/staff");
+    expect(safeNext("/staff/callbacks#open", origin)).toBe("/staff/callbacks#open");
+    expect(safeNext("/staff?x=1", origin)).toBe("/staff?x=1");
+    for (const bad of [
+      null,
+      "",
+      "https://evil.example",
+      "https://clinic.example/staff",
+      "//evil.example",
+      "///evil.example/staff",
+      "/\\evil.example",
+      "/staffevil",
+      "/staff\\..\\x",
+      "/staff/login",
+      "/staff/login?next=/staff",
+      "/book",
+      "/staff/../book",
+      "/staff/./calendar",
+      "/staff/%2e%2e/book",
+      "/staff/%2E/calendar",
+      "/staff/.%2e/book",
+      "/staff/calendar/..",
+      "/staff/\tcalendar",
+      "javascript:alert(1)",
+      "staff",
+    ]) {
+      expect(safeNext(bad, origin), String(bad)).toBe("/staff");
     }
+  });
+
+  it("uses the page origin by default", () => {
+    expect(safeNext("/staff/settings")).toBe("/staff/settings");
+    expect(safeNext(`${window.location.origin}/staff/settings`)).toBe("/staff");
   });
 
   it("explains why Call now is unavailable", () => {

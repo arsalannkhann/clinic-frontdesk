@@ -8,11 +8,34 @@ import type { LoginResult } from "@/lib/api/types";
 import { Button } from "@/components/ui/Button";
 import { Field, Input } from "@/components/ui/Field";
 
-/** Only same-site console paths are accepted as a post-login destination. */
-export function safeNext(value: string | null): string {
-  if (!value || !/^\/staff(?:[/?#]|$)/.test(value) || value.includes("\\")) return "/staff";
-  if (value.startsWith("/staff/login")) return "/staff";
-  return value;
+const HOME = "/staff";
+
+function currentOrigin(): string {
+  return typeof window === "undefined" ? "http://localhost" : window.location.origin;
+}
+
+/**
+ * Only a same-origin console path is accepted as a post-login destination. The value is
+ * resolved with `new URL(next, origin)`; it must stay on this origin, resolve to `/staff` or
+ * `/staff/...` (not the sign-in page), and contain no dot segments, encoded or not: the path
+ * as written must equal the normalised path. Anything else goes to `/staff`.
+ */
+export function safeNext(value: string | null, origin: string = currentOrigin()): string {
+  if (!value || !value.startsWith("/") || value.startsWith("//")) return HOME;
+  if (/[\\\u0000-\u001f\u007f\s]/.test(value)) return HOME;
+  let url: URL;
+  try {
+    url = new URL(value, origin);
+  } catch {
+    return HOME;
+  }
+  if (url.origin !== new URL(origin).origin) return HOME;
+  const rawPath = value.split(/[?#]/, 1)[0]!;
+  if (rawPath !== url.pathname) return HOME; // a dot segment (or %2e) was normalised away
+  if (rawPath.split("/").some((segment) => /^(?:\.|%2e){1,2}$/i.test(segment))) return HOME;
+  if (url.pathname !== HOME && !url.pathname.startsWith(`${HOME}/`)) return HOME;
+  if (url.pathname === `${HOME}/login` || url.pathname.startsWith(`${HOME}/login/`)) return HOME;
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 export function LoginForm() {
