@@ -742,6 +742,14 @@ def test_access_log_redacts_session_ids():
     )
 
 
+def test_session_ids_in_paths_are_documented_as_logged_by_the_platform():
+    from pathlib import Path
+
+    for doc in ("docs/adr/0011-chat-and-outbound-callbacks.md", "docs/OPERATIONS.md"):
+        text = Path(doc).read_text()
+        assert "platform request logs" in text and "/v1/chat/sessions/" in text, doc
+
+
 def test_session_ids_are_random_128_bit(env):
     ids = {start(env) for _ in range(3)}
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
