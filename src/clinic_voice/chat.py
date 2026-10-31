@@ -910,8 +910,10 @@ def _answer_pending(turn, pending) -> None:
 def confirm(url, settings, token, proposal_id, request, address, idempotency_key=None, ports=None):
     """Book a proposal (channel chat) with the name, phone and consent from the card.
     Order: session (404), consent (422), rate limits (429), proposal (404; 409
-    proposal_used when consumed under another key; 410 proposal_expired), then
-    public.create_booking. A repeated confirm (double click, retry) replays the booking."""
+    proposal_used when consumed under another key; 410 proposal_expired), the service
+    still publicly offered (409 slot_unavailable), then public.create_booking, whose gate
+    re-checks the clinic (row FOR SHARE), the proposal (row FOR UPDATE) and the offer. A
+    repeated confirm (double click, retry) replays the booking."""
     keyring, hash_key = public.crypto(settings)
     with connect(url) as conn:
         session = find_session(conn, token)
@@ -933,34 +935,41 @@ def confirm(url, settings, token, proposal_id, request, address, idempotency_key
             # only first attempts count against the booking limits.
             public.booking_limits(conn, settings, hash_key, clinic_id, request.phone, address)
         clinic = _clinic(conn, clinic_id)
-        offer = conn.execute(
-            """SELECT s.doctor_id, s.id AS service_row_id, d.name AS doctor_name,
-            s.name AS service_name FROM services s
-            JOIN doctors d ON d.clinic_id=s.clinic_id AND d.id=s.doctor_id
-            WHERE s.clinic_id=%s AND s.id=%s AND s.doctor_id=%s""",
-            (clinic_id, proposal["service_id"], proposal["doctor_id"]),
-        ).fetchone()
+        # A consumed proposal books nothing new (replay or proposal_used, decided under the
+        # action lock), so it only needs the names, even if the service was hidden since.
+        offer = _offered(conn, clinic_id, proposal, public_only=proposal["consumed_at"] is None)
         conn.commit()
     if offer is None:
-        raise not_found()
+        raise public.fail(public.SLOT_UNAVAILABLE)
     material = str(proposal_id) + (f":{idempotency_key}" if idempotency_key else "")
     key = KEY_PREFIX + hashlib.sha256(material.encode()).hexdigest()
 
     def gate(conn):
-        # After the action lock (a replay of the same key returned before this): the
-        # proposal must be unused and unexpired, and the clinic's chat still on.
+        # After the action lock (a replay of the same key returned before this). Level 1b
+        # (locks.py): the clinic row FOR SHARE, as the web gate takes it, so a change that
+        # turns the public site or the chat off waits for this booking or wins before it.
         row = conn.execute(
-            """SELECT p.consumed_at, p.expires_at, c.public_enabled, c.public_chat_enabled
-            FROM chat_proposals p JOIN clinics c ON c.id=p.clinic_id
-            WHERE p.clinic_id=%s AND p.id=%s FOR UPDATE OF p""",
-            (clinic_id, proposal_id),
+            "SELECT public_enabled, public_chat_enabled FROM clinics WHERE id=%s FOR SHARE",
+            (clinic_id,),
         ).fetchone()
         if row is None or not (row["public_enabled"] and row["public_chat_enabled"]):
+            raise not_found()
+        # Level 1c: the proposal row FOR UPDATE; it must be unused and unexpired.
+        row = conn.execute(
+            "SELECT consumed_at, expires_at FROM chat_proposals WHERE clinic_id=%s AND id=%s"
+            " FOR UPDATE",
+            (clinic_id, proposal_id),
+        ).fetchone()
+        if row is None:
             raise not_found()
         if row["consumed_at"] is not None:
             raise fail("proposal_used", 409, "This time was already booked from this chat")
         if row["expires_at"] <= service.utc_now():
             raise fail("proposal_expired", 410, "This offer has expired; please ask again")
+        # The service must still be offered on the website (public.OFFERED): one hidden or
+        # deactivated since the proposal was made cannot be booked from it.
+        if _offered(conn, clinic_id, proposal) is None:
+            raise public.fail(public.SLOT_UNAVAILABLE)
 
     def consumed(conn, appointment_id, patient_id):
         conn.execute(
@@ -1001,6 +1010,20 @@ def confirm(url, settings, token, proposal_id, request, address, idempotency_key
         if not _noted(conn, keyring, session, proposal_id):
             append(conn, keyring, session, "system", note)
     return public.public_booking(result)
+
+
+def _offered(conn, clinic_id, proposal, public_only=True):
+    """The proposal's service row as an offerings() row while it is publicly offered
+    (public.OFFERED: service active and public, doctor active), else None. public_only=False
+    returns it whatever its state (names for a replayed confirm)."""
+    offered = public.OFFERED if public_only else "true"
+    return conn.execute(
+        f"""SELECT s.doctor_id, s.id AS service_row_id, d.name AS doctor_name,
+        s.name AS service_name FROM services s
+        JOIN doctors d ON d.clinic_id=s.clinic_id AND d.id=s.doctor_id
+        WHERE s.clinic_id=%s AND s.id=%s AND s.doctor_id=%s AND {offered}""",  # noqa: S608
+        (clinic_id, proposal["service_id"], proposal["doctor_id"]),
+    ).fetchone()
 
 
 def _noted(conn, keyring, session, proposal_id) -> bool:

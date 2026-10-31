@@ -6,9 +6,9 @@ locks in this global order, and never in reverse, so the paths cannot deadlock:
 1a. Call session row FOR NO KEY UPDATE (Bolna gateway only): serializes the per-session
    appointment cap check in reserve(), and verification failure counting in
    bolna.bookings.verify (which takes no other lock).
-1b. Clinic row FOR SHARE (Bolna gateway only, gateway.require_line(lock=True)): every
-   booking-changing tool re-checks the clinic's line inside its write transaction (reserve,
-   cancel, reschedule, opt-out; opt-out takes no earlier lock). Changes that close the line
+1b. Clinic row FOR SHARE (Bolna gateway, gateway.require_line(lock=True); the web and chat
+   booking gates, below): every booking-changing tool re-checks the clinic's line inside its
+   write transaction (reserve, cancel, reschedule, opt-out; opt-out takes no earlier lock). Changes that close the line
    update the clinic row (admin.update_clinic, test_calls_enabled off), which takes no other
    lock, so it waits for in-flight tool writes and no tool write commits after it.
 2. Doctor-set advisory lock ("doctors:<clinic>"): shared by create_doctor, exclusive for a
@@ -62,6 +62,20 @@ committed before that lock always suppresses the send.
 Staff callback calls (P2, callbacks.py) take the contact-budget lock of today, then the
 callback_requests row FOR UPDATE, then the clinic row FOR SHARE, and nothing else, so they
 fit the contact order above (budget lock before the clinic row) and share its budget.
+
+Web and chat bookings (P1/P2, public.py and chat.py) go through service.reserve, so they take
+level 1 (their channel-prefixed idempotency key), then a gate at level 1b: the clinic row FOR
+SHARE (public_enabled, and for chat public_chat_enabled too), exactly like the gateway's line
+check. The chat confirm's gate then takes level 1c, its chat_proposals row FOR UPDATE (it
+must be unconsumed and unexpired, and its service still publicly offered), before the doctor
+rows (3) and the patient lock (4). After the appointment insert the same transaction updates
+that proposal row (consumed_at, already locked) and, last, its chat_sessions row (patient_id,
+FOR NO KEY UPDATE). The session row is a leaf: chat turns (chat.send, chat.append) lock it
+FOR UPDATE and then only insert chat_messages rows, and propose_booking only inserts proposal
+rows (a FOR KEY SHARE on the session through the foreign key), so neither waits on anything a
+confirm holds. Residual: retention deletes an inactive session and so its proposals (session
+row, then proposal rows), the reverse of a confirm; it only selects sessions idle for
+RETENTION_SESSION_DAYS, and PostgreSQL's deadlock detector aborts one side if they meet.
 
 Provisioning (T10, provisioning.py and handlers/provisioning.py), outside the scheduling
 locks: staff requests (advance, select_number, activate, reset) lock the provisioning row

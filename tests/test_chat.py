@@ -664,6 +664,125 @@ def test_session_ids_are_random_128_bit(env):
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
 
 
+# --- Review fixes: confirm gate (clinic row lock, hidden services, parallel confirms) --------
+
+
+def _hide_service(url, **values):
+    with connect(url) as conn:
+        sets = ", ".join(f"{k}=%s" for k in values)
+        conn.execute(
+            f"UPDATE services SET {sets} WHERE id=%s",  # noqa: S608
+            (*values.values(), SERVICE_ID),
+        )
+
+
+@pytest.mark.parametrize("change", [{"public": False}, {"active": False}])
+def test_a_service_hidden_after_the_proposal_cannot_be_booked(env, change):
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    _hide_service(env["url"], **change)
+    assert_envelope(confirm(env, session, proposal), 409, "slot_unavailable")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+        assert (
+            conn.execute("SELECT consumed_at FROM chat_proposals").fetchone()["consumed_at"] is None
+        )
+
+
+def test_the_confirm_gate_rechecks_the_offer_inside_the_transaction(env, monkeypatch):
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    real = chat._offered
+    seen = []
+
+    def hide_after_precheck(conn, clinic_id, row, public_only=True):
+        seen.append(public_only)
+        if len(seen) == 2:  # The gate's check, inside the booking transaction.
+            _hide_service(env["url"], public=False)
+        return real(conn, clinic_id, row, public_only)
+
+    monkeypatch.setattr(chat, "_offered", hide_after_precheck)
+    assert_envelope(confirm(env, session, proposal), 409, "slot_unavailable")
+    assert seen == [True, True]
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def test_a_replayed_confirm_still_answers_after_the_service_is_hidden(env):
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    first = confirm(env, session, proposal)
+    _hide_service(env["url"], public=False)
+    again = confirm(env, session, proposal)
+    assert first.status_code == again.status_code == 202 and again.json() == first.json()
+
+
+def test_the_confirm_gate_takes_the_clinic_row_for_share(env):
+    """A clinic update in flight (it holds the row FOR NO KEY UPDATE, like the UPDATE in
+    admin.update_clinic) blocks the confirm at the gate; once it commits chat off, the
+    confirm books nothing. Foreign-key checks alone (FOR KEY SHARE) would not wait."""
+    import threading
+
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    result = {}
+
+    def run():
+        result["response"] = confirm(env, session, proposal)
+
+    worker = threading.Thread(target=run)
+    with connect(env["url"]) as holder:  # Commits (and releases the row) on every exit.
+        holder.execute("SELECT 1 FROM clinics WHERE id=%s FOR NO KEY UPDATE", (CLINIC,))
+        worker.start()
+        worker.join(timeout=2)
+        blocked = worker.is_alive()
+        holder.execute("UPDATE clinics SET public_chat_enabled=false WHERE id=%s", (CLINIC,))
+    worker.join(timeout=10)
+    assert blocked, "the confirm must wait for the clinic row"
+    assert not worker.is_alive()
+    assert_envelope(result["response"], 404, "not_found")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def test_parallel_confirms_with_different_keys_book_once(env, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("PUBLIC_BOOKING_PHONE_PER_DAY", "100")
+    monkeypatch.setenv("PUBLIC_BOOKING_IP_PER_HOUR", "100")
+    get_settings.cache_clear()
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    barrier = threading.Barrier(4)
+    responses = []
+
+    def run(index):
+        barrier.wait()
+        responses.append(
+            confirm(env, session, proposal, headers={"Idempotency-Key": f"card-key-{index:04d}"})
+        )
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    statuses = sorted(r.status_code for r in responses)
+    assert statuses == [202, 409, 409, 409], [r.text for r in responses]
+    assert {r.json()["error"]["code"] for r in responses if r.status_code == 409} == {
+        "proposal_used"
+    }
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 1
+        used = conn.execute("SELECT consumed_at, appointment_id FROM chat_proposals").fetchone()
+    assert used["consumed_at"] is not None and used["appointment_id"] is not None
+
+
 # --- Review fixes: unclosed reasoning and length-truncated replies ---------------------------
 
 
