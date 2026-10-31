@@ -13,8 +13,10 @@ from psycopg import Error as DatabaseError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from clinic_voice import staff as staff_service
+from clinic_voice import staff_platform
 from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
 from clinic_voice.bolna.gateway import refuse_context, require_line
+from clinic_voice.chat import KEY_PREFIX as CHAT_KEY_PREFIX
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tool_caller
 from clinic_voice.errors import NotFound, PublicError
@@ -24,8 +26,10 @@ from clinic_voice.routes_appointments import router as appointments_router
 from clinic_voice.routes_bolna import router as bolna_router
 from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
+from clinic_voice.routes_chat import router as chat_router
 from clinic_voice.routes_internal import router as internal_router
 from clinic_voice.routes_public import router as public_router
+from clinic_voice.routes_staff import router as staff_router
 from clinic_voice.routes_webhooks import router as webhooks_router
 from clinic_voice.schemas import (
     CONTEXT_CODES,
@@ -39,6 +43,7 @@ from clinic_voice.schemas import (
     SessionResponse,
     SlotQuery,
     SlotResponse,
+    StaffMe,
     StaffUser,
     StaffUserCreate,
     StaffUserDetail,
@@ -52,6 +57,8 @@ from clinic_voice.service import appointment_status, reserve, slots
 # slashes and unknown (404) paths are redacted too.
 TOKEN_SHAPE = re.compile(r"cv[tbws]_[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{43}")
 WEBHOOK_SEGMENT = re.compile(r"(/webhooks/+[^/?#]+/+)[^/?#]+")
+# A chat session id is a bearer secret in the path (/v1/chat/sessions/<id>/...).
+CHAT_SEGMENT = re.compile(r"(/chat/+sessions/+)[^/?#]+")
 REDACTED_SEGMENT = "<redacted>"
 
 
@@ -59,6 +66,7 @@ def redact_path(path: str) -> str:
     """The request path without its query string and with credential segments redacted."""
     path = path.split("?", 1)[0]
     path = TOKEN_SHAPE.sub(REDACTED_SEGMENT, path)
+    path = CHAT_SEGMENT.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path)
     return WEBHOOK_SEGMENT.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path)
 
 
@@ -193,11 +201,14 @@ app.include_router(oauth_router)
 app.include_router(bolna_router)
 app.include_router(webhooks_router)
 app.include_router(public_router)
+app.include_router(chat_router)
+app.include_router(staff_router)
 app.include_router(internal_router)
 
-PUBLIC_PATH = "/v1/public/"
+PUBLIC_PATHS = ("/v1/public/", "/v1/chat/")
 PUBLIC_CODES = {
     400: "invalid_request",
+    403: "forbidden",
     404: "not_found",
     405: "method_not_allowed",
     409: "conflict",
@@ -213,7 +224,7 @@ def _is_public(request) -> bool:
     root = request.scope.get("root_path") or ""
     if root and path.startswith(root):
         path = path[len(root) :]
-    return path.startswith(PUBLIC_PATH)
+    return path.startswith(PUBLIC_PATHS)
 
 
 def envelope(status: int, code: str, message: str, headers=None) -> JSONResponse:
@@ -283,7 +294,9 @@ async def validation_error(request, exc):
     )
 
 
-REQUIRED_MIGRATION = "018_platform.sql"
+# Keys the Bolna gateway, the website, the chat confirm, staff bookings and the seed derive.
+RESERVED_KEY_PREFIXES = (BOLNA_KEY_PREFIX, WEB_KEY_PREFIX, CHAT_KEY_PREFIX, "staff:", "seed:")
+REQUIRED_MIGRATION = "019_chat.sql"
 
 
 @app.get("/health/live")
@@ -325,7 +338,7 @@ def reserve_slot(
     ],
     caller=Depends(tool_caller),
 ):
-    if idempotency_key.startswith((BOLNA_KEY_PREFIX, WEB_KEY_PREFIX)):
+    if idempotency_key.startswith(RESERVED_KEY_PREFIXES):
         # Reserved for keys the Bolna gateway and the public booking API derive (Bolna keys
         # bind appointments to a call session; web keys to a contact).
         raise HTTPException(422, "Idempotency key prefix is reserved")
@@ -369,9 +382,11 @@ def staff_logout(staff=Depends(staff_session)):
     return Response(status_code=204)
 
 
-@app.get("/v1/staff/me", response_model=StaffUser)
+@app.get("/v1/staff/me", response_model=StaffMe)
 def staff_me(staff=Depends(staff_session)):
-    return staff_service.public(staff)
+    """The signed-in staff member and their clinic {id, name, timezone, public_slug}."""
+    with database() as conn:
+        return staff_platform.me(conn, staff)
 
 
 @app.post("/v1/staff/me/password", status_code=204)

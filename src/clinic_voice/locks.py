@@ -59,6 +59,10 @@ updates only reminder rows (no appointment lock) and then inserts reminder.stop 
 send re-reads consent and opt-out only after locking its reminder row, so an opt-out
 committed before that lock always suppresses the send.
 
+Staff callback calls (P2, callbacks.py) take the contact-budget lock of today, then the
+callback_requests row FOR UPDATE, then the clinic row FOR SHARE, and nothing else, so they
+fit the contact order above (budget lock before the clinic row) and share its budget.
+
 Provisioning (T10, provisioning.py and handlers/provisioning.py), outside the scheduling
 locks: staff requests (advance, select_number, activate, reset) lock the provisioning row
 FOR UPDATE (inserting it first when missing), then read the clinic row (FOR SHARE in

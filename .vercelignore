@@ -1,10 +1,12 @@
-# API project (repository root). Only pyproject.toml, index.py, vercel.json and src/ are
+# API project (repository root). Only pyproject.toml, index.py, vercel.json, src/ and
+# agents/prompts/ (read by bolna/agent_config.py when provisioning compiles an agent) are
 # needed at runtime; the web app (web/) is its own Vercel project.
 web/
 dashboard/
 tests/
 docs/
-agents/
+agents/*
+!agents/prompts/
 migrations/
 .github/
 .claude/
@@ -14,3 +16,4 @@ migrations/
 compose.yaml
 Dockerfile
 *.md
+!agents/prompts/*.md

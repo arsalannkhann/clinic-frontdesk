@@ -307,16 +307,17 @@ def _agent(conn, job, port, row) -> bool:
             tool_token=token,
             webhook_url=agent_config.webhook_url(base, webhook_token),
         )
-    except ValueError:
+    except (ValueError, OSError) as error:
         # Nothing was sent: give this attempt's credentials up and restore the previous
-        # intent (an earlier timed-out create may still be unresolved).
+        # intent (an earlier timed-out create may still be unresolved). OSError: the prompt
+        # file (agents/prompts/) is missing from the deployment bundle or unreadable.
         return _finish(
             conn,
             job,
             row,
             "failed",
             "agent",
-            "agent_config_invalid",
+            "prompt_unavailable" if isinstance(error, OSError) else "agent_config_invalid",
             agent_create_pending=row["agent_create_pending"],
             attempt_credential_id=row["attempt_credential_id"],
             attempt_webhook_credential_id=row["attempt_webhook_credential_id"],

@@ -25,7 +25,7 @@ def _authorized(authorization: str | None, secret: str) -> bool:
     scheme, _, token = (authorization or "").partition(" ")
     # Compare even for a wrong scheme, so timing does not tell the two apart.
     matches = hmac.compare_digest(token.encode(), secret.encode())
-    return scheme == "Bearer" and matches
+    return scheme.lower() == "bearer" and matches  # RFC 9110: schemes are case-insensitive.
 
 
 @router.post(

@@ -110,15 +110,56 @@ class Settings(BaseSettings):
     public_lookup_ip_per_hour: int = Field(default=10, ge=1, le=10000)
     public_callback_ip_per_hour: int = Field(default=3, ge=1, le=10000)
     public_callback_phone_per_day: int = Field(default=3, ge=1, le=1000)
+    public_lookup_phone_per_day: int = Field(default=10, ge=1, le=1000)
+    public_slots_ip_per_hour: int = Field(default=120, ge=1, le=100000)
+    # Profile, services and doctors (cacheable catalogue reads).
+    public_read_ip_per_hour: int = Field(default=600, ge=1, le=100000)
+    # Shared secret of the web app's server (the BFF), sent as X-Proxy-Secret on every
+    # /v1/public/* and /v1/chat/* request (edge.py). Set: those paths refuse requests
+    # without it (403) and take the client address from X-Client-IP. Unset (local
+    # development): no check, and the socket / TRUSTED_PROXY_HOPS address is used.
+    public_proxy_secret: SecretStr | None = None
+    # Chat assistant (P2, chat.py). OpenAI-compatible chat completions with tools; the
+    # default is Sarvam. Unset API key: the chat answers with guided quick replies only.
+    chat_llm_base_url: str = "https://api.sarvam.ai/v1"
+    chat_llm_model: str = "sarvam-105b"
+    chat_llm_api_key: SecretStr | None = None
+    # Header carrying the key: "api-subscription-key" (Sarvam) or "authorization"
+    # (Authorization: Bearer <key>, OpenAI style).
+    chat_llm_auth_header: str = "api-subscription-key"
+    chat_llm_timeout_seconds: float = Field(default=25.0, ge=1.0, le=60.0)
+    chat_llm_max_tokens: int = Field(default=1500, ge=64, le=8192)
+    chat_max_turns: int = Field(default=40, ge=1, le=500)
+    chat_session_ip_per_hour: int = Field(default=10, ge=1, le=10000)
+    chat_message_ip_per_hour: int = Field(default=120, ge=1, le=100000)
 
-    @field_validator("worker_tick_secret")
+    @field_validator("worker_tick_secret", "public_proxy_secret")
     @classmethod
-    def _tick_secret(cls, value):
+    def _tick_secret(cls, value, info):
         if value is None or not value.get_secret_value():
             return None
         if len(value.get_secret_value()) < 32:
-            raise ValueError("worker_tick_secret must be at least 32 characters")
+            raise ValueError(f"{info.field_name} must be at least 32 characters")
         return value
+
+    @field_validator("chat_llm_base_url")
+    @classmethod
+    def _chat_base(cls, value):
+        checked = _https_or_loopback(value, "chat_llm_base_url")
+        if checked is None:
+            raise ValueError("chat_llm_base_url is required")
+        return checked.rstrip("/")
+
+    @field_validator("chat_llm_auth_header")
+    @classmethod
+    def _chat_header(cls, value):
+        value = value.strip().lower()
+        if value not in ("api-subscription-key", "authorization"):
+            raise ValueError("chat_llm_auth_header must be api-subscription-key or authorization")
+        return value
+
+    def chat_configured(self) -> bool:
+        return bool(self.chat_llm_api_key and self.chat_llm_api_key.get_secret_value())
 
     @field_validator("dashboard_origins")
     @classmethod

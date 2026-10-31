@@ -480,6 +480,14 @@ def test_tick_runs_due_jobs_and_returns_counts_only(env):
     assert status == "confirmed"
 
 
+@pytest.mark.parametrize("scheme", ["bearer", "BEARER", "Bearer"])
+def test_tick_bearer_scheme_is_case_insensitive(env, scheme):
+    r = env["client"].post(
+        "/v1/internal/worker/tick", headers={"Authorization": f"{scheme} {TICK_SECRET}"}
+    )
+    assert r.status_code == 200
+
+
 def test_tick_short_secret_is_a_configuration_error(monkeypatch):
     with pytest.raises(ValueError):
         Settings(database_url="postgresql://u@h/d", worker_tick_secret="short")
@@ -1103,12 +1111,17 @@ def test_seed_platform_is_synthetic_consistent_and_idempotent(empty):
         assert local.date() != date(2026, 11, 8) or row["status"] == "cancelled"
     # Idempotent: nothing is added or duplicated.
     again = seed_platform.seed(empty, get_settings())
-    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "jobs": 0}
+    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "chats": 0, "jobs": 0}
     with connect(empty) as conn:
         assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == len(rows)
         assert conn.execute("SELECT count(*) AS n FROM doctors").fetchone()["n"] == 5
         assert conn.execute("SELECT count(*) AS n FROM schedule_exceptions").fetchone()["n"] == 2
         assert conn.execute("SELECT count(*) AS n FROM callback_requests").fetchone()["n"] == 4
+        chats = conn.execute("SELECT * FROM chat_sessions").fetchall()
+        assert len(chats) == len(seed_platform.CHATS) and all(c["synthetic"] for c in chats)
+        assert conn.execute("SELECT public_chat_enabled FROM clinics").fetchone()[
+            "public_chat_enabled"
+        ]
         conn.execute("INSERT INTO clinics (id,name) VALUES (%s,'Real clinic')", (uuid4(),))
     with pytest.raises(seed_platform.SeedRefused):
         seed_platform.seed(empty, get_settings())
@@ -1126,3 +1139,271 @@ def test_seeded_clinic_serves_the_public_api(empty, monkeypatch):
     assert len(services) == 10 and len(doctors) == 5
     assert all(s["colour"] and s["description"] for s in services)
     assert {sid for d in doctors for sid in d["service_ids"]} == {s["id"] for s in services}
+
+
+# --- Seed robustness (P2 review fix A5) --------------------------------------------------
+
+
+class _Interrupted(Exception):
+    pass
+
+
+@pytest.mark.parametrize("stage", ["_future", "_cancel_some", "_callbacks"])
+def test_interrupted_seed_is_completed_by_the_next_run(empty, monkeypatch, stage):
+    original = getattr(seed_platform, stage)
+
+    def interrupted(*args, **kwargs):
+        raise _Interrupted()
+
+    monkeypatch.setattr(seed_platform, stage, interrupted)
+    with pytest.raises(_Interrupted):
+        seed_platform.seed(empty, get_settings())
+    monkeypatch.setattr(seed_platform, stage, original)
+    seed_platform.seed(empty, get_settings())
+    again = seed_platform.seed(empty, get_settings())
+    assert again == {"past": 0, "future": 0, "cancelled": 0, "callbacks": 0, "chats": 0, "jobs": 0}
+    with connect(empty) as conn:
+        kinds = conn.execute(
+            """SELECT count(*) FILTER (WHERE request_hash='seed') AS past,
+            count(*) FILTER (WHERE request_hash<>'seed') AS future,
+            count(*) FILTER (WHERE request_hash<>'seed' AND status='cancelled') AS cancelled
+            FROM appointments"""
+        ).fetchone()
+        callbacks = conn.execute("SELECT count(*) AS n FROM callback_requests").fetchone()["n"]
+        jobs = conn.execute("SELECT DISTINCT status FROM outbox").fetchall()
+        phones = conn.execute(
+            "SELECT count(*) AS n, count(DISTINCT phone_hash) AS d FROM ("
+            " SELECT phone_hash FROM patients UNION ALL SELECT phone_hash FROM callback_requests"
+            ") x"
+        ).fetchone()
+    assert kinds["past"] == seed_platform.PAST_TARGET
+    assert seed_platform.FUTURE_TARGET - 6 <= kinds["future"] <= seed_platform.FUTURE_TARGET
+    assert kinds["cancelled"] == seed_platform.FUTURE_CANCELLED
+    assert callbacks == len(seed_platform.CALLBACKS)
+    assert [j["status"] for j in jobs] == ["done"]
+    assert phones["n"] == phones["d"]  # Every synthetic number is used once.
+
+
+def test_seed_calendar_jobs_never_touch_another_clinic(env):
+    other = reserve_direct(env["url"], SLOT)
+    with connect(env["url"]) as conn:
+        assert seed_platform._run_calendar_jobs(conn) == 0
+        job = conn.execute(
+            "SELECT status, attempts FROM outbox WHERE appointment_id=%s",
+            (other["appointment_id"],),
+        ).fetchone()
+    assert (job["status"], job["attempts"]) == ("pending", 0)
+
+
+def test_seed_refusal_check_holds_off_clinic_inserts(empty, monkeypatch):
+    """No clinic can be inserted between the refusal check and the catalogue upsert."""
+    original = seed_platform._upsert_catalogue
+    raced = []
+
+    def upsert_while_racing(conn):
+        with connect(empty) as other:
+            other.execute("SET LOCAL lock_timeout = '200ms'")
+            try:
+                other.execute("INSERT INTO clinics (id,name) VALUES (%s,'Racing')", (uuid4(),))
+            except psycopg.errors.LockNotAvailable:
+                raced.append("blocked")
+        original(conn)
+
+    monkeypatch.setattr(seed_platform, "_upsert_catalogue", upsert_while_racing)
+    with connect(empty) as conn:
+        seed_platform._check_and_upsert(conn)
+    assert raced == ["blocked"]
+
+
+# --- Synthetic contacts (P2 review fix A4) -----------------------------------------------
+
+
+def test_seeded_patients_are_never_contacted(empty, monkeypatch):
+    from clinic_voice import reminders
+
+    seed_platform.seed(empty, get_settings())
+    clinic_id = seed_platform.CLINIC_ID
+    with connect(empty) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM consents").fetchone()["n"] == 0
+        flags = conn.execute("SELECT DISTINCT synthetic FROM patients").fetchall()
+        assert [f["synthetic"] for f in flags] == [True]
+        callbacks = conn.execute("SELECT DISTINCT synthetic FROM callback_requests").fetchall()
+        assert [c["synthetic"] for c in callbacks] == [True]
+        conn.execute(
+            "UPDATE clinics SET outbound_enabled=true, quiet_hours_start='23:59',"
+            " quiet_hours_end='00:00', bolna_outbound_agent_id=%s WHERE id=%s",
+            (str(uuid4()), clinic_id),
+        )
+        conn.commit()
+        assert reminders.schedule_due(conn) == 0
+        # Even a patient who somehow holds consent is refused at planning and at send time.
+        row = conn.execute(
+            "SELECT id, patient_id, version FROM appointments WHERE status='confirmed'"
+            " AND starts_at > now() + interval '2 days' LIMIT 1"
+        ).fetchone()
+        patient_id = row["patient_id"]
+        conn.execute(
+            "INSERT INTO consents (id,clinic_id,patient_id,purpose,source)"
+            " SELECT gen_random_uuid(), %s, %s, p, 'staff'"
+            " FROM unnest(ARRAY['booking_confirmation','reminder_call','reminder_message']) p",
+            (clinic_id, patient_id),
+        )
+        conn.commit()
+        assert reminders.schedule_due(conn) == 0
+        assert reminders.on_confirmed(conn, clinic_id, row["id"], row["version"]) == 0
+        for channel in ("call", "message"):
+            refused = reminders.refusal(conn, clinic_id, patient_id, row["id"], "reminder", channel)
+            assert refused == "synthetic_contact"
+        assert conn.execute("SELECT count(*) AS n FROM reminders").fetchone()["n"] == 0
+        conn.rollback()
+
+
+# --- Retention (P2 review fix A2) --------------------------------------------------------
+
+
+def test_retention_purge_erases_booking_notes(env):
+    from clinic_voice import retention
+
+    client = env["client"]
+    kept = client.post(f"{BASE}/bookings", json=booking(notes=NOTES)).json()
+    purged = client.post(
+        f"{BASE}/bookings",
+        json=booking(SLOT + timedelta(hours=1), phone="+919000000102", notes=NOTES),
+    ).json()
+    url = env["url"]
+    with connect(url) as conn:
+        for reference in (kept["reference"], purged["reference"]):
+            row = appointment_by_reference(url, reference)
+            assert row["notes_ciphertext"] is not None
+        target = appointment_by_reference(url, purged["reference"])
+        # The purged patient's booking has ended and the record is past retention.
+        conn.execute("UPDATE appointments SET status='cancelled' WHERE id=%s", (target["id"],))
+        conn.execute(
+            "UPDATE patients SET retention_until=now() - interval '1 day' WHERE id=%s",
+            (target["patient_id"],),
+        )
+        conn.commit()
+        result = retention.purge(conn, 90)
+    assert result["patients"] == 1
+    gone = appointment_by_reference(url, purged["reference"])
+    assert (gone["patient_id"], gone["notes_ciphertext"], gone["notes_key_id"]) == (None,) * 3
+    assert appointment_by_reference(url, kept["reference"])["notes_ciphertext"] is not None
+
+
+# --- Trusted edge: proxy secret and client address (P2 review fix A1) -------------------
+
+PROXY_SECRET = "synthetic-proxy-secret-" + "1" * 32
+
+
+def test_proxy_secret_must_be_long(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u@localhost/x_test")
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", "short")
+    with pytest.raises(ValueError):
+        Settings()
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"X-Proxy-Secret": "wrong"},
+        {"X-Proxy-Secret": PROXY_SECRET[:-1]},
+        {"X-Proxy-Secret": PROXY_SECRET + "x"},
+    ],
+)
+def test_proxy_secret_refuses_direct_callers(env, monkeypatch, headers):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    client = env["client"]
+    for path in ("", "/services", "/doctors"):
+        assert_envelope(client.get(f"{BASE}{path}", headers=headers), 403, "forbidden")
+    r = client.post(f"{BASE}/bookings", json=booking(), headers=headers)
+    assert_envelope(r, 403, "forbidden")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def test_proxy_secret_lets_the_bff_through(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    assert env["client"].get(BASE, headers={"X-Proxy-Secret": PROXY_SECRET}).status_code == 200
+
+
+def test_repeated_proxy_secret_lines_are_refused(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    r = env["client"].get(
+        BASE, headers=[("X-Proxy-Secret", PROXY_SECRET), ("X-Proxy-Secret", PROXY_SECRET)]
+    )
+    assert_envelope(r, 403, "forbidden")
+
+
+def test_client_ip_header_is_trusted_only_with_the_secret(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
+    monkeypatch.setenv("PUBLIC_CALLBACK_PHONE_PER_DAY", "100")
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+
+    def post(phone, **headers):
+        return client.post(
+            f"{BASE}/callbacks",
+            json={"name": NAME, "phone": phone},
+            headers={"X-Proxy-Secret": PROXY_SECRET, **headers},
+        )
+
+    assert post("+919000000401", **{"X-Client-IP": "203.0.113.10"}).status_code == 201
+    assert_envelope(post("+919000000402", **{"X-Client-IP": "203.0.113.10"}), 429, "rate_limited")
+    # Another BFF-reported visitor has its own bucket; X-Forwarded-For is ignored now.
+    assert post("+919000000403", **{"X-Client-IP": "203.0.113.11"}).status_code == 201
+    r = post("+919000000404", **{"X-Client-IP": "203.0.113.11", "X-Forwarded-For": "1.2.3.4"})
+    assert_envelope(r, 429, "rate_limited")
+    # A malformed or missing X-Client-IP falls into one shared bucket (fails closed).
+    assert post("+919000000405", **{"X-Client-IP": "not-an-ip"}).status_code == 201
+    assert_envelope(post("+919000000406"), 429, "rate_limited")
+    assert_envelope(post("+919000000407", **{"X-Client-IP": "999.1.1.1"}), 429, "rate_limited")
+
+
+def test_without_the_secret_client_ip_header_is_ignored(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+    body = {"name": NAME, "phone": "+919000000501"}
+    r = client.post(f"{BASE}/callbacks", json=body, headers={"X-Client-IP": "203.0.113.1"})
+    assert r.status_code == 201
+    # A spoofed X-Client-IP does not open a new bucket: the socket address is used.
+    body["phone"] = "+919000000502"
+    r = client.post(f"{BASE}/callbacks", json=body, headers={"X-Client-IP": "203.0.113.2"})
+    assert_envelope(r, 429, "rate_limited")
+
+
+def test_public_reads_are_rate_limited_per_ip(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_READ_IP_PER_HOUR", "3")
+    monkeypatch.setenv("PUBLIC_SLOTS_IP_PER_HOUR", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+    for path in ("", "/services", "/doctors"):
+        assert client.get(f"{BASE}{path}").status_code == 200
+    assert_envelope(client.get(f"{BASE}/doctors"), 429, "rate_limited")
+    params = {"service_id": str(SERVICE_ID), "date": DAY.isoformat()}
+    assert client.get(f"{BASE}/slots", params=params).status_code == 200
+    assert_envelope(client.get(f"{BASE}/slots", params=params), 429, "rate_limited")
+
+
+def test_lookup_is_rate_limited_per_phone(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_LOOKUP_PHONE_PER_DAY", "2")
+    monkeypatch.setenv("PUBLIC_LOOKUP_IP_PER_HOUR", "100")
+    monkeypatch.setenv("TRUSTED_PROXY_HOPS", "1")
+    get_settings.cache_clear()
+    client = env["client"]
+
+    def lookup(phone, address):
+        body = {"reference": "ZZZZZZZZ", "phone": phone}
+        headers = {"X-Forwarded-For": address}
+        return client.post(f"{BASE}/bookings/lookup", json=body, headers=headers)
+
+    assert lookup(PHONE, "203.0.113.1").status_code == 404
+    assert lookup(PHONE, "203.0.113.2").status_code == 404
+    assert_envelope(lookup(PHONE, "203.0.113.9"), 429, "rate_limited")
+    assert lookup("+919000000998", "203.0.113.9").status_code == 404
