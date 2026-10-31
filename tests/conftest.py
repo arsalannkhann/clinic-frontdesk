@@ -6,12 +6,16 @@
 # could read .env; clinic_voice.config itself builds none at import. Tests configure
 # settings through monkeypatch.setenv only. Production keeps reading .env from the working
 # directory (config.ENV_FILE).
+import os
+
 from clinic_voice.config import Settings, get_settings
 
 Settings.model_config["env_file"] = None
+# The suite is a local environment (config.LOCAL_ENVIRONMENTS): the patient-facing paths
+# work without PUBLIC_PROXY_SECRET. Tests of the production gate set APP_ENV themselves.
+os.environ["APP_ENV"] = "test"
 get_settings.cache_clear()
 
-import os  # noqa: E402
 from pathlib import Path  # noqa: E402
 from uuid import uuid4  # noqa: E402
 

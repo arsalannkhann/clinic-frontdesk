@@ -6,6 +6,9 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+# APP_ENV values that mark a developer machine or the test suite. Anything else, including
+# the default "production", is treated as a deployment.
+LOCAL_ENVIRONMENTS = frozenset({"development", "test"})
 
 
 def _https_or_loopback(value: str | None, name: str) -> str | None:
@@ -116,8 +119,10 @@ class Settings(BaseSettings):
     public_read_ip_per_hour: int = Field(default=600, ge=1, le=100000)
     # Shared secret of the web app's server (the BFF), sent as X-Proxy-Secret on every
     # /v1/public/* and /v1/chat/* request (edge.py). Set: those paths refuse requests
-    # without it (403) and take the client address from X-Client-IP. Unset (local
-    # development): no check, and the socket / TRUSTED_PROXY_HOPS address is used.
+    # without it (403) and take the client address from X-Client-IP. Unset in a local
+    # environment (APP_ENV development or test): no check, and the socket /
+    # TRUSTED_PROXY_HOPS address is used. Unset anywhere else (production, the default):
+    # those paths answer 503 unavailable and /health/ready reports it.
     public_proxy_secret: SecretStr | None = None
     # Chat assistant (P2, chat.py). OpenAI-compatible chat completions with tools; the
     # default is Sarvam. Unset API key: the chat answers with guided quick replies only.
@@ -132,6 +137,11 @@ class Settings(BaseSettings):
     chat_max_turns: int = Field(default=40, ge=1, le=500)
     chat_session_ip_per_hour: int = Field(default=10, ge=1, le=10000)
     chat_message_ip_per_hour: int = Field(default=120, ge=1, le=100000)
+    # Transcript reloads (GET /v1/chat/sessions/{id}) per client address per hour.
+    chat_history_ip_per_hour: int = Field(default=300, ge=1, le=100000)
+    # Model calls (each tool round is one) per clinic per UTC day, all sessions together.
+    # Over it the chat answers with the fallback text and quick replies, never an error.
+    chat_llm_calls_per_clinic_per_day: int = Field(default=3000, ge=1, le=1000000)
 
     @field_validator("worker_tick_secret", "public_proxy_secret")
     @classmethod
@@ -157,6 +167,15 @@ class Settings(BaseSettings):
         if value not in ("api-subscription-key", "authorization"):
             raise ValueError("chat_llm_auth_header must be api-subscription-key or authorization")
         return value
+
+    def local_environment(self) -> bool:
+        """APP_ENV development or test: a developer machine or the test suite."""
+        return self.app_env.strip().lower() in LOCAL_ENVIRONMENTS
+
+    def proxy_gate_missing(self) -> bool:
+        """Outside a local environment the patient-facing paths need PUBLIC_PROXY_SECRET;
+        True when it is unset there (edge.require_proxy answers 503)."""
+        return self.public_proxy_secret is None and not self.local_environment()
 
     def chat_configured(self) -> bool:
         return bool(self.chat_llm_api_key and self.chat_llm_api_key.get_secret_value())

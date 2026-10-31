@@ -1076,6 +1076,9 @@ class StaffCalendarOut(StrictModel):
     doctors: list[StaffCalendarDoctor]
     appointments: list[StaffCalendarAppointment]
     exceptions: list[StaffCalendarException]
+    # True when the range held more than 2000 appointments; only the earliest 2000 are
+    # listed (narrow the range or filter by doctor client-side).
+    truncated: bool = False
 
 
 class StaffBookingRequest(StrictModel):
@@ -1103,6 +1106,10 @@ class StaffCallbackOut(StrictModel):
     resolved_at: AwareDatetime | None
     execution_id: str | None
     call_requested_at: AwareDatetime | None
+    # Outcome of the current call: placed, unknown (timeout or unexpected error; the call may
+    # have been placed) or failed (the request is open again). A 'calling' request whose
+    # outcome is placed or unknown can be reopened.
+    call_outcome: str | None = None
     synthetic: bool
 
 
@@ -1119,6 +1126,11 @@ class StaffCallbackResolved(StrictModel):
     id: UUID
     status: Literal["done", "dismissed"]
     resolved_at: AwareDatetime
+
+
+class StaffCallbackReopened(StrictModel):
+    id: UUID
+    status: Literal["open"]
 
 
 class StaffOutboundStatus(StrictModel):

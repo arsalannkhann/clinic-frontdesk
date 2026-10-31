@@ -27,7 +27,9 @@ Logs and audit rows carry ids and codes only.
 """
 
 import hashlib
+import ipaddress
 import logging
+from contextlib import nullcontext
 from datetime import UTC, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -197,9 +199,26 @@ def list_slots(conn, clinic, service_id, doctor_id, day, days) -> dict:
     return {"timezone": clinic["timezone"], "slots": result}
 
 
+IPV6_BUCKET_PREFIX = 64
+
+
 def client_value(address) -> str:
-    # Requests whose address cannot be determined share one bucket (fails closed).
-    return str(address) if address is not None else "unknown"
+    """The rate-limit bucket of a client address. IPv4: the address. IPv6: its /64 prefix,
+    because one subscriber or host is routinely given a whole /64 and could otherwise rotate
+    through 2**64 buckets (an IPv4-mapped IPv6 address counts as its IPv4 address).
+    Requests whose address cannot be determined share one bucket (fails closed)."""
+    if address is None:
+        return "unknown"
+    if isinstance(address, str):
+        try:
+            address = ipaddress.ip_address(address.strip())
+        except ValueError:
+            return "unknown"
+    if isinstance(address, ipaddress.IPv6Address):
+        if address.ipv4_mapped is not None:
+            return str(address.ipv4_mapped)
+        return str(ipaddress.IPv6Network((address, IPV6_BUCKET_PREFIX), strict=False))
+    return str(address)
 
 
 def limit(conn, hash_key, name, count, window, value) -> None:
@@ -430,13 +449,14 @@ def booking_limits(conn, settings, hash_key, clinic_id, phone, address) -> None:
     )
 
 
-def lookup(url, settings, clinic, request, address) -> dict:
+def lookup(url, settings, clinic, request, address, conn=None) -> dict:
     """One booking by reference + phone. Every mismatch (malformed or unknown reference,
     another clinic's reference, a phone that is not the booking patient's, a booking whose
     patient record was purged) is the same 404 not_found, so the response never reveals
-    whether a reference exists."""
+    whether a reference exists. `conn` (the chat turn's connection) is used instead of a
+    new one; the caller commits it."""
     _, hash_key = crypto(settings)
-    with connect(url) as conn:
+    with nullcontext(conn) if conn is not None else connect(url) as conn:
         limit(
             conn,
             hash_key,

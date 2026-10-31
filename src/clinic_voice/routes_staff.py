@@ -22,6 +22,7 @@ from clinic_voice.schemas import (
     StaffCalendarOut,
     StaffCallbackCallOut,
     StaffCallbackOut,
+    StaffCallbackReopened,
     StaffCallbackResolve,
     StaffCallbackResolved,
     StaffConversationDetail,
@@ -99,6 +100,16 @@ def call_callback(callback_id: UUID, staff=Depends(writer)):
 def resolve_callback(callback_id: UUID, body: StaffCallbackResolve, staff=Depends(writer)):
     with database() as conn:
         return callbacks.resolve(conn, staff, callback_id, body.status)
+
+
+@router.post(
+    "/callbacks/{callback_id}/reopen", response_model=StaffCallbackReopened, responses=CODED
+)
+def reopen_callback(callback_id: UUID, staff=Depends(writer)):
+    """Return a request whose call was placed or whose outcome is unknown to open, so a
+    missed call can be retried deliberately with another "Call now". Never dials."""
+    with database() as conn:
+        return callbacks.reopen(conn, staff, callback_id)
 
 
 @router.get("/outbound-status", response_model=StaffOutboundStatus)

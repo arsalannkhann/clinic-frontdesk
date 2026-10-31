@@ -20,21 +20,27 @@ Lock order (locks.py, contacts): the contact-budget advisory lock of today, then
 row FOR UPDATE, then the clinic row FOR SHARE (so a settings change waits for the decision).
 The row is marked 'calling' (call_requested_at/by, call_contact_day, which counts against the
 budget) and committed before the provider call, which runs with the connection idle. Outcomes:
-success stores the execution id (call_outcome 'placed'); a timeout keeps 'calling' with
-call_outcome 'unknown' (the call may have been placed; never redialled automatically, staff
-resolve it); a definite failure returns the request to 'open' and releases the budget slot
-(502 call_failed). The phone number and call context go to the port only, never to logs.
+success stores the execution id (call_outcome 'placed'); a timeout, or any other unexpected
+exception from the port, keeps 'calling' with call_outcome 'unknown' (the call may have been
+placed; never redialled automatically); a definite failure returns the request to 'open' and
+releases the budget slot (502 call_failed). The phone number and call context go to the port
+only, never to logs.
+
+A placed or unknown call is resolved by staff (done / dismissed), or reopened (reopen()) back
+to 'open' so a missed call can be retried deliberately with another "Call now". Reopening
+keeps the earlier call counted against its day's contact budget (callback_call_attempts).
 """
 
 import logging
 import re
-from uuid import UUID
+from datetime import timedelta
+from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import HTTPException
 
 from clinic_voice import reminders, service
-from clinic_voice.audit import audit
+from clinic_voice.audit import audit, audit_many
 from clinic_voice.crypto import CryptoError, Keyring
 from clinic_voice.db import connect
 from clinic_voice.errors import PublicError
@@ -90,6 +96,7 @@ def _out(row, keyring) -> dict:
         "resolved_at": row["resolved_at"],
         "execution_id": row["outbound_execution_id"],
         "call_requested_at": row["call_requested_at"],
+        "call_outcome": row["call_outcome"],
         "synthetic": row["synthetic"],
     }
 
@@ -108,8 +115,7 @@ def list_callbacks(conn, staff, keyring, status, limit) -> list[dict]:
     ).fetchall()
     result = [_out(row, keyring if with_details else None) for row in rows]
     if with_details:
-        for row in rows:
-            audit(conn, clinic_id, staff["id"], "callback.details_viewed", row["id"])
+        audit_many(conn, clinic_id, staff["id"], "callback.details_viewed", [r["id"] for r in rows])
     return result
 
 
@@ -281,8 +287,86 @@ def call(url, staff, callback_id: UUID, keyring: Keyring | None, port) -> dict:
             type(error).__name__,
         )
         raise refuse("call_failed", "The call could not be placed", 502) from None
+    except Exception as error:
+        # Anything else (a bug in the adapter, a transport error it did not map) leaves it
+        # open whether the call was placed: like a timeout, the outcome is unknown, the
+        # request stays 'calling' and is never redialled automatically (staff reopen it).
+        _record(url, clinic_id, callback_id, "unknown")
+        log.error(
+            "callback call outcome unknown callback=%s clinic=%s error=%s",
+            callback_id,
+            clinic_id,
+            type(error).__name__,
+        )
+        return {"status": "calling", "execution_id": None}
     if not isinstance(execution_id, str) or not EXECUTION_ID.fullmatch(execution_id):
         execution_id = None
     _record(url, clinic_id, callback_id, "placed", execution_id)
     log.info("callback call placed callback=%s clinic=%s", callback_id, clinic_id)
     return {"status": "calling", "execution_id": execution_id}
+
+
+REOPENABLE = ("placed", "unknown")
+# A 'calling' request with no outcome yet is a call being placed right now, unless it was
+# requested this long ago (the process died between the mark and the outcome).
+STALE_CALL = timedelta(minutes=5)
+
+
+def reopen(conn, staff, callback_id: UUID) -> dict:
+    """Return a called request to 'open' so staff can deliberately call again (POST
+    .../reopen, owner/admin, audited 'callback.reopened'). Allowed when its call was placed or
+    its outcome is unknown, or it has had no outcome for STALE_CALL; a call still being
+    placed is 409 call_in_progress and a resolved request 409 callback_resolved. An open
+    request is returned unchanged. Nothing is dialled here, ever.
+
+    The request's last call moves to callback_call_attempts (migration 020) with its
+    clinic-local contact day, so it keeps counting against that day's contact budget
+    (reminders.budget_used counts both tables) while the request's own call fields are
+    cleared for the next "Call now". The move is one transaction under the request row
+    lock only: the day's count is the same before and after it, so it needs no budget lock.
+    """
+    clinic_id = staff["clinic_id"]
+    row = conn.execute(
+        """SELECT id, status, call_requested_at, call_requested_by, call_contact_day,
+        call_outcome, outbound_execution_id FROM callback_requests
+        WHERE clinic_id=%s AND id=%s FOR UPDATE""",
+        (clinic_id, callback_id),
+    ).fetchone()
+    if row is None:
+        raise HTTPException(404, NOT_FOUND)
+    if row["status"] == "open":
+        return {"id": row["id"], "status": "open"}
+    if row["status"] in RESOLVED:
+        raise refuse("callback_resolved", "The callback request is already resolved")
+    now = service.utc_now()
+    outcome = row["call_outcome"]
+    stale = row["call_requested_at"] is not None and row["call_requested_at"] <= now - STALE_CALL
+    if outcome not in REOPENABLE and not (outcome is None and stale):
+        raise refuse("call_in_progress", "The call is still being placed; try again shortly")
+    if row["call_contact_day"] is not None:
+        conn.execute(
+            """INSERT INTO callback_call_attempts (id,clinic_id,callback_request_id,
+            contact_day,requested_at,requested_by,outcome,execution_id,reopened_at,
+            reopened_by) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (
+                uuid4(),
+                clinic_id,
+                callback_id,
+                row["call_contact_day"],
+                row["call_requested_at"],
+                row["call_requested_by"],
+                outcome or "unknown",
+                row["outbound_execution_id"],
+                now,
+                staff["id"],
+            ),
+        )
+    conn.execute(
+        """UPDATE callback_requests SET status='open', call_requested_at=NULL,
+        call_requested_by=NULL, call_contact_day=NULL, call_outcome=NULL,
+        outbound_execution_id=NULL WHERE clinic_id=%s AND id=%s""",
+        (clinic_id, callback_id),
+    )
+    audit(conn, clinic_id, staff["id"], "callback.reopened", callback_id)
+    log.info("callback reopened callback=%s clinic=%s", callback_id, clinic_id)
+    return {"id": callback_id, "status": "open"}

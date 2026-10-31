@@ -419,13 +419,88 @@ def test_malformed_tool_arguments_are_refused_to_the_model(env):
     assert results == [{"error": "invalid_arguments"}, {"error": "unknown_tool"}]
 
 
+EMERGENCY_POSITIVES = [
+    # English: bleeding, with "stop" up to about 30 characters away, in either order.
+    "My gum bleeding won't stop after extraction",
+    "The bleeding from the extraction socket hasn't stopped",
+    "bleeding since this morning and it has not stopped",
+    "It won't stop bleeding",
+    "Bleeding still doesn't stop",
+    "heavy bleeding from my tooth",
+    "non-stop bleeding",
+    # Breathing, swelling, fever, fainting.
+    "I can't breathe properly and my face is swollen",
+    "trouble swallowing since yesterday",
+    "Swelling is spreading to my eye",
+    "my cheek is swollen down to my neck",
+    "high fever and the swelling is getting worse",
+    "She fainted after the injection",
+    "chest pain right now",
+    # Injuries and trauma.
+    "My son knocked out a tooth playing cricket",
+    "his front tooth got knocked out",
+    "I knocked my tooth out",
+    "jaw injury from a fall",
+    "I think I broke my jaw",
+    "she fell and broke her front teeth",
+    "road accident, my face is bleeding",
+    # Saying so.
+    "This is an emergency",
+    "it's a dental emergency",
+    "emergency hai please",
+    # Hinglish.
+    "khoon band nahi ho raha",
+    "saans nahi aa rahi",
+    "wo behosh ho gaya",
+    # Hindi (Devanagari), including both nukta forms.
+    "दांत निकालने के बाद खून बंद नहीं हो रहा",
+    "खून रुक नहीं रहा है",
+    "मुझे सांस नहीं आ रही",
+    "साँस लेने में तकलीफ हो रही है",
+    "वह बेहोश हो गया",
+    "गाल पर सूजन है और तेज़ बुखार भी है",
+    "सूजन और तेज़ बुखार",
+    "तेज बुखार के साथ सूजन",
+    "मेरा चेहरा सूज गया है",
+    "सूजन आंख तक पहुंच गई",
+    "जबड़ा टूट गया",
+    "यह इमरजेंसी है",
+]
+EMERGENCY_NEGATIVES = [
+    "I booked the wrong day by accident",
+    "Sorry, I clicked that by accident",
+    "Can I book an emergency pain visit tomorrow?",
+    "Do you take emergency appointments on Sunday?",
+    "My gums bleed a little when I brush",
+    "The bleeding stopped after an hour, can I eat now?",
+    "How long does swelling last after a filling?",
+    "Is Tuesday 10am free? It fits my schedule",
+    "I want to book teeth whitening",
+    "मुझे कल का अपॉइंटमेंट चाहिए",
+    "दांत में हल्का दर्द है",
+    "kal appointment mil sakta hai?",
+]
+
+
+@pytest.mark.parametrize("text", EMERGENCY_POSITIVES)
+def test_emergency_matcher_positives(text):
+    assert chat.EMERGENCY.search(text), text
+
+
+@pytest.mark.parametrize("text", EMERGENCY_NEGATIVES)
+def test_emergency_matcher_negatives(text):
+    assert not chat.EMERGENCY.search(text), text
+
+
 @pytest.mark.parametrize(
     "text",
     [
         "My gum bleeding won't stop after extraction",
-        "I can't breathe properly and my face is swollen",
+        "The bleeding from the socket hasn't stopped",
         "Swelling is spreading to my eye",
         "khoon band nahi ho raha",
+        "गाल पर सूजन है और तेज़ बुखार भी है",
+        "his front tooth got knocked out",
         "This is an emergency",
     ],
 )
@@ -455,6 +530,14 @@ def test_a_booking_request_for_an_emergency_visit_is_not_an_emergency(env):
     env["fake"].script = [LLMReply("Which day would you like?")]
     body = say(env, session, "Can I book an emergency pain visit tomorrow?").json()
     assert body["messages"][0]["text"] == "Which day would you like?"
+
+
+def test_an_accidental_booking_is_not_an_emergency(env):
+    session = start(env)
+    env["fake"].script = [LLMReply("Which day would you like instead?")]
+    body = say(env, session, "I booked the wrong day by accident").json()
+    assert body["messages"][0]["text"] == "Which day would you like instead?"
+    assert len(env["fake"].calls) == 1
 
 
 # --- Tools -----------------------------------------------------------------------------------
@@ -659,6 +742,597 @@ def test_access_log_redacts_session_ids():
     )
 
 
+def test_session_ids_in_paths_are_documented_as_logged_by_the_platform():
+    from pathlib import Path
+
+    for doc in ("docs/adr/0011-chat-and-outbound-callbacks.md", "docs/OPERATIONS.md"):
+        text = Path(doc).read_text()
+        assert "platform request logs" in text and "/v1/chat/sessions/" in text, doc
+
+
 def test_session_ids_are_random_128_bit(env):
     ids = {start(env) for _ in range(3)}
     assert len(ids) == 3 and all(len(UUID(hex=i).hex) == 32 for i in ids)
+
+
+# --- Review fixes: bounded transcript reads and one connection per turn ---------------------
+
+
+def test_transcript_reloads_are_rate_limited_per_ip(env, monkeypatch):
+    monkeypatch.setenv("CHAT_HISTORY_IP_PER_HOUR", "2")
+    get_settings.cache_clear()
+    session = start(env)
+    client = env["client"]
+    assert client.get(f"/v1/chat/sessions/{session}").status_code == 200
+    # Guessed ids count too: the limit is checked before the session lookup.
+    assert_envelope(client.get("/v1/chat/sessions/" + "0" * 32), 404, "not_found")
+    assert_envelope(client.get(f"/v1/chat/sessions/{session}"), 429, "rate_limited")
+    # Messages have their own bucket.
+    assert say(env, session, "hello").status_code == 200
+
+
+def test_transcript_reload_returns_the_newest_visible_messages(env, monkeypatch):
+    monkeypatch.setattr(chat, "HISTORY_VISIBLE", 3)
+    session = start(env)
+    for n in range(3):
+        env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply(f"answer {n}")]
+        say(env, session, f"question {n}")
+    body = env["client"].get(f"/v1/chat/sessions/{session}").json()
+    assert body["messages"] == [
+        {"role": "assistant", "text": "answer 1"},
+        {"role": "user", "text": "question 2"},
+        {"role": "assistant", "text": "answer 2"},
+    ]
+    monkeypatch.setattr(chat, "HISTORY_VISIBLE", 100)
+    body = env["client"].get(f"/v1/chat/sessions/{session}").json()
+    assert len(body["messages"]) == 7 and body["messages"][0]["text"].startswith("Hello!")
+
+
+def test_a_turn_reuses_one_connection_and_is_idle_during_model_calls(env, monkeypatch):
+    from clinic_voice import public
+
+    session = start(env)
+    slots, propose, final = propose_script()
+    env["fake"].script = [
+        LLMReply(
+            None,
+            [
+                call("clinic_info"),
+                call("list_services"),
+                call("booking_status", reference="ZZZZZZZZ", phone=PHONE),
+            ],
+        ),
+        LLMReply(None, [call("request_callback", name=NAME, phone=PHONE), *slots.tool_calls]),
+        propose,
+        final,
+    ]
+    opened = {"chat": 0, "public": 0}
+    real_chat, real_public = chat.connect, public.connect
+
+    def counting(module):
+        real = real_chat if module == "chat" else real_public
+
+        def connect(url):
+            opened[module] += 1
+            return real(url)
+
+        return connect
+
+    monkeypatch.setattr(chat, "connect", counting("chat"))
+    monkeypatch.setattr(public, "connect", counting("public"))
+    states = []
+    fake_complete = env["fake"].complete
+
+    def watching(messages, tools):
+        with real_chat(env["url"]) as conn:
+            states.extend(
+                r["state"]
+                for r in conn.execute(
+                    "SELECT state FROM pg_stat_activity WHERE datname=current_database()"
+                    " AND pid <> pg_backend_pid() AND state LIKE 'idle in transaction%%'"
+                )
+            )
+        return fake_complete(messages, tools)
+
+    monkeypatch.setattr(env["fake"], "complete", watching)
+    body = say(env, session, "several things please").json()
+    assert body["proposal"] is not None
+    # One connection for the whole turn (session check, every tool, stores, release).
+    assert opened == {"chat": 1, "public": 0}
+    # It never sat inside a transaction while the model was called.
+    assert states == []
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM callback_requests").fetchone()["n"] == 1
+
+
+# --- Review fixes: one turn per session at a time (busy lease, migration 020) ---------------
+
+
+class BlockingLLM:
+    """A model whose first call waits until released, to hold a turn open."""
+
+    def __init__(self):
+        import threading
+
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def complete(self, messages, tools):
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            assert self.release.wait(timeout=20)
+        return LLMReply(f"answer {self.calls}")
+
+
+def test_a_concurrent_message_is_409_turn_in_progress(env, monkeypatch):
+    import threading
+
+    session = start(env)
+    llm = BlockingLLM()
+    monkeypatch.setattr(routes_chat, "llm_for", lambda settings: llm)
+    first = {}
+    worker = threading.Thread(target=lambda: first.setdefault("r", say(env, session, "first")))
+    worker.start()
+    try:
+        assert llm.entered.wait(timeout=10)
+        busy = say(env, session, "second while busy")
+        assert_envelope(busy, 409, "turn_in_progress")
+        row = session_row(env["url"])
+        assert row["busy_until"] is not None and row["turn_count"] == 1
+    finally:
+        llm.release.set()
+        worker.join(timeout=20)
+    assert first["r"].status_code == 200 and first["r"].json()["messages"][0]["text"] == "answer 1"
+    assert session_row(env["url"])["busy_until"] is None
+    # The refused message was not stored; the next one goes through.
+    keyring = Keyring.from_setting(KEYS)
+    with connect(env["url"]) as conn:
+        texts = [
+            m["document"].get("text")
+            for m in chat.transcript(conn, keyring, CLINIC, session_row(env["url"])["id"])
+        ]
+    assert "second while busy" not in texts
+    assert say(env, session, "third").json()["messages"][0]["text"] == "answer 2"
+    assert session_row(env["url"])["turn_count"] == 2
+
+
+def test_a_stale_busy_mark_expires(env):
+    session = start(env)
+    lease = chat.turn_lease(get_settings())
+    with connect(env["url"]) as conn:
+        conn.execute("UPDATE chat_sessions SET busy_until=%s", (env["clock"]["now"] + lease,))
+    assert_envelope(say(env, session, "hello"), 409, "turn_in_progress")
+    env["clock"]["now"] += lease + timedelta(seconds=1)
+    assert say(env, session, "hello again").status_code == 200
+    assert session_row(env["url"])["busy_until"] is None
+
+
+def test_a_turn_whose_lease_was_taken_over_does_not_clear_the_new_mark(env):
+    session = start(env)
+    row = session_row(env["url"])
+    later = env["clock"]["now"] + timedelta(minutes=5)
+    with connect(env["url"]) as conn:
+        conn.execute("UPDATE chat_sessions SET busy_until=%s", (later,))
+    turn = chat.Turn(
+        env["url"], get_settings(), {"timezone": "Asia/Kolkata"}, row, None, None, None
+    )
+    chat._release(turn, env["clock"]["now"] + timedelta(seconds=60))
+    assert session_row(env["url"])["busy_until"] == later
+    chat._release(turn, later)
+    turn.close()
+    assert session_row(env["url"])["busy_until"] is None
+    assert say(env, session, "ok").status_code == 200
+
+
+def test_turn_lease_covers_one_model_call(monkeypatch):
+    from clinic_voice.config import Settings
+
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u@localhost/x_test")
+    monkeypatch.setenv("CHAT_LLM_TIMEOUT_SECONDS", "60")
+    settings = Settings()
+    assert chat.turn_lease(settings) >= timedelta(seconds=settings.chat_llm_timeout_seconds + 20)
+    assert chat.turn_lease(settings) >= timedelta(seconds=chat.TURN_LEASE_SECONDS)
+
+
+def test_no_model_call_starts_past_the_turn_deadline(env, monkeypatch):
+    session = start(env)
+    env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply("never sent")]
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(chat.time, "monotonic", lambda: clock["t"])
+    real_run = chat.run_tool
+
+    def slow_tool(turn, name, arguments):
+        clock["t"] += 50  # The tool round used most of the lease.
+        return real_run(turn, name, arguments)
+
+    monkeypatch.setattr(chat, "run_tool", slow_tool)
+    body = say(env, session, "hello").json()
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    assert len(env["fake"].calls) == 1
+    with connect(env["url"]) as conn:
+        stored = chat.transcript(
+            conn, Keyring.from_setting(KEYS), CLINIC, session_row(env["url"])["id"]
+        )
+    _assert_every_tool_call_answered(chat._model_messages(stored))
+
+
+def test_migration_020_adds_the_proposal_service_key_and_hardening(env):
+    import re
+    from pathlib import Path
+
+    from psycopg.errors import ForeignKeyViolation
+
+    session = start(env)
+    row = session_row(env["url"])
+    with pytest.raises(ForeignKeyViolation), connect(env["url"]) as conn:
+        conn.execute(
+            """INSERT INTO chat_proposals (id,clinic_id,session_id,doctor_id,service_id,
+            starts_at,created_at,expires_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
+            (uuid4(), CLINIC, row["id"], DOCTOR_ID, uuid4(), SLOT, NOW, NOW + timedelta(minutes=1)),
+        )
+    with connect(env["url"]) as conn:
+        secured = conn.execute(
+            "SELECT relrowsecurity FROM pg_class WHERE relname='callback_call_attempts'"
+        ).fetchone()
+    assert secured["relrowsecurity"] is True
+
+    def block(name):
+        text = Path(f"migrations/{name}").read_text()
+        return [b for b in re.findall(r"DO \$\$.*?\$\$;", text, re.S) if "'anon'" in b]
+
+    assert block("020_chat_review.sql") == block("018_platform.sql")
+    assert say(env, session, "still works").status_code == 200
+
+
+# --- Review fixes: history is trimmed by whole turns -----------------------------------------
+
+
+def _stored(role, document):
+    return {"role": role, "document": document}
+
+
+def _tool_turn(n):
+    return [
+        _stored("user", {"text": f"question {n}"}),
+        _stored(
+            "assistant",
+            {"text": None, "tool_calls": [{"id": f"c{n}", "name": "clinic_info", "arguments": {}}]},
+        ),
+        _stored("tool", {"tool_call_id": f"c{n}", "result": {"n": n}}),
+        _stored("assistant", {"text": f"answer {n}"}),
+    ]
+
+
+def test_history_trimming_keeps_whole_turns_and_the_current_message(monkeypatch):
+    transcript = [_stored("assistant", {"text": "greeting"})]
+    for n in range(5):
+        transcript += _tool_turn(n)
+    transcript.append(_stored("user", {"text": "current"}))
+    for limit in (1, 4, 5, 6, 9, 13, 100):
+        monkeypatch.setattr(chat, "HISTORY_MESSAGES", limit)
+        result = chat._model_messages(transcript)
+        assert result[-1] == {"role": "user", "content": "current"}
+        assert result[0]["role"] == "user"
+        older = result[:-1]
+        assert len(older) % 4 == 0  # Only whole turns.
+        assert len(result) <= max(limit, 1)
+        # The newest turns are the ones kept.
+        kept = [m["content"] for m in older if m["role"] == "user"]
+        assert kept == [f"question {n}" for n in range(5 - len(older) // 4, 5)]
+        _assert_every_tool_call_answered(result)
+    monkeypatch.setattr(chat, "HISTORY_MESSAGES", 100)
+    assert "greeting" not in json.dumps(chat._model_messages(transcript))
+
+
+def test_a_long_conversation_sends_whole_turns(env, monkeypatch):
+    monkeypatch.setattr(chat, "HISTORY_MESSAGES", 6)
+    session = start(env)
+    for n in range(4):
+        env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply(f"answer {n}")]
+        say(env, session, f"question {n}")
+    env["fake"].script = [LLMReply("last answer")]
+    say(env, session, "the current question")
+    sent = env["fake"].calls[-1]["messages"][1:]  # Without the system prompt.
+    assert sent[-1] == {"role": "user", "content": "the current question"}
+    assert [m["role"] for m in sent] == ["user", "assistant", "tool", "assistant", "user"]
+    assert sent[0]["content"] == "question 3"
+    _assert_every_tool_call_answered(sent)
+
+
+# --- Review fixes: confirm gate (clinic row lock, hidden services, parallel confirms) --------
+
+
+def _hide_service(url, **values):
+    with connect(url) as conn:
+        sets = ", ".join(f"{k}=%s" for k in values)
+        conn.execute(
+            f"UPDATE services SET {sets} WHERE id=%s",  # noqa: S608
+            (*values.values(), SERVICE_ID),
+        )
+
+
+@pytest.mark.parametrize("change", [{"public": False}, {"active": False}])
+def test_a_service_hidden_after_the_proposal_cannot_be_booked(env, change):
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    _hide_service(env["url"], **change)
+    assert_envelope(confirm(env, session, proposal), 409, "slot_unavailable")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+        assert (
+            conn.execute("SELECT consumed_at FROM chat_proposals").fetchone()["consumed_at"] is None
+        )
+
+
+def test_the_confirm_gate_rechecks_the_offer_inside_the_transaction(env, monkeypatch):
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    real = chat._offered
+    seen = []
+
+    def hide_after_precheck(conn, clinic_id, row, public_only=True):
+        seen.append(public_only)
+        if len(seen) == 2:  # The gate's check, inside the booking transaction.
+            _hide_service(env["url"], public=False)
+        return real(conn, clinic_id, row, public_only)
+
+    monkeypatch.setattr(chat, "_offered", hide_after_precheck)
+    assert_envelope(confirm(env, session, proposal), 409, "slot_unavailable")
+    assert seen == [True, True]
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def test_a_replayed_confirm_still_answers_after_the_service_is_hidden(env):
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    first = confirm(env, session, proposal)
+    _hide_service(env["url"], public=False)
+    again = confirm(env, session, proposal)
+    assert first.status_code == again.status_code == 202 and again.json() == first.json()
+
+
+def test_the_confirm_gate_takes_the_clinic_row_for_share(env):
+    """A clinic update in flight (it holds the row FOR NO KEY UPDATE, like the UPDATE in
+    admin.update_clinic) blocks the confirm at the gate; once it commits chat off, the
+    confirm books nothing. Foreign-key checks alone (FOR KEY SHARE) would not wait."""
+    import threading
+
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    result = {}
+
+    def run():
+        result["response"] = confirm(env, session, proposal)
+
+    worker = threading.Thread(target=run)
+    with connect(env["url"]) as holder:  # Commits (and releases the row) on every exit.
+        holder.execute("SELECT 1 FROM clinics WHERE id=%s FOR NO KEY UPDATE", (CLINIC,))
+        worker.start()
+        worker.join(timeout=2)
+        blocked = worker.is_alive()
+        holder.execute("UPDATE clinics SET public_chat_enabled=false WHERE id=%s", (CLINIC,))
+    worker.join(timeout=10)
+    assert blocked, "the confirm must wait for the clinic row"
+    assert not worker.is_alive()
+    assert_envelope(result["response"], 404, "not_found")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def test_parallel_confirms_with_different_keys_book_once(env, monkeypatch):
+    import threading
+
+    monkeypatch.setenv("PUBLIC_BOOKING_PHONE_PER_DAY", "100")
+    monkeypatch.setenv("PUBLIC_BOOKING_IP_PER_HOUR", "100")
+    get_settings.cache_clear()
+    session = start(env)
+    env["fake"].script = propose_script()
+    proposal = say(env, session, "book").json()["proposal"]["id"]
+    barrier = threading.Barrier(4)
+    responses = []
+
+    def run(index):
+        barrier.wait()
+        responses.append(
+            confirm(env, session, proposal, headers={"Idempotency-Key": f"card-key-{index:04d}"})
+        )
+
+    threads = [threading.Thread(target=run, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    statuses = sorted(r.status_code for r in responses)
+    assert statuses == [202, 409, 409, 409], [r.text for r in responses]
+    assert {r.json()["error"]["code"] for r in responses if r.status_code == 409} == {
+        "proposal_used"
+    }
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 1
+        used = conn.execute("SELECT consumed_at, appointment_id FROM chat_proposals").fetchone()
+    assert used["consumed_at"] is not None and used["appointment_id"] is not None
+
+
+# --- Review fixes: unclosed reasoning and length-truncated replies ---------------------------
+
+
+def _completion(content, finish_reason="stop", tool_calls=None):
+    message = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+    return {"choices": [{"message": message, "finish_reason": finish_reason}]}
+
+
+@pytest.mark.parametrize(
+    ("content", "text"),
+    [
+        ("<think>closed</think>Hello", "Hello"),
+        ("Hello <think>never closed, cut off by max_tok", "Hello"),
+        ("<THINK>\nall reasoning\nno end", None),
+        ("<think>a</think>Hi<think>b", "Hi"),
+        ("No reasoning at all", "No reasoning at all"),
+    ],
+)
+def test_reasoning_blocks_are_dropped_closed_or_not(content, text):
+    assert parse_reply(_completion(content)).text == text
+
+
+def test_a_length_truncated_reply_without_visible_text_is_a_failure():
+    with pytest.raises(ChatLLMError) as raised:
+        parse_reply(_completion("<think>thinking until the token limit", "length"))
+    assert raised.value.code == "length"
+    with pytest.raises(ChatLLMError):
+        parse_reply(_completion(None, "length"))
+    # Visible text survives a length stop; tool calls of a truncated reply still run.
+    assert parse_reply(_completion("Partial but visible", "length")).text == "Partial but visible"
+    calls = [{"id": "c1", "function": {"name": "clinic_info", "arguments": "{}"}}]
+    reply = parse_reply(_completion("<think>cut", "length", calls))
+    assert reply.text is None and reply.tool_calls == [ToolCall("c1", "clinic_info", {})]
+
+
+def test_chat_falls_back_on_a_truncated_reasoning_reply(env, monkeypatch, caplog):
+    caplog.set_level(logging.INFO)
+    replies = [
+        _completion(
+            "<think>tool first",
+            "length",
+            [{"id": "c1", "function": {"name": "clinic_info", "arguments": "{}"}}],
+        ),
+        _completion("<think>SYNTHETIC-REASONING the clinic opens at", "length"),
+    ]
+    llm = _adapter(lambda request: httpx.Response(200, json=replies.pop(0)))
+    monkeypatch.setattr(routes_chat, "llm_for", lambda settings: llm)
+    session = start(env)
+    body = say(env, session, "when do you open?").json()
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    assert "SYNTHETIC-REASONING" not in json.dumps(body)
+    assert "code=length" in caplog.text and "SYNTHETIC-REASONING" not in caplog.text
+    keyring = Keyring.from_setting(KEYS)
+    with connect(env["url"]) as conn:
+        stored = chat.transcript(conn, keyring, CLINIC, session_row(env["url"])["id"])
+    # The tool call of the first, truncated reply ran and was answered.
+    assert any(m["role"] == "tool" and m["tool_name"] == "clinic_info" for m in stored)
+    assert "SYNTHETIC-REASONING" not in json.dumps([m["document"] for m in stored])
+
+
+# --- Review fixes: the per-clinic daily model cap --------------------------------------------
+
+
+def test_model_calls_are_capped_per_clinic_per_day(env, monkeypatch):
+    monkeypatch.setenv("CHAT_LLM_CALLS_PER_CLINIC_PER_DAY", "3")
+    get_settings.cache_clear()
+    first, second = start(env), start(env)
+    env["fake"].script = [LLMReply(None, [call("clinic_info")]), LLMReply("We open at 9.")]
+    assert say(env, first, "when do you open?").json()["messages"][0]["text"] == "We open at 9."
+    assert say(env, second, "hello").json()["quick_replies"] == chat.QUICK_REPLIES
+    # Three model calls today; the fourth, from any session, is not made.
+    over = say(env, first, "and on Sunday?")
+    assert over.status_code == 200
+    body = over.json()
+    assert body["messages"][0]["text"].startswith("Sorry, I cannot answer right now.")
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    assert len(env["fake"].calls) == 3
+    # Emergencies never need the model and still get the script.
+    assert say(env, second, "This is an emergency").json()["messages"][0]["text"] == (
+        chat.DEFAULT_EMERGENCY
+    )
+
+
+# --- Review fixes: tool failures never orphan a tool call ------------------------------------
+
+
+def _assert_every_tool_call_answered(model_messages):
+    """The OpenAI contract strict providers enforce: each assistant tool_calls message is
+    followed by exactly one tool result per call id."""
+    for index, message in enumerate(model_messages):
+        if message["role"] == "tool":
+            assert index > 0
+        if message.get("tool_calls"):
+            ids = [c["id"] for c in message["tool_calls"]]
+            after = model_messages[index + 1 : index + 1 + len(ids)]
+            assert [m["role"] for m in after] == ["tool"] * len(ids)
+            assert [m["tool_call_id"] for m in after] == ids
+
+
+def test_an_unexpected_tool_exception_is_a_tool_failed_result(env, caplog):
+    caplog.set_level(logging.INFO)
+    session = start(env)
+    bad = call(
+        "propose_booking",
+        service_id=str(SERVICE_ID),
+        doctor_id=str(DOCTOR_ID),
+        starts_at="0001-01-01T00:00:00+05:00",  # astimezone() raises OverflowError.
+    )
+    env["fake"].script = [LLMReply(None, [bad]), LLMReply("Which day would suit you?")]
+    r = say(env, session, "book the first possible time")
+    assert r.status_code == 200
+    assert r.json()["messages"][0]["text"] == "Which day would suit you?"
+    second = env["fake"].calls[1]["messages"]
+    assert json.loads(second[-1]["content"]) == {"error": "tool_failed"}
+    _assert_every_tool_call_answered(second)
+    assert "error=OverflowError" in caplog.text and "0001-01-01" not in caplog.text
+    # The next turn's history is still valid for a strict provider.
+    say(env, session, "tomorrow then")
+    _assert_every_tool_call_answered(env["fake"].calls[-1]["messages"])
+
+
+def test_a_turn_failing_mid_tools_stores_placeholder_results(env, monkeypatch):
+    session = start(env)
+    env["fake"].script = [LLMReply(None, [call("clinic_info"), call("list_services")])]
+
+    def explode(turn, name, arguments):
+        raise RuntimeError("synthetic failure outside the tool")
+
+    monkeypatch.setattr(chat, "run_tool", explode)
+    body = say(env, session, "hello").json()
+    assert body["quick_replies"] == chat.FALLBACK_QUICK_REPLIES
+    keyring = Keyring.from_setting(KEYS)
+    row = session_row(env["url"])
+    with connect(env["url"]) as conn:
+        stored = chat.transcript(conn, keyring, CLINIC, row["id"])
+    calls = [m for m in stored if m["role"] == "assistant" and m["document"].get("tool_calls")]
+    results = [m["document"] for m in stored if m["role"] == "tool"]
+    ids = [c["id"] for c in calls[0]["document"]["tool_calls"]]
+    assert [r["tool_call_id"] for r in results] == ids
+    assert all(r["result"] == {"error": "tool_failed"} for r in results)
+
+
+def test_history_drops_assistant_tool_calls_without_results(env):
+    session = start(env)
+    keyring = Keyring.from_setting(KEYS)
+    row = session_row(env["url"])
+    with connect(env["url"]) as conn:
+        chat.append(conn, keyring, row, "user", {"text": "earlier question"})
+        # An interrupted older turn: two calls, only one answered.
+        chat.append(
+            conn,
+            keyring,
+            row,
+            "assistant",
+            {
+                "text": None,
+                "tool_calls": [
+                    {"id": "c_old1", "name": "clinic_info", "arguments": {}},
+                    {"id": "c_old2", "name": "list_services", "arguments": {}},
+                ],
+            },
+        )
+        chat.append(conn, keyring, row, "tool", {"tool_call_id": "c_old1", "result": {}})
+        # A stray result with no call before it.
+        chat.append(conn, keyring, row, "tool", {"tool_call_id": "c_stray", "result": {}})
+    env["fake"].script = [LLMReply("Hello again")]
+    assert say(env, session, "are you there?").status_code == 200
+    sent = env["fake"].calls[0]["messages"]
+    assert not any(m.get("tool_calls") for m in sent)
+    assert not any(m["role"] == "tool" for m in sent)
+    assert [m["content"] for m in sent if m["role"] == "user"] == [
+        "earlier question",
+        "are you there?",
+    ]

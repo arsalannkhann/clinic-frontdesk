@@ -1338,6 +1338,49 @@ def test_repeated_proxy_secret_lines_are_refused(env, monkeypatch):
     assert_envelope(r, 403, "forbidden")
 
 
+@pytest.mark.parametrize("app_env", ["production", "staging", "Production"])
+def test_production_without_the_secret_fails_closed(env, monkeypatch, app_env):
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.delenv("PUBLIC_PROXY_SECRET", raising=False)
+    get_settings.cache_clear()
+    client = env["client"]
+    for path in ("", "/services", "/doctors"):
+        assert_envelope(client.get(f"{BASE}{path}"), 503, "unavailable")
+    assert_envelope(client.post(f"{BASE}/bookings", json=booking()), 503, "unavailable")
+    assert_envelope(client.post("/v1/chat/clinics/demo-clinic/sessions"), 503, "unavailable")
+    assert_envelope(client.get("/v1/chat/sessions/" + "a" * 32), 503, "unavailable")
+    with connect(env["url"]) as conn:
+        assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+        assert conn.execute("SELECT count(*) AS n FROM chat_sessions").fetchone()["n"] == 0
+    ready = client.get("/health/ready")
+    assert ready.status_code == 200
+    assert ready.json() == {
+        "status": "degraded",
+        "integrations": "not_configured",
+        "problems": ["public_proxy_secret_missing"],
+    }
+    # Staff and health paths are not behind the gate.
+    assert client.get("/health/live").status_code == 200
+    # With the secret set, production serves the BFF and readiness is clean again.
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    get_settings.cache_clear()
+    assert client.get(BASE, headers={"X-Proxy-Secret": PROXY_SECRET}).status_code == 200
+    assert client.get("/health/ready").json()["status"] == "ready"
+    assert PROXY_SECRET not in client.get("/health/ready").text
+
+
+@pytest.mark.parametrize("app_env", ["development", "test"])
+def test_local_environments_keep_the_open_edge(env, monkeypatch, app_env):
+    monkeypatch.setenv("APP_ENV", app_env)
+    monkeypatch.delenv("PUBLIC_PROXY_SECRET", raising=False)
+    get_settings.cache_clear()
+    assert env["client"].get(BASE).status_code == 200
+    assert env["client"].get("/health/ready").json() == {
+        "status": "ready",
+        "integrations": "not_configured",
+    }
+
+
 def test_client_ip_header_is_trusted_only_with_the_secret(env, monkeypatch):
     monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
     monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
@@ -1363,6 +1406,48 @@ def test_client_ip_header_is_trusted_only_with_the_secret(env, monkeypatch):
     assert post("+919000000405", **{"X-Client-IP": "not-an-ip"}).status_code == 201
     assert_envelope(post("+919000000406"), 429, "rate_limited")
     assert_envelope(post("+919000000407", **{"X-Client-IP": "999.1.1.1"}), 429, "rate_limited")
+
+
+@pytest.mark.parametrize(
+    ("address", "bucket"),
+    [
+        ("203.0.113.7", "203.0.113.7"),
+        ("2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64"),
+        ("2001:DB8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::/64"),
+        ("::ffff:203.0.113.7", "203.0.113.7"),
+        ("not-an-ip", "unknown"),
+        (None, "unknown"),
+    ],
+)
+def test_rate_limit_buckets_ipv6_by_its_64_prefix(address, bucket):
+    from clinic_voice import public
+    from clinic_voice.edge import _parse_ip
+
+    assert public.client_value(address) == bucket
+    if address is not None:
+        assert public.client_value(_parse_ip(address)) == bucket
+
+
+def test_ipv6_visitors_of_one_64_share_a_bucket(env, monkeypatch):
+    monkeypatch.setenv("PUBLIC_PROXY_SECRET", PROXY_SECRET)
+    monkeypatch.setenv("PUBLIC_CALLBACK_IP_PER_HOUR", "1")
+    monkeypatch.setenv("PUBLIC_CALLBACK_PHONE_PER_DAY", "100")
+    get_settings.cache_clear()
+
+    def post(phone, address):
+        return env["client"].post(
+            f"{BASE}/callbacks",
+            json={"name": NAME, "phone": phone},
+            headers={"X-Proxy-Secret": PROXY_SECRET, "X-Client-IP": address},
+        )
+
+    assert post("+919000000421", "2001:db8:5:6::1").status_code == 201
+    # Rotating the interface identifier inside the same /64 does not open a new bucket.
+    assert_envelope(post("+919000000422", "2001:db8:5:6:dead:beef:0:2"), 429, "rate_limited")
+    # Another /64 is another visitor; IPv4 stays per address.
+    assert post("+919000000423", "2001:db8:5:7::1").status_code == 201
+    assert post("+919000000424", "198.51.100.1").status_code == 201
+    assert post("+919000000425", "198.51.100.2").status_code == 201
 
 
 def test_without_the_secret_client_ip_header_is_ignored(env, monkeypatch):
