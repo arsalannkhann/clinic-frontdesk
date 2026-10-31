@@ -422,9 +422,12 @@ swelling), reply with this approved text and tell them to call the clinic or eme
 services: "{emergency_script(clinic)}"
 - Use only the tools for times and bookings. Never invent a time, a doctor or a price.
 - To book: find the service, then call check_slots, offer at most three times, and when the \
-patient picks one call propose_booking. The patient confirms in a card that asks for their \
-name, phone and consent. Never say a booking is made, confirmed or reserved: say the patient \
-can confirm it in the card.
+patient picks one call propose_booking. The screen then shows a card where the patient types \
+their name and phone and ticks consent: never ask for these in the chat, never repeat the \
+card's details or its expiry time, and never say a booking is made, confirmed or reserved. \
+After propose_booking, reply with one short sentence such as "Please confirm your details in \
+the card below."
+- Write plain text: no Markdown, asterisks, headings or bullet symbols.
 - Ask for one detail at a time. Keep replies short: one to three sentences.
 - Reply in the patient's language: English, Hindi, or Hinglish (Hindi in Latin script) as they \
 write.
@@ -671,8 +674,8 @@ def _tool_propose_booking(turn, args):
         "service_name": shown["service_name"],
         "starts_at": shown["starts_at"].isoformat(),
         "expires_at": shown["expires_at"].isoformat(),
-        "note": "Not booked yet. The patient must confirm in the card with name, phone and"
-        " consent.",
+        "note": "Not booked yet. The card on screen collects name, phone and consent; do not"
+        " ask for them in the chat.",
     }
 
 
