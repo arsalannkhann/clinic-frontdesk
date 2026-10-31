@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("next/navigation", () => ({ useRouter: () => ({}), useSearchParams: () => new URLSearchParams() }));
 
-import { callBlockReason } from "@/components/staff/CallbacksPage";
+import { callBlockReason, outboundGap } from "@/components/staff/CallbacksPage";
 import { safeNext } from "@/components/staff/LoginForm";
 import { validateHours } from "@/components/staff/SettingsPage";
 import { canWriteRole } from "@/components/staff/StaffContext";
@@ -51,6 +51,13 @@ describe("staff helpers", () => {
     expect(callBlockReason(false, null, true)).toMatch(/outbound/i);
     expect(callBlockReason(true, "no_from_number", true)).toBeTruthy();
     expect(callBlockReason(true, null, false)).toMatch(/owner or an admin/);
+    const ready = { enabled: true, has_from_number: true, has_outbound_agent: true };
+    expect(outboundGap(ready)).toBeNull();
+    expect(outboundGap({ ...ready, has_from_number: false })).toBe("no_from_number");
+    expect(outboundGap({ ...ready, has_outbound_agent: false })).toBe("no_outbound_agent");
+    expect(outboundGap({ ...ready, enabled: false })).toBe("outbound_disabled");
+    expect(callBlockReason({ ...ready, enabled: false }, null, true)).toMatch(/owner can turn it on in Settings once a calling number is configured/);
+    expect(callBlockReason(ready, "outbound_disabled", true)).toMatch(/off/);
   });
 
   it("gives viewers read-only screens", () => {

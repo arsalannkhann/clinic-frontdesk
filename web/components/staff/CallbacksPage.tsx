@@ -1,15 +1,17 @@
 "use client";
 
 import { Phone } from "lucide-react";
+import Link from "next/link";
 import { useState } from "react";
 import useSWR from "swr";
 
 import { api, ApiError, errorMessage, withQuery } from "@/lib/api/client";
-import type { CallbackItem, CallbackStatus, CallStarted } from "@/lib/api/types";
+import type { CallbackItem, CallbackStatus, CallStarted, OutboundStatus } from "@/lib/api/types";
 import { CALL_REFUSALS, callbackSource, callbackStatus } from "@/lib/labels";
 import { formatShortDate, formatTime } from "@/lib/time";
 import { Badge, LabelBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { EmptyState, ErrorState, Loading, Skeleton } from "@/components/ui/States";
 import { Tabs } from "@/components/ui/Tabs";
 import { useToast } from "@/components/ui/Toast";
@@ -23,27 +25,50 @@ const TABS: { key: CallbackStatus; label: string }[] = [
   { key: "dismissed", label: "Dismissed" },
 ];
 
+/** The first thing outbound calling still needs, as a refusal code, or null when ready. */
+export function outboundGap(outbound: boolean | OutboundStatus): string | null {
+  if (typeof outbound === "boolean") return outbound ? null : "outbound_disabled";
+  if (!outbound.has_from_number) return "no_from_number";
+  if (!outbound.has_outbound_agent) return "no_outbound_agent";
+  if (!outbound.enabled) return "outbound_disabled";
+  return null;
+}
+
 /**
  * Why "Call now" is unavailable, before or after trying. A 409 from the API wins; otherwise
- * the clinic setting is checked up front so staff don't click a button that can't work.
+ * the outbound status (or, until it loads, the clinic's outbound setting) is checked up front
+ * so staff don't click a button that can't work.
  */
-export function callBlockReason(outboundEnabled: boolean, refusal: string | null, canWrite: boolean): string | null {
+export function callBlockReason(outbound: boolean | OutboundStatus, refusal: string | null, canWrite: boolean): string | null {
   if (!canWrite) return "Only the owner or an admin can place calls.";
   if (refusal) return CALL_REFUSALS[refusal] ?? refusal;
-  if (!outboundEnabled) return CALL_REFUSALS.outbound_disabled!;
-  return null;
+  const gap = outboundGap(outbound);
+  return gap ? CALL_REFUSALS[gap]! : null;
 }
 
 export function CallbacksPage() {
   const { clinic, canWrite, timeZone } = useStaff();
   const toast = useToast();
+  const [confirm, confirmDialog] = useConfirm();
   const [tab, setTab] = useState<CallbackStatus>("open");
   const [refusal, setRefusal] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const list = useSWR<CallbackItem[]>(withQuery("/api/staff/callbacks", { status: tab }), { refreshInterval: 30_000 });
-  const reason = callBlockReason(clinic.outbound_enabled, refusal, canWrite);
+  const outbound = useSWR<OutboundStatus>(canWrite ? "/api/staff/outbound-status" : null, { refreshInterval: 60_000 });
+  // The outbound status decides; if it can't be read, the clinic's own setting does (the API
+  // still refuses a call it can't place). While it loads, Call now waits, without a message.
+  const reason = callBlockReason(outbound.data ?? clinic.outbound_enabled, refusal, canWrite);
+  const checking = canWrite && !outbound.data && !outbound.error;
 
   async function call(item: CallbackItem) {
+    const yes = await confirm({
+      title: `Call ${item.name} now?`,
+      body: `This places a phone call to the patient now, on ${item.phone_masked}, from the clinic's calling number. It starts as soon as you confirm and can't be called off from here.`,
+      confirmLabel: "Call now",
+      cancelLabel: "Not now",
+      tone: "primary",
+    });
+    if (!yes) return;
     setBusy(`call:${item.id}`);
     try {
       const started = await api<CallStarted>(`/api/staff/callbacks/${encodeURIComponent(item.id)}/call`, { method: "POST", body: {} });
@@ -52,6 +77,7 @@ export function CallbacksPage() {
     } catch (error) {
       if (error instanceof ApiError && error.status === 409 && (error.code === "outbound_disabled" || error.code === "no_from_number")) {
         setRefusal(error.code);
+        void outbound.mutate();
       } else {
         toast.show(errorMessage(error), "error");
       }
@@ -77,9 +103,12 @@ export function CallbacksPage() {
     <div>
       <PageHeader title="Call-backs" description="Patients who asked the clinic to ring them. Nothing is dialled automatically." />
       <Tabs label="Call-back status" items={TABS} value={tab} onChange={setTab}>
-        {reason && tab === "open" && canWrite ? (
+        {reason && !checking && tab === "open" && canWrite ? (
           <p className="mb-4 rounded-md border border-warn/25 bg-warn-tint/60 px-3 py-2 text-sm text-ink" id="call-reason">
-            <span className="font-semibold">Call now is unavailable.</span> {reason} You can still call from the clinic phone and mark the request done.
+            <span className="font-semibold">Call now is unavailable.</span> {reason}{" "}
+            <Link href="/staff/settings#outbound" className="font-semibold text-accent underline-offset-4 hover:underline">
+              See what&apos;s needed
+            </Link>
           </p>
         ) : null}
         {list.error ? (
@@ -123,7 +152,7 @@ export function CallbacksPage() {
                       <Button
                         size="sm"
                         icon={<Phone className="size-4" aria-hidden="true" />}
-                        disabled={!!reason || !!busy}
+                        disabled={!!reason || checking || !!busy}
                         aria-describedby={reason ? "call-reason" : undefined}
                         title={reason ?? undefined}
                         loading={busy === `call:${item.id}`}
@@ -145,6 +174,7 @@ export function CallbacksPage() {
           </ul>
         )}
       </Tabs>
+      {confirmDialog}
     </div>
   );
 }

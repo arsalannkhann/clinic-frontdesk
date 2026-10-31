@@ -2,39 +2,163 @@
 
 import { ArrowRight } from "lucide-react";
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import useSWR from "swr";
 
 import { withQuery } from "@/lib/api/client";
-import type { CalendarResponse, CallbackItem, Channel, StaffAppointment, StaffStats } from "@/lib/api/types";
+import type { CalendarAppointment, CalendarResponse, CallbackItem, Channel, StaffAppointment, StaffStats } from "@/lib/api/types";
+import { safeColour } from "@/lib/calendar";
 import { useCatalog } from "@/lib/catalog";
 import { cx } from "@/lib/cx";
 import { appointmentStatus, channel as channelLabel } from "@/lib/labels";
 import { addDays, dayRange, formatDayKey, formatLongDate, formatTime, todayKey, zonedToIso } from "@/lib/time";
 import { LabelBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { useConfirm } from "@/components/ui/ConfirmDialog";
 import { EmptyState, ErrorState, Loading, Skeleton } from "@/components/ui/States";
-import { AppointmentDrawer, useAppointmentActions, type DrawerAppointment } from "./AppointmentDrawer";
-import { PageHeader, Panel } from "./PageHeader";
+import { AppointmentDrawer, cancelConfirmation, useAppointmentActions, type DrawerAppointment } from "./AppointmentDrawer";
+import { Panel } from "./PageHeader";
 import { useStaff } from "./StaffContext";
 
 const CHANNELS: Channel[] = ["voice", "web", "chat", "staff"];
 
-function Stat({ label, value, href, tone }: { label: string; value: number | undefined; href?: string; tone?: "bad" | "warn" }) {
-  const body = (
-    <>
-      <p className="text-sm text-ink-2">{label}</p>
-      <p className={cx("mt-1 font-display text-4xl tnum", tone === "bad" && value ? "text-bad" : tone === "warn" && value ? "text-warn" : "text-ink")}>
-        {value === undefined ? <Skeleton className="h-10 w-12" /> : value}
-      </p>
-    </>
-  );
-  return href ? (
-    <Link href={href} className="rounded-lg border border-line bg-raised p-4 transition-colors hover:border-line-strong">
-      {body}
+function plural(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
+/** "in 25 min", "in 2 h 10 min", or "now". */
+export function startsIn(startsAt: string, now = Date.now()): string {
+  const minutes = Math.round((Date.parse(startsAt) - now) / 60_000);
+  if (minutes <= 0) return "now";
+  if (minutes < 60) return `in ${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  return rest ? `in ${hours} h ${rest} min` : `in ${hours} h`;
+}
+
+/** An inline figure in the summary sentence, linking to where it can be acted on. */
+function Figure({ href, children, tone }: { href: string; children: ReactNode; tone?: "bad" | "warn" }) {
+  return (
+    <Link
+      href={href}
+      className={cx(
+        "font-semibold underline decoration-1 underline-offset-[5px] tnum hover:decoration-2",
+        tone === "bad" ? "text-bad decoration-bad/40" : tone === "warn" ? "text-warn decoration-warn/40" : "text-ink decoration-line-strong",
+      )}
+    >
+      {children}
     </Link>
-  ) : (
-    <div className="rounded-lg border border-line bg-raised p-4">{body}</div>
+  );
+}
+
+/**
+ * Today, editorially: one hero number (appointments today) with the next patient beside it,
+ * and the other counts as a sentence rather than a row of tiles. Every number is a real count
+ * from /api/staff/stats.
+ */
+function TodayHero({
+  stats,
+  statsError,
+  next,
+  anyToday,
+  scheduleLoaded,
+  doctorName,
+  timeZone,
+  onOpen,
+}: {
+  stats: StaffStats | undefined;
+  statsError: boolean;
+  next: CalendarAppointment | null;
+  anyToday: boolean;
+  scheduleLoaded: boolean;
+  doctorName: (id: string) => string;
+  timeZone: string;
+  onOpen: (a: CalendarAppointment) => void;
+}) {
+  const channelTotal = stats ? CHANNELS.reduce((sum, c) => sum + (stats.by_channel[c] ?? 0), 0) : 0;
+  return (
+    <section aria-label="Today at a glance" className="border-b border-line pb-8">
+      <div className="grid gap-8 md:grid-cols-[auto_1fr] md:items-end md:gap-14">
+        <div>
+          {stats ? (
+            <p className="font-display text-[5.5rem] leading-[0.85] tracking-[-0.03em] text-ink tnum sm:text-[7rem]">{stats.today}</p>
+          ) : statsError ? (
+            <p className="font-display text-[5.5rem] leading-[0.85] text-ink-3">–</p>
+          ) : (
+            <Skeleton className="h-20 w-28 sm:h-24" />
+          )}
+          <p className="mt-3 text-lg text-ink-2">
+            {stats ? (stats.today === 1 ? "appointment today" : "appointments today") : "appointments today"}
+          </p>
+        </div>
+
+        <div className="max-w-xl border-l-2 border-accent pl-5">
+          <p className="text-xs font-semibold tracking-[0.14em] text-accent uppercase">Next patient</p>
+          {!scheduleLoaded ? (
+            <Loading label="Loading the next patient" className="mt-2 flex flex-col gap-2">
+              <Skeleton className="h-7 w-64" />
+              <Skeleton className="h-5 w-48" />
+            </Loading>
+          ) : next ? (
+            <button type="button" onClick={() => onOpen(next)} className="group mt-1 block text-left">
+              <span className="block font-display text-2xl leading-snug text-ink sm:text-3xl">
+                <span className="tnum">{formatTime(next.starts_at, timeZone)}</span>
+                <span className="text-ink-3"> · </span>
+                <span className="group-hover:underline group-hover:decoration-1 group-hover:underline-offset-4">{next.patient_name ?? "Patient"}</span>
+              </span>
+              <span className="mt-1 block text-ink-2">
+                {next.service_name} with {doctorName(next.doctor_id)} · {startsIn(next.starts_at)}
+              </span>
+            </button>
+          ) : (
+            <p className="mt-1 font-display text-2xl text-ink-2">{anyToday ? "No one else is booked today." : "The diary is clear today."}</p>
+          )}
+        </div>
+      </div>
+
+      {statsError ? (
+        <p className="mt-8 text-ink-2">The other counts couldn&apos;t be loaded just now.</p>
+      ) : stats ? (
+        <p className="mt-8 max-w-3xl text-lg leading-relaxed text-ink-2">
+          <Figure href="/staff/appointments">{plural(stats.week, "appointment", "appointments")}</Figure> booked for the next seven days.{" "}
+          {stats.needs_review ? (
+            <>
+              <Figure href="#review" tone="bad">
+                {plural(stats.needs_review, "booking needs", "bookings need")} review
+              </Figure>
+              ,{" "}
+            </>
+          ) : (
+            "Nothing needs review, "
+          )}
+          {stats.open_callbacks ? (
+            <>
+              and{" "}
+              <Figure href="/staff/callbacks" tone="warn">
+                {plural(stats.open_callbacks, "patient is", "patients are")} waiting
+              </Figure>{" "}
+              for a call-back.
+            </>
+          ) : (
+            "and no one is waiting for a call-back."
+          )}
+        </p>
+      ) : (
+        <Skeleton className="mt-8 h-6 w-full max-w-2xl" />
+      )}
+
+      {stats && channelTotal > 0 ? (
+        <p className="mt-3 text-sm text-ink-3">
+          This week by channel:{" "}
+          {CHANNELS.map((c, i) => (
+            <span key={c}>
+              {i > 0 ? <span aria-hidden="true"> · </span> : null}
+              {channelLabel(c).text} <span className="font-semibold text-ink-2 tnum">{stats.by_channel[c] ?? 0}</span>
+            </span>
+          ))}
+        </p>
+      ) : null}
+    </section>
   );
 }
 
@@ -43,7 +167,13 @@ export function OverviewPage() {
   const catalog = useCatalog();
   const [today, setToday] = useState<string | null>(null);
   const [open, setOpen] = useState<DrawerAppointment | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const [confirm, confirmDialog] = useConfirm();
   useEffect(() => setToday(todayKey(timeZone)), [timeZone]);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
 
   const stats = useSWR<StaffStats>("/api/staff/stats", { refreshInterval: 60_000 });
   const range = today ? dayRange(today, timeZone) : null;
@@ -62,42 +192,35 @@ export function OverviewPage() {
     const list = (schedule.data?.appointments ?? []).filter((a) => a.status !== "cancelled");
     return list.sort((a, b) => Date.parse(a.starts_at) - Date.parse(b.starts_at));
   }, [schedule.data]);
+  const next = upcoming.find((a) => Date.parse(a.starts_at) > now) ?? null;
   const doctorName = (id: string) => schedule.data?.doctors.find((d) => d.id === id)?.name ?? catalog.doctorNames.get(id) ?? "Unknown dentist";
-  const totalByChannel = stats.data ? CHANNELS.reduce((sum, c) => sum + (stats.data!.by_channel[c] ?? 0), 0) : 0;
+  const openDrawer = (a: CalendarAppointment) => setOpen({ ...a, doctor_name: doctorName(a.doctor_id) });
+
+  async function cancelReviewed(a: StaffAppointment) {
+    const service = catalog.serviceNames.get(a.service_id) ?? "Appointment";
+    if (!(await confirm(cancelConfirmation({ ...a, service_name: service }, timeZone)))) return;
+    await actions.resolve(a.id, "cancel");
+  }
 
   return (
     <div>
-      <PageHeader title="Today" description={today ? formatDayKey(today, "long") : undefined} />
-
-      {stats.error ? <ErrorState className="mb-6" message="Counts couldn't be loaded." /> : null}
-      <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-        <Stat label="Appointments today" value={stats.data?.today} href="/staff/calendar" />
-        <Stat label="Next 7 days" value={stats.data?.week} href="/staff/appointments" />
-        <Stat label="Need review" value={stats.data?.needs_review} tone="bad" href="#review" />
-        <Stat label="Open call-backs" value={stats.data?.open_callbacks} tone="warn" href="/staff/callbacks" />
+      <div className="mb-8">
+        <h1 className="font-display text-3xl leading-tight text-ink">Today</h1>
+        <p className="mt-1 text-ink-2">{today ? formatDayKey(today, "long") : " "}</p>
       </div>
 
-      {stats.data && totalByChannel > 0 ? (
-        <section aria-labelledby="channels-title" className="mt-6 rounded-lg border border-line bg-raised p-4">
-          <h2 id="channels-title" className="text-sm font-semibold">
-            How this week&apos;s appointments were booked
-          </h2>
-          <div className="mt-3 flex h-2.5 overflow-hidden rounded-full bg-sunk" aria-hidden="true">
-            {CHANNELS.map((c, i) => (
-              <span key={c} style={{ width: `${((stats.data!.by_channel[c] ?? 0) / totalByChannel) * 100}%`, opacity: 1 - i * 0.2 }} className="bg-ink" />
-            ))}
-          </div>
-          <ul className="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-sm">
-            {CHANNELS.map((c) => (
-              <li key={c} className="text-ink-2">
-                {channelLabel(c).text} <span className="font-semibold text-ink tnum">{stats.data!.by_channel[c] ?? 0}</span>
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
+      <TodayHero
+        stats={stats.data}
+        statsError={!!stats.error}
+        next={next}
+        anyToday={upcoming.length > 0}
+        scheduleLoaded={!!schedule.data || !!schedule.error}
+        doctorName={doctorName}
+        timeZone={timeZone}
+        onOpen={openDrawer}
+      />
 
-      <div className="mt-6 grid gap-6 xl:grid-cols-[1.4fr_1fr]">
+      <div className="mt-8 grid gap-6 xl:grid-cols-[1.4fr_1fr]">
         <Panel
           title="Today's schedule"
           action={
@@ -121,16 +244,16 @@ export function OverviewPage() {
           ) : (
             <ol className="divide-y divide-line">
               {upcoming.map((a) => {
-                const ended = Date.parse(a.ends_at) < Date.now();
+                const ended = Date.parse(a.ends_at) < now;
                 return (
                   <li key={a.id}>
                     <button
                       type="button"
-                      onClick={() => setOpen({ ...a, doctor_name: doctorName(a.doctor_id) })}
+                      onClick={() => openDrawer(a)}
                       className={cx("flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-sunk/50", ended && "text-ink-3")}
                     >
                       <span className="w-[4.5rem] shrink-0 text-sm font-semibold tnum">{formatTime(a.starts_at, timeZone)}</span>
-                      <span aria-hidden="true" className="h-6 w-1 shrink-0 rounded-full" style={{ background: a.colour ?? "var(--color-ink-3)" }} />
+                      <span aria-hidden="true" className="h-6 w-1 shrink-0 rounded-full" style={{ background: safeColour(a.colour) }} />
                       <span className="min-w-0 flex-1">
                         <span className="block truncate font-semibold">{a.patient_name ?? "Patient"}</span>
                         <span className="block truncate text-sm text-ink-2">
@@ -175,7 +298,7 @@ export function OverviewPage() {
                         <Button size="sm" variant="secondary" loading={actions.busy === "requeue"} disabled={!!actions.busy} onClick={() => void actions.resolve(a.id, "requeue")}>
                           Retry sync
                         </Button>
-                        <Button size="sm" variant="danger" loading={actions.busy === "cancel"} disabled={!!actions.busy} onClick={() => void actions.resolve(a.id, "cancel")}>
+                        <Button size="sm" variant="danger" loading={actions.busy === "cancel"} disabled={!!actions.busy} onClick={() => void cancelReviewed(a)}>
                           Cancel
                         </Button>
                       </div>
@@ -215,6 +338,7 @@ export function OverviewPage() {
       </div>
 
       <AppointmentDrawer appointment={open} onClose={() => setOpen(null)} onChanged={() => void Promise.all([schedule.mutate(), stats.mutate(), review.mutate()])} />
+      {confirmDialog}
     </div>
   );
 }

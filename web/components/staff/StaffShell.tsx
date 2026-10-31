@@ -63,7 +63,12 @@ function NavLinks({ onNavigate }: { onNavigate?: () => void }) {
   );
 }
 
-function Shell({ value, children }: { value: StaffContextValue; children: ReactNode }) {
+/**
+ * The console chrome: sidebar, mobile header and main area. It renders straight away and
+ * stays mounted across navigation (it lives in the console layout); while the signed-in user
+ * and clinic load, only the account block and the content area show skeletons.
+ */
+function Shell({ value, children }: { value: StaffContextValue | null; children: ReactNode }) {
   const router = useRouter();
   const pathname = usePathname();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -82,12 +87,26 @@ function Shell({ value, children }: { value: StaffContextValue; children: ReactN
     router.refresh();
   }
 
+  const clinicName = value?.clinic.name ?? null;
+  const name = clinicName ? (
+    <span className="block truncate font-display text-lg leading-tight">{clinicName}</span>
+  ) : (
+    <Skeleton className="h-5 w-32" />
+  );
+
   const account = (
     <div className="flex flex-col gap-2 border-t border-line pt-4">
-      <div className="min-w-0 px-1">
-        <p className="truncate text-sm font-semibold text-ink">{value.user.email}</p>
-        <p className="text-xs text-ink-3">{roleLabel(value.user.role).text}</p>
-      </div>
+      {value ? (
+        <div className="min-w-0 px-1">
+          <p className="truncate text-sm font-semibold text-ink">{value.user.email}</p>
+          <p className="text-xs text-ink-3">{roleLabel(value.user.role).text}</p>
+        </div>
+      ) : (
+        <Loading label="Loading your account" className="flex flex-col gap-1.5 px-1">
+          <Skeleton className="h-4 w-40" />
+          <Skeleton className="h-3 w-16" />
+        </Loading>
+      )}
       <Button variant="ghost" size="sm" onClick={signOut} loading={signingOut} icon={<LogOut className="size-4" aria-hidden="true" />} className="justify-start">
         Sign out
       </Button>
@@ -101,9 +120,9 @@ function Shell({ value, children }: { value: StaffContextValue; children: ReactN
       </a>
       <aside className="sticky top-0 hidden h-dvh flex-col gap-6 border-r border-line bg-raised/60 px-4 py-5 lg:flex">
         <Link href="/staff" className="flex items-center gap-2.5 px-1">
-          <AsterMark className="size-6" />
+          <AsterMark className="size-6 shrink-0" />
           <span className="min-w-0">
-            <span className="block truncate font-display text-lg leading-tight">{value.clinic.name}</span>
+            {name}
             <span className="block text-xs text-ink-3">Staff console</span>
           </span>
         </Link>
@@ -115,9 +134,9 @@ function Shell({ value, children }: { value: StaffContextValue; children: ReactN
 
       <div className="min-w-0">
         <header className="sticky top-0 z-30 flex h-14 items-center justify-between border-b border-line bg-paper/95 px-4 backdrop-blur lg:hidden">
-          <Link href="/staff" className="flex items-center gap-2">
-            <AsterMark className="size-6" />
-            <span className="font-display text-lg">{value.clinic.name}</span>
+          <Link href="/staff" className="flex min-w-0 items-center gap-2">
+            <AsterMark className="size-6 shrink-0" />
+            <span className="min-w-0">{name}</span>
           </Link>
           <button
             type="button"
@@ -137,12 +156,20 @@ function Shell({ value, children }: { value: StaffContextValue; children: ReactN
           </nav>
         ) : null}
         <main id="staff-main" tabIndex={-1} className="mx-auto w-full max-w-[90rem] px-4 py-6 focus:outline-none sm:px-6 lg:px-8 lg:py-8">
-          {!value.canWrite ? (
+          {value && !value.canWrite ? (
             <p className="mb-5 rounded-md border border-line bg-sunk/70 px-3 py-2 text-sm text-ink-2">
               You have read-only access. Ask the clinic owner if you need to make changes.
             </p>
           ) : null}
-          {children}
+          {value ? (
+            children
+          ) : (
+            <Loading label="Loading the staff console">
+              <Skeleton className="h-9 w-56" />
+              <Skeleton className="mt-3 h-5 w-40" />
+              <Skeleton className="mt-8 h-64" />
+            </Loading>
+          )}
         </main>
       </div>
     </div>
@@ -178,7 +205,9 @@ export function StaffShell({ children }: { children: ReactNode }) {
   }, [me.data, clinic.data]);
 
   const error = me.error ?? clinic.error;
-  if (error && !(error instanceof ApiError && error.status === 401)) {
+  // A failed background revalidation keeps the console as it is; only a first load that fails
+  // replaces it with the error.
+  if (error && !value && !(error instanceof ApiError && error.status === 401)) {
     return (
       <div className="mx-auto flex min-h-dvh max-w-lg flex-col justify-center px-6">
         <ErrorState
@@ -203,23 +232,6 @@ export function StaffShell({ children }: { children: ReactNode }) {
       </div>
     );
   }
-  if (!value) {
-    return (
-      <Loading label="Loading the staff console" className="flex min-h-dvh">
-        <div className="hidden w-60 flex-col gap-3 border-r border-line p-5 lg:flex">
-          <Skeleton className="h-8 w-40" />
-          {Array.from({ length: 6 }, (_, i) => (
-            <Skeleton key={i} className="h-8" />
-          ))}
-        </div>
-        <div className="flex-1 p-8">
-          <Skeleton className="h-9 w-64" />
-          <Skeleton className="mt-6 h-64" />
-        </div>
-      </Loading>
-    );
-  }
-
   return (
     <SWRConfig value={{ fetcher, revalidateOnFocus: true, shouldRetryOnError: (err) => !(err instanceof ApiError && err.status < 500) }}>
       <StaffContext.Provider value={value}>

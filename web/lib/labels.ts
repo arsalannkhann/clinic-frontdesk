@@ -87,6 +87,7 @@ export const role = table({
 
 /** Refusals of "Call now", shown next to the disabled button. */
 export const CALL_REFUSALS: Record<string, string> = {
-  outbound_disabled: "Outbound calling is off for this clinic. The owner can turn it on in Settings.",
-  no_from_number: "No caller number is connected yet, so calls cannot be placed.",
+  outbound_disabled: "Outbound calling is off for this clinic. The owner can turn it on in Settings once a calling number is configured.",
+  no_from_number: "No calling number is configured yet, so calls can't be placed. The owner can set one up and then turn outbound calling on in Settings.",
+  no_outbound_agent: "No outbound voice agent is configured yet, so calls can't be placed.",
 };
