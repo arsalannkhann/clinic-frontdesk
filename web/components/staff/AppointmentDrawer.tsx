@@ -8,6 +8,7 @@ import { appointmentStatus, channel as channelLabel, syncState } from "@/lib/lab
 import { formatLongDate, formatTime, zoneAbbreviation } from "@/lib/time";
 import { LabelBadge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { useConfirm, type ConfirmOptions } from "@/components/ui/ConfirmDialog";
 import { Drawer } from "@/components/ui/Modal";
 import { useToast } from "@/components/ui/Toast";
 import { useStaff } from "./StaffContext";
@@ -62,6 +63,20 @@ export function useAppointmentActions(onChanged: () => void) {
 
 const ACTIVE = new Set<BookingStatus>(["pending_sync", "confirmed", "needs_review"]);
 
+/** The confirmation shown before any appointment is cancelled. */
+export function cancelConfirmation(
+  a: Pick<DrawerAppointment, "starts_at" | "patient_name" | "service_name">,
+  timeZone: string,
+): ConfirmOptions {
+  const who = a.patient_name ?? "this patient";
+  return {
+    title: "Cancel this appointment?",
+    body: `${a.service_name} for ${who} on ${formatLongDate(a.starts_at, timeZone)} at ${formatTime(a.starts_at, timeZone)}. The time is released and the calendar event removed. This can't be undone; the patient would need to book again.`,
+    confirmLabel: "Cancel appointment",
+    cancelLabel: "Keep it",
+  };
+}
+
 export function AppointmentDrawer({
   appointment,
   onClose,
@@ -73,81 +88,75 @@ export function AppointmentDrawer({
 }) {
   const { canWrite, timeZone } = useStaff();
   const actions = useAppointmentActions(onChanged);
-  const [confirmCancel, setConfirmCancel] = useState(false);
-
-  const close = () => {
-    setConfirmCancel(false);
-    onClose();
-  };
+  const [confirm, confirmDialog] = useConfirm();
 
   const a = appointment;
   const started = a ? Date.parse(a.starts_at) <= Date.now() : false;
 
+  async function cancel(target: DrawerAppointment) {
+    if (!(await confirm(cancelConfirmation(target, timeZone)))) return;
+    const ok = target.status === "needs_review" ? await actions.resolve(target.id, "cancel") : await actions.cancel(target.id);
+    if (ok) onClose();
+  }
+
   return (
-    <Drawer
-      open={a !== null}
-      onClose={close}
-      title={a ? a.service_name : "Appointment"}
-      description={a ? `${formatLongDate(a.starts_at, timeZone)} · ${formatTime(a.starts_at, timeZone)} to ${formatTime(a.ends_at, timeZone)} ${zoneAbbreviation(timeZone, Date.parse(a.starts_at))}` : undefined}
-      footer={
-        a && canWrite && ACTIVE.has(a.status) ? (
-          a.status === "needs_review" ? (
-            <>
-              <Button variant="danger" loading={actions.busy === "cancel"} disabled={!!actions.busy} onClick={async () => (await actions.resolve(a.id, "cancel")) && close()}>
-                Cancel appointment
+    <>
+      <Drawer
+        open={a !== null}
+        onClose={onClose}
+        title={a ? a.service_name : "Appointment"}
+        description={a ? `${formatLongDate(a.starts_at, timeZone)} · ${formatTime(a.starts_at, timeZone)} to ${formatTime(a.ends_at, timeZone)} ${zoneAbbreviation(timeZone, Date.parse(a.starts_at))}` : undefined}
+        footer={
+          a && canWrite && ACTIVE.has(a.status) ? (
+            a.status === "needs_review" ? (
+              <>
+                <Button variant="danger" loading={actions.busy === "cancel"} disabled={!!actions.busy} onClick={() => void cancel(a)}>
+                  Cancel appointment
+                </Button>
+                <Button loading={actions.busy === "requeue"} disabled={!!actions.busy || started} onClick={async () => (await actions.resolve(a.id, "requeue")) && onClose()}>
+                  Retry calendar sync
+                </Button>
+              </>
+            ) : (
+              <Button variant="danger" loading={actions.busy === "cancel"} onClick={() => void cancel(a)} disabled={started || !!actions.busy}>
+                {started ? "Already started" : "Cancel appointment"}
               </Button>
-              <Button loading={actions.busy === "requeue"} disabled={!!actions.busy || started} onClick={async () => (await actions.resolve(a.id, "requeue")) && close()}>
-                Retry calendar sync
-              </Button>
-            </>
-          ) : confirmCancel ? (
-            <>
-              <span className="mr-auto text-sm text-ink-2">Cancel this appointment?</span>
-              <Button variant="ghost" onClick={() => setConfirmCancel(false)} disabled={!!actions.busy}>
-                Keep it
-              </Button>
-              <Button variant="danger" loading={actions.busy === "cancel"} onClick={async () => (await actions.cancel(a.id)) && close()}>
-                Yes, cancel
-              </Button>
-            </>
-          ) : (
-            <Button variant="danger" onClick={() => setConfirmCancel(true)} disabled={started}>
-              {started ? "Already started" : "Cancel appointment"}
-            </Button>
-          )
-        ) : undefined
-      }
-    >
-      {a ? (
-        <div className="flex flex-col gap-6">
-          <div className="flex flex-wrap gap-2">
-            <LabelBadge label={appointmentStatus(a.status)} />
-            {a.sync_state ? <LabelBadge label={syncState(a.sync_state)} /> : null}
-            {a.channel ? <LabelBadge label={{ ...channelLabel(a.channel), tone: "neutral" }} /> : null}
+            )
+          ) : undefined
+        }
+      >
+        {a ? (
+          <div className="flex flex-col gap-6">
+            <div className="flex flex-wrap gap-2">
+              <LabelBadge label={appointmentStatus(a.status)} />
+              {a.sync_state ? <LabelBadge label={syncState(a.sync_state)} /> : null}
+              {a.channel ? <LabelBadge label={{ ...channelLabel(a.channel), tone: "neutral" }} /> : null}
+            </div>
+            <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-3 text-[0.95rem]">
+              <dt className="text-ink-3">Patient</dt>
+              <dd className="font-semibold">
+                {a.patient_name ?? <span className="font-normal text-ink-3">Hidden for your role</span>}
+                {a.phone_last2 ? <span className="ml-2 font-normal text-ink-3 tnum">phone ending {a.phone_last2}</span> : null}
+              </dd>
+              <dt className="text-ink-3">Dentist</dt>
+              <dd>{a.doctor_name}</dd>
+              <dt className="text-ink-3">Reference</dt>
+              <dd className="font-mono tracking-wider">{a.reference ?? "—"}</dd>
+            </dl>
+            {a.status === "needs_review" ? (
+              <p className="rounded-md border border-bad/25 bg-bad-tint/50 px-3 py-2 text-sm text-ink">
+                The calendar write for this booking did not complete, so it is not confirmed. Retry the sync, or cancel and call the patient.
+              </p>
+            ) : null}
+            {a.status === "pending_sync" ? (
+              <p className="rounded-md border border-warn/25 bg-warn-tint/50 px-3 py-2 text-sm text-ink">
+                Waiting for the calendar to confirm. Don&apos;t tell the patient it is confirmed yet.
+              </p>
+            ) : null}
           </div>
-          <dl className="grid grid-cols-[8rem_1fr] gap-x-4 gap-y-3 text-[0.95rem]">
-            <dt className="text-ink-3">Patient</dt>
-            <dd className="font-semibold">
-              {a.patient_name ?? <span className="font-normal text-ink-3">Hidden for your role</span>}
-              {a.phone_last2 ? <span className="ml-2 font-normal text-ink-3 tnum">phone ending {a.phone_last2}</span> : null}
-            </dd>
-            <dt className="text-ink-3">Dentist</dt>
-            <dd>{a.doctor_name}</dd>
-            <dt className="text-ink-3">Reference</dt>
-            <dd className="font-mono tracking-wider">{a.reference ?? "—"}</dd>
-          </dl>
-          {a.status === "needs_review" ? (
-            <p className="rounded-md border border-bad/25 bg-bad-tint/50 px-3 py-2 text-sm text-ink">
-              The calendar write for this booking did not complete, so it is not confirmed. Retry the sync, or cancel and call the patient.
-            </p>
-          ) : null}
-          {a.status === "pending_sync" ? (
-            <p className="rounded-md border border-warn/25 bg-warn-tint/50 px-3 py-2 text-sm text-ink">
-              Waiting for the calendar to confirm. Don&apos;t tell the patient it is confirmed yet.
-            </p>
-          ) : null}
-        </div>
-      ) : null}
-    </Drawer>
+        ) : null}
+      </Drawer>
+      {confirmDialog}
+    </>
   );
 }

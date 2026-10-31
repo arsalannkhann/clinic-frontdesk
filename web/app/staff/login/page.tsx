@@ -3,6 +3,7 @@ import Link from "next/link";
 import { Suspense } from "react";
 
 import { AsterMark } from "@/components/public/Brand";
+import { DiaryIllustration } from "@/components/public/DiaryIllustration";
 import { LoginForm } from "@/components/staff/LoginForm";
 import { getClinic, isMock } from "@/lib/server/publicData";
 import { FALLBACK_PROFILE } from "@/lib/site";
@@ -44,17 +45,13 @@ export default async function StaffLoginPage() {
           ) : null}
         </div>
       </div>
-      <div aria-hidden="true" className="relative hidden overflow-hidden border-l border-line bg-ink lg:block">
-        <div className="absolute inset-0 grid grid-cols-6 gap-px opacity-[0.16]">
-          {Array.from({ length: 6 * 22 }, (_, i) => (
-            <span key={i} className={i % 7 === 0 || i % 11 === 3 ? "bg-accent" : "bg-paper/40"} />
-          ))}
+      <div aria-hidden="true" className="hidden flex-col justify-center gap-12 border-l border-line bg-sunk/60 px-12 py-16 lg:flex xl:px-20">
+        <div className="mx-auto w-full max-w-lg -rotate-1 drop-shadow-sm">
+          <DiaryIllustration />
         </div>
-        <div className="absolute inset-x-12 bottom-12">
-          <p className="font-display text-4xl leading-tight text-paper">
-            Today&apos;s diary, call-backs and conversations, <em className="text-accent-tint">in one place.</em>
-          </p>
-        </div>
+        <p className="mx-auto max-w-lg font-display text-4xl leading-tight text-ink">
+          Today&apos;s diary, call-backs and conversations, <em className="text-accent">in one place.</em>
+        </p>
       </div>
     </main>
   );

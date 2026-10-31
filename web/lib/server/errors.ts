@@ -74,7 +74,8 @@ export function normaliseError(status: number, body: unknown): ErrorEnvelope {
     const error = (body as { error?: unknown }).error;
     if (error && typeof error === "object") {
       const code = (error as { code?: unknown }).code;
-      const message = clean((error as { message?: unknown }).message);
+      // A 5xx message can describe internals: keep the code, never the text.
+      const message = status >= 500 ? null : clean((error as { message?: unknown }).message);
       return envelope(
         typeof code === "string" && CODE.test(code) ? code : fallbackCode,
         message ?? fallbackMessage,

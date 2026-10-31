@@ -20,9 +20,11 @@ interface ModalProps {
   footer?: ReactNode;
   variant: "dialog" | "drawer";
   className?: string;
+  /** "alertdialog" for a confirmation that interrupts the user. */
+  role?: "dialog" | "alertdialog";
 }
 
-function Modal({ open, onClose, title, description, children, footer, variant, className }: ModalProps) {
+function Modal({ open, onClose, title, description, children, footer, variant, className, role }: ModalProps) {
   const ref = useRef<HTMLDialogElement>(null);
   const titleId = useId();
   const descriptionId = useId();
@@ -33,6 +35,9 @@ function Modal({ open, onClose, title, description, children, footer, variant, c
     if (open && !dialog.open) {
       if (typeof dialog.showModal === "function") dialog.showModal();
       else dialog.setAttribute("open", "");
+      // An element marked data-autofocus (for example a confirmation's safe choice) takes
+      // focus instead of the first focusable element.
+      dialog.querySelector<HTMLElement>("[data-autofocus]")?.focus();
     } else if (!open && dialog.open) {
       if (typeof dialog.close === "function") dialog.close();
       else dialog.removeAttribute("open");
@@ -42,6 +47,8 @@ function Modal({ open, onClose, title, description, children, footer, variant, c
   return (
     <dialog
       ref={ref}
+      role={role === "alertdialog" ? "alertdialog" : undefined}
+      aria-modal={role === "alertdialog" ? true : undefined}
       aria-labelledby={titleId}
       aria-describedby={description ? descriptionId : undefined}
       onCancel={(event) => {
@@ -80,7 +87,7 @@ function Modal({ open, onClose, title, description, children, footer, variant, c
           <X className="size-5" aria-hidden="true" />
         </button>
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{open ? children : null}</div>
+      {open && children ? <div className="min-h-0 flex-1 overflow-y-auto px-5 py-4">{children}</div> : null}
       {footer && open ? (
         <footer className="flex flex-wrap items-center justify-end gap-2 border-t border-line bg-paper/60 px-5 py-3">
           {footer}

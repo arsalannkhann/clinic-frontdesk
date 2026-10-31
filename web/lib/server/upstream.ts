@@ -164,16 +164,47 @@ export interface ForwardTarget {
   chat?: boolean;
 }
 
-/** Read a JSON body with a size cap. Returns a Response on rejection. */
+/**
+ * Read at most `limit` bytes of a body as UTF-8, stopping (and cancelling the stream) as soon
+ * as the limit is passed, so an oversized or endless body is never buffered whole. Returns
+ * null when the body is too large.
+ */
+export async function readLimitedText(body: ReadableStream<Uint8Array> | null, limit: number): Promise<string | null> {
+  if (!body) return "";
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        await reader.cancel().catch(() => undefined);
+        return null;
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+/** Read a JSON body with a size cap enforced while streaming. Returns a Response on rejection. */
 export async function readJsonBody(request: Request): Promise<string | null | Response> {
   const method = request.method.toUpperCase();
   if (method === "GET" || method === "HEAD" || method === "DELETE") return null;
   const declared = Number(request.headers.get("content-length") ?? "0");
   if (declared > MAX_BODY_BYTES) return errorJson(413, "too_large", "The request is too large.");
-  const text = await request.text();
-  if (new TextEncoder().encode(text).byteLength > MAX_BODY_BYTES) {
-    return errorJson(413, "too_large", "The request is too large.");
-  }
+  const text = await readLimitedText(request.body, MAX_BODY_BYTES);
+  if (text === null) return errorJson(413, "too_large", "The request is too large.");
   if (!text.trim()) return null;
   const type = request.headers.get("content-type") ?? "";
   if (!type.toLowerCase().startsWith("application/json")) {
@@ -226,7 +257,7 @@ export async function forward(request: Request, target: ForwardTarget, deps: Ups
         search: target.search ?? "",
         body,
         token,
-        ip: clientIp(request.headers),
+        ip: clientIp(request.headers, config.trustForwardedFor),
         idempotencyKey: key && IDEMPOTENCY.test(key) && !key.startsWith("bolna:") ? key : null,
       },
       target.chat ? config.chatTimeoutMs : config.timeoutMs,

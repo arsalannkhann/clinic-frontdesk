@@ -5,6 +5,7 @@ import type {
   AdminService,
   BookingResult,
   BookingStatus,
+  SyncState,
   CalendarAppointment,
   CallbackItem,
   Channel,
@@ -101,7 +102,9 @@ interface ChatSession {
   created: number;
   proposals: Map<string, Proposal>;
   lastProposal: Proposal | null;
-  messages: { role: "user" | "assistant"; text: string; created_at: string }[];
+  messages: { role: "user" | "assistant" | "system"; text: string; created_at: string }[];
+  /** The quick replies last offered, for restoring the conversation after a reload. */
+  quick: string[];
   turns: number;
 }
 
@@ -228,6 +231,18 @@ function seedState(): State {
       scripts_approved: true,
       test_calls_enabled: false,
       include_reference_in_messages: false,
+      public_slug: "aster-dental",
+      public_enabled: true,
+      public_tagline: PROFILE.tagline,
+      public_address: PROFILE.address,
+      public_map_url: PROFILE.map_url,
+      public_phone_display: PROFILE.phone_display,
+      public_email: PROFILE.email,
+      public_hours_note: PROFILE.hours_note,
+      public_about: PROFILE.about,
+      public_voice_number: PROFILE.voice_number,
+      public_chat_enabled: PROFILE.chat_enabled,
+      bolna_outbound_from_number: "+919000000199",
     },
     doctors: DOCTORS.map((d) => ({
       id: d.id,
@@ -323,68 +338,112 @@ function seedState(): State {
     id: uuid(),
     name: PATIENT_NAMES[(i * 5 + 2) % PATIENT_NAMES.length]!,
     phone: `+9190000${String(20000 + i).slice(-5)}`,
-    phone_masked: `+91 ••••• •••${String(20 + i).padStart(2, "0")}`,
+    phone_masked: `****${String(20020 + i).slice(-4)}`,
     reason,
     source: (["web", "chat", "voice", "web"] as const)[i]!,
     status: i === 3 ? "done" : "open",
     created_at: isoIst(now - (i * 95 + 20) * MINUTE),
+    resolved_at: i === 3 ? isoIst(now - (i * 95) * MINUTE) : null,
+    execution_id: null,
+    call_requested_at: null,
+    // Seeded demo data, like the API's: never dialled. One open request is a live-looking
+    // record so the Call now flow can be tried (mock mode still dials nothing).
+    synthetic: i !== 0,
   }));
 
-  state.conversations = [
+  state.conversations = seedConversations(state, now);
+  return state;
+}
+
+/** The staff conversation shapes of GET /v1/staff/conversations/{id}. */
+function seedConversations(state: State, now: number): ConversationDetail[] {
+  const at = (minutesAgo: number) => isoIst(now - minutesAgo * MINUTE);
+  const say = (role: "user" | "assistant", text: string, minutesAgo: number) => ({ role, text, tool_name: null, created_at: at(minutesAgo) });
+  const tool = (name: string, result: string, minutesAgo: number) => ({ role: "tool" as const, text: `${name}: ${result}`, tool_name: name, created_at: at(minutesAgo) });
+  const voiceAppt = state.appts.find((a) => a.channel === "voice");
+  const chatAppt = state.appts.find((a) => a.channel === "chat");
+  const link = (a: Appt | undefined) =>
+    a ? [{ id: a.id, reference: a.reference, status: a.status, starts_at: isoIst(a.starts), channel: a.channel }] : [];
+  const chat = { provider_status: null, call_type: null, duration_seconds: null, hangup_by: null };
+  return [
     {
       id: "c0000000-0000-4000-8000-000000000001",
       channel: "chat",
-      started_at: isoIst(now - 50 * MINUTE),
-      status: "ended",
-      turns: 4,
+      started_at: at(50),
+      last_active_at: at(44),
+      ended_at: null,
+      status: "active",
+      turns: 2,
       patient_name: "Ananya Krishnan",
       outcome: "booked",
+      ...chat,
       messages: [
-        { role: "assistant", text: "Hello, I'm Aster Dental Studio's virtual assistant. How can I help?" },
-        { role: "user", text: "Can I get a cleaning on Monday evening?" },
-        { role: "assistant", text: "I can offer Check-up and cleaning with Dr. Rohan Deshpande on Monday at 5:30 pm. Tap Confirm to book it; nothing is booked until you do." },
-        { role: "user", text: "Confirmed." },
-        { role: "assistant", text: "Booked. Your reference is shown on screen; we'll message you if anything changes." },
+        say("assistant", "Hello, I'm Aster Dental Studio's virtual assistant. How can I help?", 50),
+        say("user", "Can I get a cleaning on Monday evening?", 49),
+        tool("check_slots", "ok", 49),
+        tool("propose_booking", "ok", 49),
+        say("assistant", "I can offer Check-up and cleaning with Dr. Rohan Deshpande on Monday at 5:30 pm. Add your details and press Confirm to book it; nothing is booked until you do.", 48),
+        { role: "system", text: "Booking requested from this chat.", tool_name: null, created_at: at(45) },
+        say("user", "Thank you!", 44),
+        say("assistant", "You're welcome. See you on Monday.", 44),
       ],
+      appointments: link(chatAppt),
     },
     {
       id: "c0000000-0000-4000-8000-000000000002",
       channel: "voice",
-      started_at: isoIst(now - 3 * 60 * MINUTE),
-      status: "ended",
-      turns: 9,
+      started_at: at(180),
+      last_active_at: at(174),
+      ended_at: at(174),
+      status: "completed",
+      turns: 0,
       patient_name: "Vikram Hegde",
       outcome: "booked",
-      summary:
-        "Caller asked for a root canal opinion on a lower molar. Booked a root canal consultation with Dr. Kavya Iyer; reference read back. No medical advice given.",
+      provider_status: "completed",
+      call_type: "inbound",
+      duration_seconds: 342,
+      hangup_by: "caller",
+      messages: [],
+      appointments: link(voiceAppt),
     },
     {
       id: "c0000000-0000-4000-8000-000000000003",
       channel: "chat",
-      started_at: isoIst(now - 26 * 60 * MINUTE),
-      status: "ended",
+      started_at: at(26 * 60),
+      last_active_at: at(26 * 60 - 3),
+      ended_at: null,
+      status: "active",
       turns: 2,
       patient_name: null,
-      outcome: "callback_requested",
+      outcome: null,
+      ...chat,
       messages: [
-        { role: "user", text: "Do you take Star Health insurance?" },
-        { role: "assistant", text: "I can't confirm insurance cover here. I can ask the front desk to call you back with an answer. Would you like that?" },
-        { role: "user", text: "Yes please" },
-        { role: "assistant", text: "Done. Please leave your name and number on the call-back form and the team will ring you during clinic hours." },
+        say("user", "Do you take Star Health insurance?", 26 * 60),
+        say("assistant", "I can't confirm insurance cover here. I can ask the front desk to call you back with an answer. Would you like that?", 26 * 60 - 1),
+        say("user", "Yes please", 26 * 60 - 2),
+        tool("request_callback", "ok", 26 * 60 - 3),
+        say("assistant", "Done. The front desk will ring you during clinic hours.", 26 * 60 - 3),
       ],
+      appointments: [],
     },
     {
       id: "c0000000-0000-4000-8000-000000000004",
       channel: "voice",
-      started_at: isoIst(now - 28 * 60 * MINUTE),
-      status: "ended",
-      turns: 3,
+      started_at: at(28 * 60),
+      last_active_at: at(28 * 60 - 2),
+      ended_at: at(28 * 60 - 2),
+      status: "completed",
+      turns: 0,
       patient_name: null,
-      outcome: "handoff",
-      summary: "Caller reported facial swelling. The approved emergency script was read and the caller was directed to emergency care.",
+      outcome: null,
+      provider_status: "completed",
+      call_type: "inbound",
+      duration_seconds: 96,
+      hangup_by: "agent",
+      messages: [],
+      appointments: [],
     },
   ];
-  return state;
 }
 
 function isBlocked(state: State, doctorId: string, from: number, to: number): boolean {
@@ -539,7 +598,16 @@ function patientFields(body: Record<string, unknown>, requireConsent: boolean): 
 
 function publicRoutes(state: State, method: string, rest: string[], url: URLSearchParams, body: Record<string, unknown>): UpstreamResult {
   const path = rest.join("/");
-  if (method === "GET" && path === "") return ok(PROFILE);
+  if (method === "GET" && path === "") {
+    // The public profile follows what the owner saves in Settings > Clinic profile.
+    const profile: Record<string, unknown> = { ...PROFILE, name: state.clinic.name, timezone: state.clinic.timezone };
+    for (const [field, out] of Object.entries(PROFILE_FIELDS)) {
+      const value = state.clinic[field as keyof typeof PROFILE_FIELDS];
+      // An emptied text reads as absent on the website.
+      profile[out] = value === "" || value === undefined ? (out === "chat_enabled" ? false : null) : value;
+    }
+    return ok(profile);
+  }
   if (method === "GET" && path === "services") {
     return ok(SERVICES.map(({ buffer: _buffer, ...s }) => s));
   }
@@ -595,11 +663,15 @@ function publicRoutes(state: State, method: string, rest: string[], url: URLSear
       id: uuid(),
       name,
       phone,
-      phone_masked: `${phone.slice(0, 3)} ••••• •••${phone.slice(-2)}`,
+      phone_masked: `****${phone.slice(-4)}`,
       reason: reason || null,
       source: "web",
       status: "open",
       created_at: isoIst(Date.now()),
+      resolved_at: null,
+      execution_id: null,
+      call_requested_at: null,
+      synthetic: false,
     };
     state.callbacks.unshift(item);
     return ok({ id: item.id, status: item.status }, 201);
@@ -721,33 +793,67 @@ function chatReply(state: State, session: ChatSession, text: string): UpstreamRe
   return say("I can help you book an appointment, check our hours and location, or arrange a call back. What would you like to do?");
 }
 
+function publicProposal(proposal: Proposal) {
+  const doctor = doctorById(proposal.doctor_id)!;
+  const service = serviceById(proposal.service_id)!;
+  return {
+    id: proposal.id,
+    doctor_name: doctor.name,
+    service_name: service.name,
+    starts_at: isoIst(proposal.starts),
+    expires_at: isoIst(proposal.expires),
+  };
+}
+
 function chatRoutes(state: State, method: string, rest: string[], body: Record<string, unknown>): UpstreamResult {
-  if (method !== "POST") return fail(405, "method_not_allowed", "Method not allowed.");
-  if (rest[0] === "clinics" && rest[2] === "sessions" && rest.length === 3) {
-    const session: ChatSession = { id: hex(16), created: Date.now(), proposals: new Map(), lastProposal: null, messages: [], turns: 0 };
+  if (method === "POST" && rest[0] === "clinics" && rest[2] === "sessions" && rest.length === 3) {
+    const session: ChatSession = {
+      id: hex(16),
+      created: Date.now(),
+      proposals: new Map(),
+      lastProposal: null,
+      messages: [{ role: "assistant", text: GREETING, created_at: isoIst(Date.now()) }],
+      quick: QUICK,
+      turns: 0,
+    };
     state.chats.set(session.id, session);
     return ok({ session_id: session.id, greeting: GREETING, quick_replies: QUICK }, 201);
   }
   if (rest[0] !== "sessions" || !rest[1]) return fail(404, "not_found", "Not found.");
   const session = state.chats.get(rest[1]);
   if (!session) return fail(404, "session_not_found", "This conversation has ended. Start a new one.");
+  if (method === "GET" && rest.length === 2) {
+    // The transcript for a reload: messages in order, the open proposal (if still bookable)
+    // and the quick replies last offered.
+    const open = session.lastProposal;
+    const live = open && !open.consumed && open.expires > Date.now() ? publicProposal(open) : null;
+    return ok({
+      messages: session.messages.filter((m) => m.role !== "system").map(({ role, text }) => ({ role, text })),
+      proposal: live,
+      quick_replies: session.quick,
+    });
+  }
+  if (method !== "POST") return fail(405, "method_not_allowed", "Method not allowed.");
   if (rest[2] === "messages" && rest.length === 3) {
     const text = typeof body.text === "string" ? body.text.trim() : "";
     if (!text || text.length > 1000) return fail(422, "invalid_text", "Messages can be up to 1000 characters.");
-    if (session.turns >= 40) return fail(429, "rate_limited", "This conversation is very long. Please start a new one or call us.");
+    if (session.turns >= 40) return fail(409, "conversation_limit", "This conversation is full; please start a new chat or call the clinic.");
     session.turns += 1;
     session.messages.push({ role: "user", text, created_at: isoIst(Date.now()) });
     const reply = chatReply(state, session, text);
-    for (const m of (reply.body as { messages: { role: "assistant"; text: string }[] }).messages) {
+    const replyBody = reply.body as { messages: { role: "assistant"; text: string }[]; quick_replies: string[] };
+    for (const m of replyBody.messages) {
       session.messages.push({ ...m, created_at: isoIst(Date.now()) });
     }
+    session.quick = replyBody.quick_replies;
     return reply;
   }
   if (rest[2] === "proposals" && rest[3] && rest[4] === "confirm" && rest.length === 5) {
     const proposal = session.proposals.get(rest[3]);
     if (!proposal) return fail(404, "not_found", "That suggestion is no longer available.");
     if (proposal.consumed) return fail(409, "proposal_used", "This time has already been booked from this conversation.");
-    if (proposal.expires < Date.now()) return fail(409, "proposal_expired", "That suggestion has expired. Ask for a new time.");
+    if (proposal.expires < Date.now()) return fail(410, "proposal_expired", "This offer has expired; please ask again.");
+    if (body.consent_contact !== true) return fail(422, "consent_required", "Consent to be contacted is required to book.");
     const patient = patientFields(body, true);
     if ("status" in patient) return patient;
     if (!slotOpen(state, proposal.service_id, proposal.doctor_id, proposal.starts)) {
@@ -762,7 +868,16 @@ function chatRoutes(state: State, method: string, rest: string[], body: Record<s
       phone: patient.phone,
       channel: "chat",
     });
-    return ok(bookingResult(appt), 202);
+    const result = bookingResult(appt);
+    session.messages.push({
+      // Like the API: a system note, not shown to the patient (GET leaves it out), and the
+      // booked proposal is no longer offered.
+      role: "system",
+      text: `Booking requested from this chat: reference ${result.reference}, status ${result.status}.`,
+      created_at: isoIst(Date.now()),
+    });
+    session.quick = QUICK;
+    return ok(result, 202);
   }
   return fail(404, "not_found", "Not found.");
 }
@@ -774,7 +889,7 @@ const forbidden = () => detail(403, "Insufficient role");
 
 function calendarAppointment(appt: Appt, role: Role): CalendarAppointment {
   const service = serviceById(appt.service_id)!;
-  const sync: Record<BookingStatus, string> = {
+  const sync: Record<BookingStatus, SyncState> = {
     confirmed: "synced",
     pending_sync: "pending",
     needs_review: "failed",
@@ -821,7 +936,9 @@ function range(url: URLSearchParams): { from: number; to: number } | null {
 
 function staffRoutes(state: State, user: StaffUser, method: string, rest: string[], url: URLSearchParams, body: Record<string, unknown>): UpstreamResult {
   const [first, id, action] = rest;
-  if (first === "me" && rest.length === 1 && method === "GET") return ok(user);
+  if (first === "me" && rest.length === 1 && method === "GET") {
+    return ok({ ...user, clinic: { id: state.clinic.id, name: state.clinic.name, timezone: state.clinic.timezone, public_slug: state.clinic.public_slug ?? null } });
+  }
   if (first === "calendar" && method === "GET") {
     const r = range(url);
     if (!r || r.to - r.from > 31 * DAY) return fail(422, "invalid_range", "Choose a range of up to 31 days.");
@@ -861,27 +978,41 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
   if (first === "callbacks") {
     if (rest.length === 1 && method === "GET") {
       const status = url.get("status");
+      const viewer = user.role === "viewer";
       return ok(
         state.callbacks
           .filter((c) => !status || c.status === status)
-          .map(({ phone: _phone, ...c }) => c),
+          .map(({ phone: _phone, ...c }) => (viewer ? { ...c, name: null, phone_masked: null, reason: null } : c)),
       );
     }
     const item = state.callbacks.find((c) => c.id === id);
-    if (!item) return fail(404, "not_found", "That call-back request was not found.");
+    if (!item) return detail(404, "Callback request not found");
     if (action === "call" && method === "POST") {
-      if (!canWrite(user)) return fail(403, "forbidden", "Only the owner or an admin can place calls.");
-      if (!state.clinic.outbound_enabled) {
-        return fail(409, "outbound_disabled", "Outbound calling is turned off for this clinic. The owner can turn it on in Settings.");
-      }
-      return fail(409, "no_from_number", "No outbound caller number is set up yet. The owner needs to connect one before calls can be placed.");
+      if (!canWrite(user)) return forbidden();
+      // The API's order of checks.
+      if (item.status === "done" || item.status === "dismissed") return fail(409, "callback_resolved", "This request is already resolved.");
+      if (item.status === "calling") return ok({ status: "calling", execution_id: item.execution_id }, 202);
+      const outbound = outboundStatus(state);
+      if (!outbound.enabled) return fail(409, "outbound_disabled", "Outbound calling is turned off for this clinic.");
+      if (!outbound.has_from_number) return fail(409, "no_from_number", "No outbound caller number is configured.");
+      if (!outbound.has_outbound_agent) return fail(409, "no_outbound_agent", "No outbound agent is configured.");
+      if (item.synthetic) return fail(409, "synthetic_contact", "Demo records are never dialled.");
+      // Mock mode never dials anyone: the request is only marked as calling.
+      item.status = "calling";
+      item.execution_id = `mock-${hex(8)}`;
+      item.call_requested_at = isoIst(Date.now());
+      return ok({ status: "calling", execution_id: item.execution_id }, 202);
     }
     if (action === "resolve" && method === "POST") {
       if (!canWrite(user)) return forbidden();
-      if (body.status !== "done" && body.status !== "dismissed") return fail(422, "invalid_status", "Choose done or dismissed.");
-      item.status = body.status;
-      const { phone: _phone, ...out } = item;
-      return ok(out);
+      if (body.status !== "done" && body.status !== "dismissed") return detail(422, [{ loc: ["body", "status"], msg: "Input should be 'done' or 'dismissed'", type: "literal_error" }]);
+      if (item.status === "done" || item.status === "dismissed") {
+        if (item.status !== body.status) return fail(409, "callback_resolved", "This request is already resolved.");
+      } else {
+        item.status = body.status;
+        item.resolved_at = isoIst(Date.now());
+      }
+      return ok({ id: item.id, status: item.status, resolved_at: item.resolved_at });
     }
   }
   if (first === "conversations" && method === "GET") {
@@ -890,19 +1021,33 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
       return ok(
         state.conversations
           .filter((c) => !channel || c.channel === channel)
-          .map(({ messages: _m, summary: _s, ...c }) => ({ ...c, patient_name: user.role === "viewer" ? null : c.patient_name })),
+          .map((c) => ({
+            id: c.id,
+            channel: c.channel,
+            started_at: c.started_at,
+            status: c.status,
+            turns: c.turns,
+            patient_name: user.role === "viewer" ? null : c.patient_name,
+            outcome: c.outcome,
+          })),
       );
     }
     const conversation = state.conversations.find((c) => c.id === id);
-    if (!conversation) return fail(404, "not_found", "That conversation was not found.");
-    return ok(conversation);
+    if (!conversation) return detail(404, "Conversation not found");
+    if (user.role !== "viewer") return ok(conversation);
+    // Viewers see the structure but no text or names.
+    return ok({ ...conversation, patient_name: null, messages: conversation.messages.map((m) => ({ ...m, text: null })) });
+  }
+  if (first === "outbound-status" && rest.length === 1 && method === "GET") {
+    return ok(outboundStatus(state));
   }
   if (first === "stats" && method === "GET") {
     const today = istDate(Date.now());
     const weekEnd = dayStart(addDays(today, 7));
     const active = state.appts.filter((a) => a.status !== "cancelled");
+    // Appointments created in the last 30 days, by channel (cancelled ones included).
     const byChannel: Record<Channel, number> = { voice: 0, web: 0, chat: 0, staff: 0 };
-    for (const a of active.filter((a) => a.starts >= dayStart(today) && a.starts < weekEnd)) byChannel[a.channel] += 1;
+    for (const a of state.appts.filter((a) => a.created >= Date.now() - 30 * DAY)) byChannel[a.channel] += 1;
     return ok({
       today: active.filter((a) => istDate(a.starts) === today).length,
       week: active.filter((a) => a.starts >= dayStart(today) && a.starts < weekEnd).length,
@@ -911,16 +1056,54 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
       by_channel: byChannel,
     });
   }
-  return fail(404, "not_found", "Not found.");
+  return detail(404, "Not Found");
 }
 
-const OWNER_ONLY = new Set(["scripts_approved", "test_calls_enabled", "include_reference_in_messages"]);
-const CLINIC_FIELDS = new Set([
+/**
+ * Mock outbound readiness: the outbound agent is "configured"; the calling number follows the
+ * owner's bolna_outbound_from_number. Nothing is ever dialled.
+ */
+const MOCK_HAS_OUTBOUND_AGENT = true;
+function outboundStatus(state: State) {
+  return {
+    enabled: state.clinic.outbound_enabled,
+    has_from_number: Boolean(state.clinic.bolna_outbound_from_number),
+    has_outbound_agent: MOCK_HAS_OUTBOUND_AGENT,
+  };
+}
+
+const OWNER_ONLY = new Set([
+  "outbound_enabled",
+  "bolna_outbound_from_number",
+  "scripts_approved",
+  "test_calls_enabled",
+  "include_reference_in_messages",
+]);
+/** admin/clinic profile field → public profile field. */
+const PROFILE_FIELDS = {
+  public_tagline: "tagline",
+  public_address: "address",
+  public_map_url: "map_url",
+  public_phone_display: "phone_display",
+  public_email: "email",
+  public_hours_note: "hours_note",
+  public_about: "about",
+  public_voice_number: "voice_number",
+  public_chat_enabled: "chat_enabled",
+} as const;
+const PROFILE_LIMITS: Record<string, number> = {
+  public_tagline: 160,
+  public_address: 300,
+  public_phone_display: 32,
+  public_hours_note: 300,
+  public_about: 2000,
+};
+const CLINIC_FIELDS = new Set<string>([
+  ...Object.keys(PROFILE_FIELDS),
   "name",
   "timezone",
   "lead_time_minutes",
   "horizon_days",
-  "outbound_enabled",
   "quiet_hours_start",
   "quiet_hours_end",
   "reminder_lead_minutes",
@@ -929,6 +1112,25 @@ const CLINIC_FIELDS = new Set([
   "handoff_text",
   ...OWNER_ONLY,
 ]);
+
+/** The API's PATCH rules for the profile and number fields: no nulls, https, E.164, lengths. */
+function clinicFieldErrors(body: Record<string, unknown>) {
+  const errors: { loc: string[]; msg: string; type: string }[] = [];
+  for (const [key, value] of Object.entries(body)) {
+    const bad = (msg: string) => errors.push({ loc: ["body", key], msg, type: "value_error" });
+    if (value === null) bad("may not be null");
+    else if (key === "public_chat_enabled" || key === "outbound_enabled") {
+      if (typeof value !== "boolean") bad("must be a boolean");
+    } else if (key in PROFILE_FIELDS || key === "bolna_outbound_from_number") {
+      if (typeof value !== "string") bad("must be a string");
+      else if (key === "public_map_url" && !/^https:\/\/\S+$/.test(value)) bad("must be an https URL");
+      else if ((key === "public_voice_number" || key === "bolna_outbound_from_number") && !E164.test(value)) bad("must be an E.164 number");
+      else if (key === "public_email" && value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) bad("must be an email address");
+      else if (PROFILE_LIMITS[key] !== undefined && value.length > PROFILE_LIMITS[key]!) bad(`at most ${PROFILE_LIMITS[key]} characters`);
+    }
+  }
+  return errors;
+}
 
 function adminRoutes(
   state: State,
@@ -949,6 +1151,8 @@ function adminRoutes(
       const unknown = keys.filter((k) => !CLINIC_FIELDS.has(k));
       if (unknown.length) return detail(422, unknown.map((k) => ({ loc: ["body", k], msg: "extra", type: "extra_forbidden" })));
       if (keys.some((k) => OWNER_ONLY.has(k)) && user.role !== "owner") return forbidden();
+      const invalid = clinicFieldErrors(body);
+      if (invalid.length) return detail(422, invalid);
       if (body.quiet_hours_start !== undefined && body.quiet_hours_start === (body.quiet_hours_end ?? state.clinic.quiet_hours_end)) {
         return detail(422, "Quiet hours start and end must differ");
       }

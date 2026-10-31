@@ -2,14 +2,14 @@
 
 import { Plus, Trash2 } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
-import useSWR from "swr";
+import useSWR, { useSWRConfig } from "swr";
 
 import { api, errorMessage, withQuery } from "@/lib/api/client";
 import type {
   AdminDoctor,
   AdminService,
   ClinicConfig,
-  ClinicProfile,
+  OutboundStatus,
   ExceptionCreated,
   HoursWindow,
   ScheduleException,
@@ -58,23 +58,83 @@ export function SettingsPage() {
 
 /* ---------- clinic ---------- */
 
-type ClinicForm = Omit<ClinicConfig, "id" | "timezone">;
-const OWNER_ONLY: (keyof ClinicForm)[] = ["scripts_approved", "test_calls_enabled", "include_reference_in_messages"];
+type ClinicForm = Omit<ClinicConfig, "id" | "timezone" | "public_slug" | "public_enabled">;
+const OWNER_ONLY: (keyof ClinicForm)[] = [
+  "outbound_enabled",
+  "bolna_outbound_from_number",
+  "scripts_approved",
+  "test_calls_enabled",
+  "include_reference_in_messages",
+];
+
+/** The public profile on admin/clinic, shown on the website. */
+const PROFILE_TEXT = [
+  "public_tagline",
+  "public_address",
+  "public_map_url",
+  "public_phone_display",
+  "public_email",
+  "public_hours_note",
+  "public_about",
+  "public_voice_number",
+] as const;
+type TextKey = (typeof PROFILE_TEXT)[number] | "bolna_outbound_from_number";
+const TEXT_KEYS: readonly TextKey[] = [...PROFILE_TEXT, "bolna_outbound_from_number"];
+/** The API takes no nulls and validates these, so once set they can be replaced, not cleared. */
+const UNCLEARABLE: readonly TextKey[] = ["public_map_url", "public_voice_number", "bolna_outbound_from_number"];
+const E164 = /^\+[1-9]\d{7,14}$/;
+
+const isText = (key: keyof ClinicForm): key is TextKey => (TEXT_KEYS as readonly string[]).includes(key);
+/** Text compares trimmed, with empty and missing alike. */
+const normalise = (key: keyof ClinicForm, value: unknown): unknown => (isText(key) ? (typeof value === "string" ? value.trim() : "") : value);
+
+/**
+ * The PATCH body: changed fields only (the API refuses nulls), leaving out owner-only fields
+ * for everyone else. A cleared text field is sent as "".
+ */
+export function clinicChanges(form: ClinicForm, original: ClinicConfig, isOwner: boolean): Partial<ClinicForm> {
+  const changes: Record<string, unknown> = {};
+  for (const key of Object.keys(form) as (keyof ClinicForm)[]) {
+    if (!isOwner && OWNER_ONLY.includes(key)) continue;
+    const next = normalise(key, form[key]);
+    if (next !== normalise(key, original[key])) changes[key] = next;
+  }
+  return changes as Partial<ClinicForm>;
+}
+
+/** Field errors for the changed profile and number fields, before anything is sent. */
+export function clinicFieldErrors(changes: Partial<ClinicForm>, original: ClinicConfig): Partial<Record<TextKey, string>> {
+  const errors: Partial<Record<TextKey, string>> = {};
+  for (const key of TEXT_KEYS) {
+    const value = changes[key];
+    if (typeof value !== "string") continue;
+    if (value === "" && UNCLEARABLE.includes(key) && original[key]) errors[key] = "This can be replaced but not cleared.";
+    else if (key === "public_map_url" && !/^https:\/\/\S+$/.test(value)) errors[key] = "Use an https:// link.";
+    else if ((key === "public_voice_number" || key === "bolna_outbound_from_number") && !E164.test(value)) errors[key] = "Use the international format, for example +919800012345.";
+    else if (key === "public_email" && value && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value)) errors[key] = "Enter an email address.";
+  }
+  return errors;
+}
+
+function toForm(clinic: ClinicConfig): ClinicForm {
+  const { id: _id, timezone: _tz, public_slug: _slug, public_enabled: _enabled, ...rest } = clinic;
+  const form: ClinicForm = { ...rest };
+  for (const key of TEXT_KEYS) if (key in clinic) form[key] = rest[key] ?? "";
+  return form;
+}
 
 function ClinicSettings() {
   const { canWrite, isOwner } = useStaff();
   const toast = useToast();
+  const { mutate } = useSWRConfig();
   const clinic = useSWR<ClinicConfig>("/api/admin/clinic");
-  const profile = useSWR<ClinicProfile>("/api/public");
   const [form, setForm] = useState<ClinicForm | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<Partial<Record<TextKey, string>>>({});
 
   useEffect(() => {
-    if (clinic.data) {
-      const { id: _id, timezone: _tz, ...rest } = clinic.data;
-      setForm(rest);
-    }
+    if (clinic.data) setForm(toForm(clinic.data));
   }, [clinic.data]);
 
   if (clinic.error) return <ErrorState message={errorMessage(clinic.error)} />;
@@ -87,17 +147,28 @@ function ClinicSettings() {
     );
   }
   const original = clinic.data;
-  const set = <K extends keyof ClinicForm>(key: K, value: ClinicForm[K]) => setForm((f) => (f ? { ...f, [key]: value } : f));
+  // An API without the profile on admin/clinic leaves nothing to edit.
+  const hasProfile = PROFILE_TEXT.some((key) => key in original);
+  const set = <K extends keyof ClinicForm>(key: K, value: ClinicForm[K]) => {
+    setForm((f) => (f ? { ...f, [key]: value } : f));
+    if (isText(key)) setFieldErrors((e) => ({ ...e, [key]: undefined }));
+  };
+  const text = (key: TextKey) => (form[key] as string | null | undefined) ?? "";
+  const textField = (key: TextKey) => ({
+    value: text(key),
+    onChange: (e: { target: { value: string } }) => set(key, e.target.value),
+  });
 
   async function save(event: FormEvent) {
     event.preventDefault();
     if (!form) return;
     setError(null);
-    const changes: Partial<ClinicForm> = {};
-    for (const key of Object.keys(form) as (keyof ClinicForm)[]) {
-      if (form[key] !== original[key] && (isOwner || !OWNER_ONLY.includes(key))) {
-        (changes as Record<string, unknown>)[key] = form[key];
-      }
+    const changes = clinicChanges(form, original, isOwner);
+    const invalid = clinicFieldErrors(changes, original);
+    setFieldErrors(invalid);
+    if (Object.keys(invalid).length) {
+      setError("Check the highlighted fields.");
+      return;
     }
     if (Object.keys(changes).length === 0) {
       toast.show("Nothing has changed.", "info");
@@ -107,6 +178,8 @@ function ClinicSettings() {
     try {
       const updated = await api<ClinicConfig>("/api/admin/clinic", { method: "PATCH", body: changes });
       await clinic.mutate(updated, { revalidate: false });
+      // Outbound readiness depends on outbound_enabled; refresh the panel and Call-backs.
+      if ("outbound_enabled" in changes || "bolna_outbound_from_number" in changes) void mutate("/api/staff/outbound-status");
       toast.show("Clinic settings saved.");
     } catch (err) {
       setError(errorMessage(err));
@@ -116,7 +189,7 @@ function ClinicSettings() {
   }
 
   return (
-    <div className="grid gap-6 xl:grid-cols-[1.4fr_1fr]">
+    <div className="grid items-start gap-6 xl:grid-cols-[1.4fr_1fr]">
       <form onSubmit={save} noValidate>
         <fieldset disabled={!canWrite || saving} className="flex flex-col gap-6">
           <Panel title="Booking rules">
@@ -134,14 +207,80 @@ function ClinicSettings() {
             </div>
           </Panel>
 
+          <Panel title="Clinic profile">
+            {hasProfile ? (
+              <div className="grid gap-4 p-4 sm:grid-cols-2">
+                <p className="text-sm text-ink-2 sm:col-span-2">
+                  Shown to patients on the website and used by the assistants. Leave a text empty to hide it.
+                  {original.public_slug ? (
+                    <>
+                      {" "}
+                      The website is {original.public_enabled ? "published" : "not published"} at the address <span className="font-mono">{original.public_slug}</span>.
+                    </>
+                  ) : null}
+                </p>
+                <Field label="Tagline" className="sm:col-span-2" error={fieldErrors.public_tagline}>
+                  {(p) => <Input {...p} {...textField("public_tagline")} maxLength={160} />}
+                </Field>
+                <Field label="Address" className="sm:col-span-2" error={fieldErrors.public_address}>
+                  {(p) => <Textarea {...p} {...textField("public_address")} rows={2} maxLength={300} />}
+                </Field>
+                <Field label="Map link" hint="An https link. Once set it can be replaced, not removed." error={fieldErrors.public_map_url}>
+                  {(p) => <Input {...p} {...textField("public_map_url")} type="url" inputMode="url" maxLength={500} />}
+                </Field>
+                <Field label="Phone shown on the website" error={fieldErrors.public_phone_display}>
+                  {(p) => <Input {...p} {...textField("public_phone_display")} type="tel" maxLength={32} />}
+                </Field>
+                <Field label="Email" error={fieldErrors.public_email}>
+                  {(p) => <Input {...p} {...textField("public_email")} type="email" autoComplete="off" maxLength={254} />}
+                </Field>
+                <Field label="Receptionist line" hint="The number patients call for the voice assistant, like +919800012345." error={fieldErrors.public_voice_number}>
+                  {(p) => <Input {...p} {...textField("public_voice_number")} type="tel" maxLength={16} />}
+                </Field>
+                <Field label="Hours note" hint="For example “Sunday by appointment only”." className="sm:col-span-2" error={fieldErrors.public_hours_note}>
+                  {(p) => <Input {...p} {...textField("public_hours_note")} maxLength={300} />}
+                </Field>
+                <Field label="About the clinic" className="sm:col-span-2" error={fieldErrors.public_about}>
+                  {(p) => <Textarea {...p} {...textField("public_about")} rows={4} maxLength={2000} />}
+                </Field>
+                <Checkbox
+                  className="sm:col-span-2"
+                  label="Show the chat assistant on the website"
+                  checked={!!form.public_chat_enabled}
+                  onChange={(e) => set("public_chat_enabled", e.target.checked)}
+                />
+              </div>
+            ) : (
+              <p className="p-4 text-sm text-ink-2">The clinic&apos;s public profile can&apos;t be edited from here yet.</p>
+            )}
+          </Panel>
+
           <Panel title="Patient contact">
             <div className="flex flex-col gap-4 p-4">
               <Checkbox
                 label="Allow outbound contact (reminders and staff call-backs)"
-                description="Off by default. Nothing is sent or dialled while this is off. A caller number must also be connected before calls can be placed."
+                description={
+                  isOwner
+                    ? "Off by default. Nothing is sent or dialled while this is off. Calls also need a calling number and an outbound agent; see Outbound calling."
+                    : "Owner only. Nothing is sent or dialled while this is off."
+                }
                 checked={form.outbound_enabled}
+                disabled={!isOwner}
                 onChange={(e) => set("outbound_enabled", e.target.checked)}
               />
+              {"bolna_outbound_from_number" in original ? (
+                <Field
+                  label="Calling number"
+                  hint={
+                    isOwner
+                      ? "The number call-backs come from, connected to the clinic's voice provider, like +919800012345. Once set it can be replaced, not removed."
+                      : "Owner only."
+                  }
+                  error={fieldErrors.bolna_outbound_from_number}
+                >
+                  {(p) => <Input {...p} {...textField("bolna_outbound_from_number")} type="tel" maxLength={16} disabled={!isOwner} className="sm:max-w-xs" />}
+                </Field>
+              ) : null}
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label="Quiet hours start">{(p) => <Input {...p} type="time" value={form.quiet_hours_start} onChange={(e) => set("quiet_hours_start", e.target.value)} />}</Field>
                 <Field label="Quiet hours end">{(p) => <Input {...p} type="time" value={form.quiet_hours_end} onChange={(e) => set("quiet_hours_end", e.target.value)} />}</Field>
@@ -202,38 +341,91 @@ function ClinicSettings() {
         </fieldset>
       </form>
 
-      <Panel title="Public profile">
+      <OutboundPanel saved={original.outbound_enabled} />
+    </div>
+  );
+}
+
+/**
+ * What outbound calling needs and what is in place, from GET staff/outbound-status. Call-backs
+ * links here ("See what's needed"). The number and agent are set up by the platform; the owner
+ * then turns outbound contact on above.
+ */
+function OutboundPanel({ saved }: { saved: boolean }) {
+  const { canWrite, isOwner } = useStaff();
+  const status = useSWR<OutboundStatus>(canWrite ? "/api/staff/outbound-status" : null);
+
+  useEffect(() => {
+    if (status.data && window.location.hash === "#outbound") {
+      document.getElementById("outbound")?.scrollIntoView({ block: "start" });
+    }
+  }, [status.data]);
+
+  const data = status.data;
+  const ready = data ? data.enabled && data.has_from_number && data.has_outbound_agent : false;
+  const steps: { done: boolean; label: string; detail: string }[] = data
+    ? [
+        {
+          done: data.has_from_number,
+          label: "A calling number",
+          detail: data.has_from_number ? "Configured. Calls show this number to the patient." : isOwner
+              ? "Not configured yet. Set the calling number under Patient contact and save."
+              : "Not configured yet. The owner sets it under Patient contact.",
+        },
+        {
+          done: data.has_outbound_agent,
+          label: "An outbound voice agent",
+          detail: data.has_outbound_agent ? "Configured." : "Not configured yet. It is set up together with the calling number.",
+        },
+        {
+          done: data.enabled,
+          label: "Outbound contact turned on",
+          detail: data.enabled
+            ? "On. Staff can place call-backs from the Call-backs page."
+            : isOwner
+              ? "Off. Turn on “Allow outbound contact” under Patient contact and save."
+              : "Off. Only the owner can turn it on.",
+        },
+      ]
+    : [];
+
+  return (
+    <div id="outbound" className="scroll-mt-20 xl:sticky xl:top-8">
+      <Panel title="Outbound calling" action={data ? <Badge tone={ready ? "ok" : "warn"}>{ready ? "Ready" : "Not ready"}</Badge> : null}>
         <div className="p-4 text-sm">
-          {profile.data ? (
-            <dl className="grid gap-3">
-              {(
-                [
-                  ["Tagline", profile.data.tagline],
-                  ["Address", profile.data.address],
-                  ["Phone shown", profile.data.phone_display],
-                  ["Receptionist line", profile.data.voice_number],
-                  ["Email", profile.data.email],
-                  ["Hours note", profile.data.hours_note],
-                ] as const
-              ).map(([label, value]) => (
-                <div key={label}>
-                  <dt className="text-ink-3">{label}</dt>
-                  <dd className="text-ink">{value ?? <span className="text-ink-3">Not set</span>}</dd>
-                </div>
-              ))}
-              <div>
-                <dt className="text-ink-3">Website chat</dt>
-                <dd>{profile.data.chat_enabled ? "On" : "Off"}</dd>
-              </div>
-            </dl>
-          ) : profile.error ? (
-            <p className="text-ink-2">The public profile couldn&apos;t be loaded.</p>
+          {!canWrite ? (
+            <p className="text-ink-2">Outbound calling is {saved ? "on" : "off"} for this clinic. Only the owner or an admin can place calls.</p>
+          ) : status.error ? (
+            <p className="text-ink-2">The outbound status couldn&apos;t be loaded. Outbound contact is {saved ? "on" : "off"} in the clinic settings.</p>
+          ) : !data ? (
+            <Loading label="Loading the outbound status">
+              <Skeleton className="h-28" />
+            </Loading>
           ) : (
-            <Skeleton className="h-40" />
+            <>
+              <p className="text-ink-2">Staff can call patients back from the clinic&apos;s number once all three are in place.</p>
+              <ol className="mt-4 flex flex-col gap-3">
+                {steps.map((step) => (
+                  <li key={step.label} className="flex gap-3">
+                    <span
+                      aria-hidden="true"
+                      className={`mt-0.5 inline-flex size-5 shrink-0 items-center justify-center rounded-full text-xs font-bold ${step.done ? "bg-ok text-paper" : "border border-line-strong text-ink-3"}`}
+                    >
+                      {step.done ? "✓" : ""}
+                    </span>
+                    <span>
+                      <span className="block font-semibold text-ink">
+                        {step.label}
+                        <span className="sr-only">{step.done ? ": done" : ": not yet"}</span>
+                      </span>
+                      <span className="block text-ink-2">{step.detail}</span>
+                    </span>
+                  </li>
+                ))}
+              </ol>
+              <p className="mt-4 border-t border-line pt-3 text-xs text-ink-3">Nothing is dialled automatically: every call is started by a person from Call-backs, after a confirmation.</p>
+            </>
           )}
-          <p className="mt-4 border-t border-line pt-3 text-xs text-ink-3">
-            The public profile is shown on the website. Editing it here needs an admin API route that does not exist yet.
-          </p>
         </div>
       </Panel>
     </div>

@@ -24,7 +24,7 @@ import {
 import { cx } from "@/lib/cx";
 import { patientBookingStatus } from "@/lib/labels";
 import { formatIndian, toIndianE164 } from "@/lib/phone";
-import { addDays, formatDayKey, formatLongDate, formatTime, minutesOfDay, todayKey, weekdayOf } from "@/lib/time";
+import { addDays, formatDayKey, formatLongDate, formatTime, minutesOfDay, todayKey, weekdayOf, zoneAbbreviation } from "@/lib/time";
 import { Monogram } from "@/components/public/Monogram";
 import { LabelBadge } from "@/components/ui/Badge";
 import { Button, ButtonLink } from "@/components/ui/Button";
@@ -57,58 +57,56 @@ function StepHeading({ children, id }: { children: ReactNode; id: string }) {
   );
 }
 
+/**
+ * One option on the treatment or dentist step. Choosing moves to the next step, so it is a
+ * button rather than a radio: arrow keys never choose (and never skip a step); a click,
+ * Enter or Space does. Tab moves between options.
+ */
 function Choice({
-  name,
-  value,
   checked,
   onSelect,
   children,
 }: {
-  name: string;
-  value: string;
   checked: boolean;
   onSelect: () => void;
   children: ReactNode;
 }) {
   return (
-    <label
+    <button
+      type="button"
+      aria-pressed={checked}
+      onClick={onSelect}
       className={cx(
-        "group relative flex cursor-pointer gap-4 rounded-lg border bg-raised p-4 transition-colors has-[:focus-visible]:outline-2 has-[:focus-visible]:outline-offset-2 has-[:focus-visible]:outline-accent",
+        "group relative flex w-full cursor-pointer gap-4 rounded-lg border bg-raised p-4 text-left transition-colors",
         checked ? "border-accent ring-1 ring-accent" : "border-line hover:border-line-strong",
       )}
     >
-      <input
-        type="radio"
-        name={name}
-        value={value}
-        checked={checked}
-        onChange={onSelect}
-        onClick={(event) => {
-          // Re-selecting the current choice still moves on.
-          if (checked) {
-            event.preventDefault();
-            onSelect();
-          }
-        }}
-        className="sr-only"
-      />
       {children}
       {checked ? (
         <span className="absolute top-3 right-3 inline-flex size-5 items-center justify-center rounded-full bg-accent text-white">
           <Check className="size-3.5" aria-hidden="true" />
         </span>
       ) : null}
-    </label>
+    </button>
   );
 }
+
+const CONFLICT_MESSAGE = "We may already have your booking — check it with your reference, or try again.";
 
 export function BookingStepper({ services, doctors, timeZone, callHref, callDisplay }: StepperProps) {
   const params = useSearchParams();
   const [state, dispatch] = useReducer(bookingReducer, initialBooking);
   const [errors, setErrors] = useState<FieldErrors>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
+  /** The API saw this idempotency key with a different request: the booking may exist. */
+  const [maybeBooked, setMaybeBooked] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const idempotency = useRef<{ slot: string; key: string } | null>(null);
+  const idempotency = useRef<{ request: string; key: string } | null>(null);
+
+  function setField(field: "name" | "phone" | "notes", value: string) {
+    dispatch({ type: "field", field, value });
+    if (errors[field]) setErrors(({ [field]: _cleared, ...rest }) => rest);
+  }
   const headingRef = useRef<string | null>(null);
   const [weekStart, setWeekStart] = useState<string | null>(null);
 
@@ -155,6 +153,7 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
   async function submit(event: FormEvent) {
     event.preventDefault();
     setSubmitError(null);
+    setMaybeBooked(false);
     const found = validateDetails(state);
     setErrors(found);
     if (Object.keys(found).length) {
@@ -164,9 +163,11 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
     }
     const request = toRequest(state);
     if (!request) return;
-    const slotKey = `${request.doctor_id}|${request.starts_at}`;
-    if (!idempotency.current || idempotency.current.slot !== slotKey) {
-      idempotency.current = { slot: slotKey, key: newIdempotencyKey("web") };
+    // A retry of the same request reuses its key (so a lost response can't double-book); any
+    // change to the slot or the details is a new request with a fresh key.
+    const fingerprint = JSON.stringify(request);
+    if (!idempotency.current || idempotency.current.request !== fingerprint) {
+      idempotency.current = { request: fingerprint, key: newIdempotencyKey("web") };
     }
     setSubmitting(true);
     try {
@@ -177,7 +178,13 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
       });
       dispatch({ type: "booked", result });
     } catch (error) {
-      if (error instanceof ApiError && error.status === 409) {
+      if (error instanceof ApiError && error.status === 409 && error.code === "idempotency_conflict") {
+        // Not a taken slot: an earlier attempt with this key may have gone through. Stay on
+        // the details step; the next submission gets a new key once anything changes.
+        idempotency.current = null;
+        setMaybeBooked(true);
+        setSubmitError(CONFLICT_MESSAGE);
+      } else if (error instanceof ApiError && error.status === 409) {
         dispatch({ type: "slotLost" });
         setSubmitError(error.message || "That time has just been taken. Please choose another.");
         void slots.mutate();
@@ -246,7 +253,7 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
                 <legend className="sr-only">Treatment</legend>
                 <div className="grid gap-3 sm:grid-cols-2">
                   {services.map((s) => (
-                    <Choice key={s.id} name="service" value={s.id} checked={state.serviceId === s.id} onSelect={() => dispatch({ type: "service", id: s.id })}>
+                    <Choice key={s.id} checked={state.serviceId === s.id} onSelect={() => dispatch({ type: "service", id: s.id })}>
                       <span aria-hidden="true" className="w-1 shrink-0 rounded-full" style={{ background: safeColour(s.colour) }} />
                       <span className="flex flex-col gap-1 pr-6">
                         <span className="font-semibold text-ink">{s.name}</span>
@@ -270,7 +277,7 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
             <fieldset className="mt-6">
               <legend className="sr-only">Dentist</legend>
               <div className="grid gap-3 sm:grid-cols-2">
-                <Choice name="doctor" value={ANY_DOCTOR} checked={state.doctorId === ANY_DOCTOR} onSelect={() => dispatch({ type: "doctor", id: ANY_DOCTOR })}>
+                <Choice checked={state.doctorId === ANY_DOCTOR} onSelect={() => dispatch({ type: "doctor", id: ANY_DOCTOR })}>
                   <span aria-hidden="true" className="inline-flex size-11 shrink-0 items-center justify-center rounded-full border border-dashed border-line-strong text-ink-2">
                     <Users className="size-5" />
                   </span>
@@ -280,7 +287,7 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
                   </span>
                 </Choice>
                 {eligible.map((d) => (
-                  <Choice key={d.id} name="doctor" value={d.id} checked={state.doctorId === d.id} onSelect={() => dispatch({ type: "doctor", id: d.id })}>
+                  <Choice key={d.id} checked={state.doctorId === d.id} onSelect={() => dispatch({ type: "doctor", id: d.id })}>
                     <Monogram name={d.name} colour={d.colour} className="size-11 text-base" />
                     <span className="flex flex-col gap-0.5 pr-6">
                       <span className="font-semibold">{d.name}</span>
@@ -296,7 +303,7 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
         {state.step === "time" ? (
           <section aria-labelledby="step-time">
             <StepHeading id="step-time">Choose a time</StepHeading>
-            <p className="mt-2 text-ink-2">Times are in clinic time ({zone === "Asia/Kolkata" ? "IST" : zone}).</p>
+            <p className="mt-2 text-ink-2">Times are in clinic time ({zoneAbbreviation(zone)}).</p>
             {submitError ? (
               <p role="alert" className="mt-4 rounded-md border border-bad/25 bg-bad-tint/60 px-3 py-2 text-sm font-medium text-ink">
                 {submitError}
@@ -332,7 +339,7 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
                         "disabled:cursor-not-allowed disabled:bg-transparent disabled:text-ink-3",
                       )}
                     >
-                      <span className="text-[0.7rem] tracking-wide uppercase">{["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekdayOf(day)]}</span>
+                      <span className="text-xs tracking-wide uppercase">{["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][weekdayOf(day)]}</span>
                       <span className="font-display text-lg leading-tight tnum">{Number(day.slice(8))}</span>
                       <span aria-hidden="true" className={cx("mt-0.5 size-1 rounded-full", count ? (selected ? "bg-paper" : "bg-accent") : "bg-transparent")} />
                     </button>
@@ -417,19 +424,19 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
               <div data-field="name">
                 <Field label="Patient's full name" error={errors.name}>
                   {(props) => (
-                    <Input {...props} autoComplete="name" value={state.name} onChange={(e) => dispatch({ type: "field", field: "name", value: e.target.value })} />
+                    <Input {...props} autoComplete="name" value={state.name} onChange={(e) => setField("name", e.target.value)} />
                   )}
                 </Field>
               </div>
               <div data-field="phone">
                 <Field label="Mobile number" hint="Ten digits. We'll only use it about this appointment." error={errors.phone}>
-                  {(props) => <PhoneInput {...props} value={state.phone} onValueChange={(value) => dispatch({ type: "field", field: "phone", value })} />}
+                  {(props) => <PhoneInput {...props} value={state.phone} onValueChange={(value) => setField("phone", value)} />}
                 </Field>
               </div>
               <div data-field="notes">
                 <Field label="Anything we should know?" optional hint="For example, if you're nervous or need step-free access. Please don't include medical history." error={errors.notes}>
                   {(props) => (
-                    <Textarea {...props} maxLength={500} value={state.notes} onChange={(e) => dispatch({ type: "field", field: "notes", value: e.target.value })} />
+                    <Textarea {...props} maxLength={500} value={state.notes} onChange={(e) => setField("notes", e.target.value)} />
                   )}
                 </Field>
               </div>
@@ -440,9 +447,14 @@ export function BookingStepper({ services, doctors, timeZone, callHref, callDisp
                 onChange={(e) => dispatch({ type: "consent", value: e.target.checked })}
               />
               {submitError ? (
-                <p role="alert" className="rounded-md border border-bad/25 bg-bad-tint/60 px-3 py-2 text-sm font-medium text-ink">
-                  {submitError}
-                </p>
+                <div role="alert" className="rounded-md border border-bad/25 bg-bad-tint/60 px-3 py-2 text-sm font-medium text-ink">
+                  <p>{submitError}</p>
+                  {maybeBooked ? (
+                    <Link href="/booking" className="mt-1 inline-block font-semibold text-accent underline-offset-4 hover:underline">
+                      Check a booking with your reference
+                    </Link>
+                  ) : null}
+                </div>
               ) : null}
               <div className="flex flex-wrap items-center gap-3">
                 <Button type="submit" size="lg" loading={submitting}>
