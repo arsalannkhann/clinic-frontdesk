@@ -797,7 +797,8 @@ export interface paths {
         };
         /**
          * Get Session
-         * @description The visible transcript (user and assistant text), the open proposal, quick replies.
+         * @description The newest 100 visible messages (user and assistant text), the open proposal, quick
+         *     replies.
          */
         get: operations["get_session_v1_chat_sessions__session_id__get"];
         put?: never;
@@ -937,6 +938,27 @@ export interface paths {
         put?: never;
         /** Resolve Callback */
         post: operations["resolve_callback_v1_staff_callbacks__callback_id__resolve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/staff/callbacks/{callback_id}/reopen": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reopen Callback
+         * @description Return a request whose call was placed or whose outcome is unknown to open, so a
+         *     missed call can be retried deliberately with another "Call now". Never dials.
+         */
+        post: operations["reopen_callback_v1_staff_callbacks__callback_id__reopen_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2657,6 +2679,11 @@ export interface components {
             appointments: components["schemas"]["StaffCalendarAppointment"][];
             /** Exceptions */
             exceptions: components["schemas"]["StaffCalendarException"][];
+            /**
+             * Truncated
+             * @default false
+             */
+            truncated: boolean;
         };
         /** StaffCallbackCallOut */
         StaffCallbackCallOut: {
@@ -2702,8 +2729,23 @@ export interface components {
             execution_id: string | null;
             /** Call Requested At */
             call_requested_at: string | null;
+            /** Call Outcome */
+            call_outcome?: string | null;
             /** Synthetic */
             synthetic: boolean;
+        };
+        /** StaffCallbackReopened */
+        StaffCallbackReopened: {
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /**
+             * Status
+             * @constant
+             */
+            status: "open";
         };
         /** StaffCallbackResolve */
         StaffCallbackResolve: {
@@ -5502,6 +5544,66 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["StaffCallbackResolved"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+            /** @description Bad Gateway */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+        };
+    };
+    reopen_callback_v1_staff_callbacks__callback_id__reopen_post: {
+        parameters: {
+            query?: never;
+            header?: {
+                authorization?: string | null;
+            };
+            path: {
+                callback_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StaffCallbackReopened"];
                 };
             };
             /** @description Conflict */
