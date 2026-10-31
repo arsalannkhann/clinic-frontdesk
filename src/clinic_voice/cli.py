@@ -43,6 +43,16 @@ def seed(url, clinic_id=DEMO_CLINIC_ID):
             )
 
 
+def seed_platform_command(url, settings):
+    from clinic_voice import seed_platform
+
+    try:
+        counts = seed_platform.seed(url, settings)
+    except seed_platform.SeedRefused as error:
+        raise SystemExit(str(error)) from None
+    print(" ".join(f"{key}={value}" for key, value in counts.items()))
+
+
 def credential_command(url, args):
     with connect(url) as conn:
         if args.action == "issue":
@@ -138,6 +148,14 @@ def build_ports(calendar, url, settings):
             file=sys.stderr,
         )
         return Ports(calendar=FakeCalendar())
+    if calendar == "ledger":
+        # A production mode: the platform database is the calendar of record for doctors
+        # mapped to ledger:<doctor id>. Jobs of any other doctor dead-letter
+        # calendar_unmapped; use --calendar google when some doctors use Google.
+        from clinic_voice.outbox import Ports
+        from clinic_voice.providers.ledger import LedgerResolver
+
+        return Ports(calendar_for=LedgerResolver())
     if calendar == "google":
         import httpx
         from fastapi import HTTPException as ConfigError
@@ -145,6 +163,7 @@ def build_ports(calendar, url, settings):
         from clinic_voice.calendar_accounts import GoogleCalendarResolver
         from clinic_voice.outbox import Ports
         from clinic_voice.providers.google_calendar import DEFAULT_TIMEOUT
+        from clinic_voice.providers.ledger import LedgerResolver
 
         http = httpx.Client(timeout=DEFAULT_TIMEOUT, follow_redirects=False)
         try:
@@ -154,9 +173,11 @@ def build_ports(calendar, url, settings):
                 "Google Calendar is not configured: set GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET,"
                 " GOOGLE_REDIRECT_URI and a valid TOKEN_ENCRYPTION_KEYS."
             ) from None
-        return Ports(calendar_for=resolver)
+        # Ledger-mapped doctors are served by the ledger, everyone else by Google.
+        return Ports(calendar_for=LedgerResolver(resolver))
     raise SystemExit(
-        "No calendar provider configured; the worker will not start. Use --calendar google, or"
+        "No calendar provider configured; the worker will not start. Use --calendar google"
+        " (Google and ledger doctors), --calendar ledger (ledger doctors only), or"
         " --calendar fake for local development only."
     )
 
@@ -242,8 +263,10 @@ def worker_command(url, args, settings):
 
 
 def bolna_command(url, args, settings):
-    """Print a compiled agent payload for review. The tool token is never needed or printed:
-    the payload is compiled with a redaction placeholder. Nothing is sent to Bolna."""
+    """Print a compiled agent payload for review. No token is ever needed or printed: the
+    payload is compiled with a redaction placeholder for the tool token and the webhook
+    URL's token (provisioning sets webhook_url; a hand-configured agent needs its own
+    credential, docs/OPERATIONS.md). Nothing is sent to Bolna."""
     import json
 
     from clinic_voice.bolna import agent_config
@@ -258,7 +281,10 @@ def bolna_command(url, args, settings):
             raise SystemExit(str(error)) from None
     try:
         payload = agent_config.compile_agent(
-            clinic, gateway_base_url=base, tool_token=agent_config.REDACTED
+            clinic,
+            gateway_base_url=base,
+            tool_token=agent_config.REDACTED,
+            webhook_url=agent_config.webhook_url(base, agent_config.REDACTED),
         )
     except ValueError as error:
         raise SystemExit(str(error)) from None
@@ -321,6 +347,11 @@ def main(argv=None):
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("migrate")
     commands.add_parser("seed-demo")
+    commands.add_parser(
+        "seed-platform",
+        help="Seed the synthetic Aster Dental Studio platform demo (idempotent; refuses a"
+        " database with other clinics)",
+    )
     commands.add_parser("export-openapi")
     commands.add_parser(
         "generate-key", help="Print a new random base64 32-byte key (nothing is stored)"
@@ -355,7 +386,10 @@ def main(argv=None):
     worker = commands.add_parser("worker", help="Process outbox jobs")
     worker.add_argument("--once", action="store_true", help="Process one batch and exit")
     worker.add_argument(
-        "--calendar", choices=["fake", "google"], help="Calendar provider (fake: dev only)"
+        "--calendar",
+        choices=["fake", "google", "ledger"],
+        help="Calendar provider (google: Google and ledger doctors; ledger: ledger doctors"
+        " only; fake: dev only)",
     )
     worker.add_argument(
         "--bolna",
@@ -374,7 +408,7 @@ def main(argv=None):
     bolna = commands.add_parser("bolna", help="Bolna agent configuration (offline only)")
     bolna_actions = bolna.add_subparsers(dest="action", required=True)
     compile_agent = bolna_actions.add_parser(
-        "compile-agent", help="Print the agent payload with the tool token redacted"
+        "compile-agent", help="Print the agent payload with its tokens redacted"
     )
     compile_agent.add_argument("--clinic", type=UUID, required=True)
     compile_agent.add_argument("--gateway-url", help="Public base URL (default from settings)")
@@ -417,7 +451,11 @@ def main(argv=None):
 
         from clinic_voice.api import app
 
-        print(json.dumps(app.openapi(), indent=2))
+        # FastAPI takes response descriptions from http.HTTPStatus, whose 422 phrase changed in
+        # Python 3.13; pin the RFC 9110 phrase so the committed contract matches on every
+        # supported Python.
+        text = json.dumps(app.openapi(), indent=2)
+        print(text.replace('"Unprocessable Entity"', '"Unprocessable Content"'))
         return
     if args.command == "generate-key":
         from clinic_voice.crypto import generate_key
@@ -430,6 +468,8 @@ def main(argv=None):
         migrate(url, Path("migrations"))
     elif args.command == "seed-demo":
         seed(url)
+    elif args.command == "seed-platform":
+        seed_platform_command(url, settings)
     elif args.command == "staff":
         staff_command(url, args)
     elif args.command == "worker":

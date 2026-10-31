@@ -12,9 +12,11 @@ from pydantic import (
     ConfigDict,
     Field,
     RootModel,
+    StrictBool,
     StringConstraints,
     model_validator,
 )
+from pydantic_core import PydanticCustomError
 
 
 class StrictModel(BaseModel):
@@ -183,6 +185,45 @@ class ClinicConfig(StrictModel):
     # Owner decision (T12, ADR 0008): booking reference in confirmation/reminder messages.
     # Off by default: the reference is a verification factor on inbound calls.
     include_reference_in_messages: bool
+    # Website and chat profile (P2). public_slug and public_enabled are read-only here.
+    public_slug: str | None = None
+    public_enabled: bool = False
+    public_tagline: str = ""
+    public_address: str = ""
+    public_map_url: str | None = None
+    public_phone_display: str = ""
+    public_email: str = ""
+    public_hours_note: str = ""
+    public_about: str = ""
+    public_voice_number: str | None = None
+    public_chat_enabled: bool = False
+    # Caller number of staff callback calls (owner only).
+    bolna_outbound_from_number: str | None = None
+
+
+def _profile_text(max_length: int):
+    return Annotated[
+        str,
+        BeforeValidator(_profile_plain),
+        StringConstraints(strip_whitespace=True, max_length=max_length),
+    ]
+
+
+def _profile_plain(value):
+    # Marketing copy: no control characters except line breaks and tabs.
+    if isinstance(value, str) and re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", value):
+        raise ValueError("control characters are not allowed")
+    return value
+
+
+ProfileEmail = Annotated[
+    str,
+    StringConstraints(
+        strip_whitespace=True, max_length=254, pattern=r"^$|^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    ),
+]
+MapUrl = Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"^https://\S{1,492}$")]
+PublicNumber = Annotated[str, StringConstraints(pattern=r"^\+[1-9][0-9]{6,14}$")]
 
 
 class ClinicUpdate(PatchModel):
@@ -200,6 +241,16 @@ class ClinicUpdate(PatchModel):
     scripts_approved: bool | None = None  # Owner only.
     test_calls_enabled: bool | None = None  # Owner only.
     include_reference_in_messages: bool | None = None  # Owner only.
+    public_tagline: _profile_text(160) | None = None
+    public_address: _profile_text(300) | None = None
+    public_map_url: MapUrl | None = None
+    public_phone_display: _profile_text(32) | None = None
+    public_email: ProfileEmail | None = None
+    public_hours_note: _profile_text(300) | None = None
+    public_about: _profile_text(2000) | None = None
+    public_voice_number: PublicNumber | None = None
+    public_chat_enabled: bool | None = None
+    bolna_outbound_from_number: PublicNumber | None = None  # Owner only.
 
     @model_validator(mode="after")
     def _quiet_window(self):
@@ -415,13 +466,77 @@ CatalogName = Annotated[
 ]
 
 
+CONTEXT_FIELDS = ("execution_id", "from_number", "agent_id")
+UNSUBSTITUTED_CODE = "context_unsubstituted"
+MISSING_CODE = "context_missing"
+CONTEXT_CODES = (UNSUBSTITUTED_CODE, MISSING_CODE)
+# Names of Bolna call-context variables (docs/SOURCE_REVIEW.md). A value equal to one of them
+# is the variable's name, not its value.
+CONTEXT_VARIABLE_NAMES = frozenset(CONTEXT_FIELDS + ("call_sid", "to_number"))
+# printf-style "%(name)s" and its siblings ("%(name)d", "%()r"): a lowercase conversion
+# letter after the parenthesised name.
+_SPECIFIER = re.compile(r"%\([^)]*\)[a-z]")
+# "<from_number>" and the other variable names in angle brackets (any case, inner spaces).
+_ANGLE = re.compile(r"<\s*(?:" + "|".join(sorted(CONTEXT_VARIABLE_NAMES)) + r")\s*>", re.IGNORECASE)
+
+
+def unsubstituted(value) -> bool:
+    """True when a call-context value is a template rather than data: it contains a brace
+    ("{from_number}", "{{execution_id}}"), a %(name)s-style specifier, a variable name in
+    angle brackets ("<agent_id>"), or is a variable name itself (trimmed, any case).
+    Deliberately narrow: an empty or otherwise malformed value is not a placeholder (an
+    empty from_number is a withheld number, as before; "None" or "unknown" is ignored and
+    logged, gateway.note_context)."""
+    if not isinstance(value, str):
+        return False
+    return (
+        "{" in value
+        or "}" in value
+        or _SPECIFIER.search(value) is not None
+        or _ANGLE.search(value) is not None
+        or value.strip().casefold() in CONTEXT_VARIABLE_NAMES
+    )
+
+
+def _missing(value) -> bool:
+    """execution_id absent, null or blank: Bolna sent no execution id at all."""
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+# Every /v1/bolna/* tool body. A call-context field still holding its template fails
+# validation with type UNSUBSTITUTED_CODE (field names in ctx, never values), which api.py
+# turns into the dedicated 422. Failing that, an absent, null or blank execution_id fails
+# with type MISSING_CODE, the same speakable 422 (code context_missing). Both run before the
+# field validators, so a literal "{execution_id}" is reported as unsubstituted and an empty
+# one as missing rather than as a malformed UUID. Any other execution_id that is not a UUID
+# keeps the generic validation 422. (A comment, not a docstring, so the OpenAPI contract is
+# unchanged.)
 class BolnaCallContext(StrictModel):
     execution_id: UUID
     # The number that initiated the call. Stored encrypted when it is E.164, else ignored
-    # (withheld numbers, unrendered templates). Never echoed.
+    # (withheld or malformed numbers; an unrendered template is refused). Never echoed.
     from_number: ProviderNumber = ""
     # Recorded when it is a UUID (Bolna agent ids are), else ignored like from_number.
     agent_id: Annotated[str, BeforeValidator(_no_control_characters), Field(max_length=64)] = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _substituted(cls, data):
+        if isinstance(data, dict):
+            fields = [name for name in CONTEXT_FIELDS if unsubstituted(data.get(name))]
+            if fields:
+                raise PydanticCustomError(
+                    UNSUBSTITUTED_CODE,
+                    "call context variables were not substituted",
+                    {"fields": fields},
+                )
+            if _missing(data.get("execution_id")):
+                raise PydanticCustomError(
+                    MISSING_CODE,
+                    "call context variables are missing",
+                    {"fields": ["execution_id"]},
+                )
+        return data
 
 
 class BolnaSlotQuery(BolnaCallContext):
@@ -741,3 +856,357 @@ class ProvisioningAdvanced(StrictModel):
     job_id: UUID
     state: ProvisioningState
     step: Literal["calendar", "agent", "number", "verify"]
+
+
+# Public clinic API (P1, /v1/public/clinics/{slug}/...). Inputs are strict: unknown fields,
+# control characters and non-E.164 phones are refused (422 invalid_request).
+
+
+def _form_text(value):
+    # Free text from a public form: no control characters except line breaks and tabs.
+    if isinstance(value, str) and re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", value):
+        raise ValueError("control characters are not allowed")
+    return value
+
+
+PersonName = Annotated[
+    str,
+    BeforeValidator(_no_control_characters),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=120),
+]
+E164Phone = Annotated[
+    str, StringConstraints(strip_whitespace=True, pattern=r"^\+[1-9][0-9]{6,14}$")
+]
+FormText = Annotated[
+    str, BeforeValidator(_form_text), StringConstraints(strip_whitespace=True, max_length=500)
+]
+
+
+class PublicErrorBody(StrictModel):
+    code: str
+    message: str
+
+
+class PublicErrorEnvelope(StrictModel):
+    error: PublicErrorBody
+
+
+class PublicClinicOut(StrictModel):
+    name: str
+    tagline: str
+    timezone: str
+    address: str
+    map_url: str | None
+    phone_display: str
+    email: str
+    hours_note: str
+    about: str
+    voice_number: str | None  # E.164; null until the clinic has a voice line.
+    chat_enabled: bool
+
+
+class PublicServiceOut(StrictModel):
+    id: UUID  # Catalogue id: the same offering at every doctor who provides it.
+    name: str
+    description: str
+    duration_minutes: int
+    colour: str | None
+
+
+class PublicDoctorOut(StrictModel):
+    id: UUID
+    name: str
+    public_bio: str
+    photo_url: str | None
+    colour: str | None
+    service_ids: list[UUID]
+
+
+class PublicSlot(StrictModel):
+    doctor_id: UUID
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+
+
+class PublicSlotsOut(StrictModel):
+    timezone: str
+    slots: list[PublicSlot]
+
+
+class PublicBookingRequest(StrictModel):
+    service_id: UUID
+    doctor_id: UUID
+    starts_at: AwareDatetime
+    name: PersonName
+    phone: E164Phone
+    # A JSON boolean, never a coerced string; must be true (422 consent_required otherwise).
+    consent_contact: StrictBool
+    notes: FormText | None = None
+
+
+# pending_sync or confirmed for a new booking; a replayed idempotency key or a lookup also
+# reports needs_review or cancelled.
+PublicBookingStatus = Literal["pending_sync", "confirmed", "needs_review", "cancelled"]
+
+
+class PublicBookingOut(StrictModel):
+    reference: str
+    status: PublicBookingStatus
+    starts_at: AwareDatetime
+    doctor_name: str
+    service_name: str
+
+
+class PublicLookupRequest(StrictModel):
+    reference: Annotated[
+        str,
+        BeforeValidator(_no_control_characters),
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=32),
+    ]
+    phone: E164Phone
+
+
+class PublicCallbackRequest(StrictModel):
+    name: PersonName
+    phone: E164Phone
+    reason: FormText | None = None
+
+
+class PublicCallbackOut(StrictModel):
+    id: UUID
+    status: Literal["open", "calling", "done", "dismissed"]
+
+
+class WorkerTickOut(StrictModel):
+    claimed: int
+    housekeeping: Literal["ran", "failed"]
+
+
+# Chat assistant (P2, ADR 0011)
+
+
+def _not_blank(value):
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("text must not be blank")
+    return value
+
+
+ChatText = Annotated[
+    str,
+    BeforeValidator(_form_text),
+    BeforeValidator(_not_blank),
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=1000),
+]
+
+
+class ChatSessionOut(StrictModel):
+    session_id: str  # 32 hex characters: a bearer secret for this conversation only.
+    greeting: str
+    quick_replies: list[str]
+
+
+class ChatMessageRequest(StrictModel):
+    text: ChatText
+
+
+class ChatMessageOut(StrictModel):
+    role: Literal["user", "assistant"]
+    text: str
+
+
+class ChatProposalOut(StrictModel):
+    id: UUID
+    doctor_name: str
+    service_name: str
+    starts_at: AwareDatetime
+    expires_at: AwareDatetime
+
+
+class ChatTurnOut(StrictModel):
+    messages: list[ChatMessageOut]
+    proposal: ChatProposalOut | None = None
+    quick_replies: list[str]
+
+
+class ChatConfirmRequest(StrictModel):
+    name: PersonName
+    phone: E164Phone
+    consent_contact: StrictBool
+
+
+# Staff platform (P2): calendar, bookings, callbacks, conversations, stats
+
+
+SyncState = Literal["synced", "pending", "failed", "not_applicable"]
+Channel = Literal["voice", "web", "chat", "staff"]
+
+
+class StaffCalendarDoctor(StrictModel):
+    id: UUID
+    name: str
+    colour: str | None
+
+
+class StaffCalendarAppointment(StrictModel):
+    id: UUID
+    doctor_id: UUID
+    service_id: UUID
+    service_name: str
+    colour: str | None
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    status: AppointmentState
+    sync_state: SyncState
+    channel: Channel
+    patient_name: str | None = None
+    reference: str | None = None
+
+
+class StaffCalendarException(StrictModel):
+    id: UUID
+    doctor_id: UUID | None
+    kind: Literal["holiday", "leave", "break"]
+    starts_at: AwareDatetime
+    ends_at: AwareDatetime
+    label: str
+
+
+class StaffCalendarOut(StrictModel):
+    timezone: str
+    doctors: list[StaffCalendarDoctor]
+    appointments: list[StaffCalendarAppointment]
+    exceptions: list[StaffCalendarException]
+    # True when the range held more than 2000 appointments; only the earliest 2000 are
+    # listed (narrow the range or filter by doctor client-side).
+    truncated: bool = False
+
+
+class StaffBookingRequest(StrictModel):
+    service_id: UUID  # Catalogue id or service row id.
+    doctor_id: UUID
+    starts_at: AwareDatetime
+    name: PersonName
+    phone: E164Phone
+    notes: FormText | None = None
+    # Whether the patient agreed to booking confirmations and reminders (default: no).
+    consent_contact: StrictBool = False
+
+
+CallbackStatus = Literal["open", "calling", "done", "dismissed"]
+
+
+class StaffCallbackOut(StrictModel):
+    id: UUID
+    name: str | None
+    phone_masked: str | None
+    reason: str | None
+    source: Literal["web", "chat", "voice"]
+    status: CallbackStatus
+    created_at: AwareDatetime
+    resolved_at: AwareDatetime | None
+    execution_id: str | None
+    call_requested_at: AwareDatetime | None
+    # Outcome of the current call: placed, unknown (timeout or unexpected error; the call may
+    # have been placed) or failed (the request is open again). A 'calling' request whose
+    # outcome is placed or unknown can be reopened.
+    call_outcome: str | None = None
+    synthetic: bool
+
+
+class StaffCallbackCallOut(StrictModel):
+    status: Literal["calling"]
+    execution_id: str | None
+
+
+class StaffCallbackResolve(StrictModel):
+    status: Literal["done", "dismissed"]
+
+
+class StaffCallbackResolved(StrictModel):
+    id: UUID
+    status: Literal["done", "dismissed"]
+    resolved_at: AwareDatetime
+
+
+class StaffCallbackReopened(StrictModel):
+    id: UUID
+    status: Literal["open"]
+
+
+class StaffOutboundStatus(StrictModel):
+    enabled: bool
+    has_from_number: bool
+    has_outbound_agent: bool
+
+
+class StaffConversationOut(StrictModel):
+    id: UUID
+    channel: Literal["chat", "voice"]
+    started_at: AwareDatetime
+    status: str
+    turns: int
+    patient_name: str | None = None
+    outcome: str | None
+
+
+class StaffTranscriptMessage(StrictModel):
+    role: Literal["user", "assistant", "tool", "system"]
+    text: str | None
+    tool_name: str | None = None
+    created_at: AwareDatetime
+
+
+class StaffLinkedAppointment(StrictModel):
+    id: UUID
+    reference: str | None
+    status: AppointmentState
+    starts_at: AwareDatetime
+    channel: Channel
+
+
+class StaffConversationDetail(StrictModel):
+    id: UUID
+    channel: Literal["chat", "voice"]
+    started_at: AwareDatetime
+    last_active_at: AwareDatetime | None = None
+    ended_at: AwareDatetime | None = None
+    status: str
+    turns: int
+    outcome: str | None
+    patient_name: str | None = None
+    messages: list[StaffTranscriptMessage] = []
+    # Voice: the call session summary (no raw provider payloads).
+    provider_status: str | None = None
+    call_type: str | None = None
+    duration_seconds: float | None = None
+    hangup_by: str | None = None
+    appointments: list[StaffLinkedAppointment] = []
+
+
+class StaffChannelCounts(StrictModel):
+    voice: int
+    web: int
+    chat: int
+    staff: int
+
+
+class StaffStatsOut(StrictModel):
+    today: int
+    week: int
+    needs_review: int
+    open_callbacks: int
+    by_channel: StaffChannelCounts
+
+
+class StaffClinicRef(StrictModel):
+    id: UUID
+    name: str
+    timezone: str
+    public_slug: str | None
+
+
+class StaffMe(StrictModel):
+    id: UUID
+    email: str
+    role: Role
+    clinic: StaffClinicRef

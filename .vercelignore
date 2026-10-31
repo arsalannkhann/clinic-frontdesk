@@ -1,0 +1,20 @@
+# API project (repository root). Only pyproject.toml, index.py, vercel.json, src/ and
+# agents/prompts/ (read by bolna/agent_config.py when provisioning compiles an agent) are
+# needed at runtime. web/ is not listed: Vercel applies this repository-root file to the
+# web project too (root directory web/), so the API keeps web/ out of its function through
+# excludeFiles in vercel.json instead.
+dashboard/
+tests/
+docs/
+agents/*
+!agents/prompts/
+migrations/
+.github/
+.claude/
+.venv/
+.env
+.env.*
+compose.yaml
+Dockerfile
+*.md
+!agents/prompts/*.md

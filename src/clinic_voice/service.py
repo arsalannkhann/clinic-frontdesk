@@ -174,8 +174,9 @@ REFERENCE_CONSTRAINT = "appointments_booking_reference_key"
 REFERENCE_ATTEMPTS = 5
 INSERT_APPOINTMENT = """INSERT INTO appointments (id,clinic_id,doctor_id,service_id,starts_at,
     ends_at,blocks_until,status,idempotency_key,request_hash,call_session_id,patient_id,
-    rescheduled_from,tool_credential_id,booking_reference)
-    VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s,%s,%s,%s,%s) RETURNING *"""
+    rescheduled_from,tool_credential_id,channel,booking_reference)
+    VALUES (%s,%s,%s,%s,%s,%s,%s,'pending_sync',%s,%s,%s,%s,%s,%s,%s,%s) RETURNING *"""
+CHANNELS = ("voice", "web", "chat", "staff")
 
 
 def _insert_appointment(conn, values):
@@ -208,12 +209,16 @@ def insert_reservation(
     attach_patient=None,
     after_insert=None,
     tool_credential_id=None,
+    channel="voice",
 ):
     """Check the slot and insert a pending_sync appointment plus its calendar.create job in
     the caller's transaction. The caller must hold the doctor row lock (locks.py, level 3).
     attach_patient(conn, starts_at) -> patient id | None runs after the slot check;
     after_insert(conn, appointment_id, patient_id) runs after the appointment insert.
-    tool_credential_id records the /v1/tools credential that reserved it (status reads)."""
+    tool_credential_id records the /v1/tools credential that reserved it (status reads);
+    channel is the channel that created the row (migration 018)."""
+    if channel not in CHANNELS:
+        raise ValueError("unknown channel")
     context = get_context(conn, clinic_id, doctor_id, service_id)
     day = starts_at.astimezone(ZoneInfo(context["timezone"])).date()
     available = slots(conn, clinic_id, doctor_id, service_id, day, context=context)
@@ -240,6 +245,7 @@ def insert_reservation(
             patient_id,
             rescheduled_from,
             tool_credential_id,
+            channel,
         ),
     )
     conn.execute(
@@ -262,6 +268,7 @@ def reserve(
     after_insert=None,
     gate=None,
     tool_credential_id=None,
+    channel="voice",
 ):
     """Reserve a slot idempotently. call_session_id links the appointment to the Bolna call
     session that created it (the gateway derives `key` from that session's execution id).
@@ -271,7 +278,8 @@ def reserve(
     (gateway only) re-checks the clinic's line inside the transaction, after the action and
     session locks and before the doctor rows (locks.py, level 1b); it raises to refuse. A
     replay is not re-gated (it changes nothing). tool_credential_id (/v1/tools only) is
-    stored on the new appointment."""
+    stored on the new appointment. channel (migration 018) is stored on a new appointment; a
+    replay returns the existing row whatever its channel (keys are channel-prefixed)."""
     canonical = request.model_dump(mode="json")
     # Normalize offset representations so the same instant retries consistently.
     canonical["starts_at"] = request.starts_at.astimezone(UTC).isoformat()
@@ -322,6 +330,7 @@ def reserve(
                 attach_patient=attach_patient,
                 after_insert=after_insert,
                 tool_credential_id=tool_credential_id,
+                channel=channel,
             )
             result = response(row)
         return result

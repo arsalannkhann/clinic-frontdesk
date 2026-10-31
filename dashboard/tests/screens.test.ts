@@ -28,6 +28,14 @@ const CLINIC: Clinic = {
   scripts_approved: true,
   test_calls_enabled: false,
   include_reference_in_messages: false,
+  public_enabled: false,
+  public_tagline: "",
+  public_address: "",
+  public_phone_display: "",
+  public_email: "",
+  public_hours_note: "",
+  public_about: "",
+  public_chat_enabled: false,
 };
 
 interface Seen {

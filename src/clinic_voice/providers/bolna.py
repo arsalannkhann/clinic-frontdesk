@@ -24,7 +24,10 @@ agents, get execution and list phone numbers.
 
 summarize_agent() is the single allowlist for agent data (GET /v2/agent/{id} and
 /v2/agent/all): id, agent_name, each tool's URL and the credential id parsed from each
-tool's api_token. The token's secret part, prompts and every other field are dropped.
+tool's api_token, and, only when the response carries it (undocumented), the webhook_url's
+credential id and the URL without its token segment, plus a sha256 digest of each readable
+token's secret (compared with the stored secret_hash by verification). Token secrets,
+prompts and every other field are dropped.
 
 minimize_execution() is the single allowlist for execution data (webhook bodies and
 GET /executions alike); STATUS_RANK and FINAL_STATUSES define the monotonic status order
@@ -252,12 +255,24 @@ class Agent:
     """Allowlisted agent fields. tool_urls maps tool name -> URL; token_credential_ids holds,
     per tool, the tenant credential id (hex) of its api_token, None when the token is masked
     (only asterisks, optionally after "Bearer "), or UNREADABLE when it is absent or not a
-    tool credential. No secret, prompt or other field is kept."""
+    tool credential. webhook_base is webhook_url without its last segment (the token) and
+    webhook_credential_id that token's credential id (hex): both None when the response has
+    no webhook_url (GET /v2/agent does not document one); webhook_credential_id None with a
+    base when the token is masked, UNREADABLE when it is not a webhook credential.
+    token_secret_digests (per tool, aligned with token_credential_ids) and
+    webhook_secret_digest are credentials.digest() of each readable token's secret, the form
+    tenant_credentials.secret_hash stores, so verification can tell a mangled secret from
+    the recorded one; None where the id is None or UNREADABLE. No secret, prompt or other
+    field is kept, and the digests are left out of repr()."""
 
     id: str
     name: str | None
     tool_urls: dict = field(default_factory=dict)
     token_credential_ids: tuple = ()
+    webhook_base: str | None = None
+    webhook_credential_id: str | None = None
+    token_secret_digests: tuple = field(default=(), repr=False)
+    webhook_secret_digest: bytes | None = field(default=None, repr=False)
 
 
 def _maybe_json(value):
@@ -274,18 +289,40 @@ UNREADABLE = "unreadable"  # Not a hex id, so it never equals a credential id.
 MASKED_TOKEN = re.compile(r"(Bearer +)?\*+")
 
 
-def _credential_id(api_token) -> str | None:
-    """The credential id (hex) of a tool token; None only for a true mask; UNREADABLE for
-    anything else (absent, empty, another format), which verification treats as a mismatch."""
+def _tool_token(api_token) -> tuple[str | None, bytes | None]:
+    """(credential id hex, secret digest) of a tool token: id None only for a true mask;
+    UNREADABLE for anything else (absent, empty, another format), which verification treats
+    as a mismatch. The digest is set only with a readable id; the secret itself is dropped."""
     if not isinstance(api_token, str):
-        return UNREADABLE
+        return UNREADABLE, None
     if MASKED_TOKEN.fullmatch(api_token):
-        return None
+        return None, None
     scheme, _, token = api_token.partition(" ")
     parsed = credentials.parse_any(
         token if scheme == "Bearer" else api_token, credentials.GATEWAY_SCOPES
     )
-    return UNREADABLE if parsed is None else parsed[0].hex
+    if parsed is None:
+        return UNREADABLE, None
+    return parsed[0].hex, credentials.digest(parsed[1])
+
+
+MASKED_SEGMENT = re.compile(r"\*+")
+
+
+def _webhook(value) -> tuple[str | None, str | None, bytes | None]:
+    """(webhook_base, webhook_credential_id, webhook_secret_digest) of a webhook_url value;
+    see Agent."""
+    if value is None or value == "":
+        return None, None, None
+    if not isinstance(value, str) or "/" not in value:
+        return None, UNREADABLE, None
+    base, _, segment = value.rpartition("/")
+    if MASKED_SEGMENT.fullmatch(segment):
+        return base, None, None
+    parsed = credentials.parse(segment, "webhook")
+    if parsed is None:
+        return base, UNREADABLE, None
+    return base, parsed[0].hex, credentials.digest(parsed[1])
 
 
 def summarize_agent(body) -> Agent | None:
@@ -297,7 +334,7 @@ def summarize_agent(body) -> Agent | None:
     if not isinstance(agent_id, str) or not SAFE_ID.fullmatch(agent_id):
         return None
     name = body.get("agent_name")
-    urls, token_ids = {}, []
+    urls, token_ids, token_digests = {}, [], []
     tasks = body.get("tasks")
     for task in tasks if isinstance(tasks, list) else []:
         tools_config = task.get("tools_config") if isinstance(task, dict) else None
@@ -308,8 +345,20 @@ def summarize_agent(body) -> Agent | None:
                 continue
             url = entry.get("url")
             urls[tool_name] = url if isinstance(url, str) else None
-            token_ids.append(_credential_id(entry.get("api_token")))
-    return Agent(agent_id, name if isinstance(name, str) else None, urls, tuple(token_ids))
+            token_id, token_digest = _tool_token(entry.get("api_token"))
+            token_ids.append(token_id)
+            token_digests.append(token_digest)
+    webhook_base, webhook_id, webhook_digest = _webhook(body.get("webhook_url"))
+    return Agent(
+        agent_id,
+        name if isinstance(name, str) else None,
+        urls,
+        tuple(token_ids),
+        webhook_base,
+        webhook_id,
+        tuple(token_digests),
+        webhook_digest,
+    )
 
 
 class BolnaPort(Protocol):
@@ -426,10 +475,17 @@ class FakeBolna:
             self._written("update_agent")
 
     def _summary(self, agent_id):
+        # The fake returns webhook_url when the stored agent has one; whether Bolna's GET
+        # response does is undocumented (tests cover both).
         config = (self.agents[agent_id] or {}).get("agent_config") or {}
-        return summarize_agent(
-            {"id": agent_id, "agent_name": config.get("agent_name"), "tasks": config.get("tasks")}
-        )
+        body = {
+            "id": agent_id,
+            "agent_name": config.get("agent_name"),
+            "tasks": config.get("tasks"),
+        }
+        if "webhook_url" in config:
+            body["webhook_url"] = config["webhook_url"]
+        return summarize_agent(body)
 
     def get_agent(self, agent_id):
         with self._lock:

@@ -6,6 +6,9 @@ from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
+# APP_ENV values that mark a developer machine or the test suite. Anything else, including
+# the default "production", is treated as a deployment.
+LOCAL_ENVIRONMENTS = frozenset({"development", "test"})
 
 
 def _https_or_loopback(value: str | None, name: str) -> str | None:
@@ -13,6 +16,8 @@ def _https_or_loopback(value: str | None, name: str) -> str | None:
         return None
     parts = urlsplit(value)
     host = (parts.hostname or "").lower()
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"{name} must not carry a username or password")
     if parts.scheme == "https" and host:
         return value
     if parts.scheme == "http" and host in LOOPBACK_HOSTS:
@@ -45,8 +50,13 @@ def _origin(value: str) -> str:
     return f"{parts.scheme}://{host}" + (f":{port}" if port and port != default else "")
 
 
+# Production reads this file from the working directory. The test suite clears it
+# (tests/conftest.py) and asserts this declared default (tests/test_api.py).
+ENV_FILE = ".env"
+
+
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore", hide_input_in_errors=True)
     database_url: SecretStr
     # Only "development" relaxes development-only safety checks (e.g. worker --calendar fake).
     app_env: str = "production"
@@ -88,6 +98,87 @@ class Settings(BaseSettings):
     # /v1/admin/* cross-origin (e.g. https://dash.clinic.example). Empty: no CORS headers at
     # all (serve the dashboard same-origin, or use the Vite dev-server proxy).
     dashboard_origins: str | None = None
+    # Serverless worker tick (P1, POST /v1/internal/worker/tick): bearer secret the
+    # scheduler (Supabase pg_cron + pg_net) sends. Unset: the endpoint answers 404.
+    worker_tick_secret: SecretStr | None = None
+    # Seconds a tick spends claiming and running outbox jobs before housekeeping. Keep it
+    # well under the function's maxDuration (vercel.json).
+    worker_tick_budget_seconds: float = Field(default=8.0, ge=1.0, le=50.0)
+    # Public and chat bookings run their own calendar.create job inline for at most this
+    # long (ledger-mapped doctors only); 0 leaves every booking to the tick.
+    inline_confirm_budget_seconds: float = Field(default=3.0, ge=0.0, le=10.0)
+    # Public API rate limits (fixed windows; keys are HMACs under PHONE_HASH_KEY).
+    public_booking_ip_per_hour: int = Field(default=5, ge=1, le=10000)
+    public_booking_phone_per_day: int = Field(default=3, ge=1, le=1000)
+    public_lookup_ip_per_hour: int = Field(default=10, ge=1, le=10000)
+    public_callback_ip_per_hour: int = Field(default=3, ge=1, le=10000)
+    public_callback_phone_per_day: int = Field(default=3, ge=1, le=1000)
+    public_lookup_phone_per_day: int = Field(default=10, ge=1, le=1000)
+    public_slots_ip_per_hour: int = Field(default=120, ge=1, le=100000)
+    # Profile, services and doctors (cacheable catalogue reads).
+    public_read_ip_per_hour: int = Field(default=600, ge=1, le=100000)
+    # Shared secret of the web app's server (the BFF), sent as X-Proxy-Secret on every
+    # /v1/public/* and /v1/chat/* request (edge.py). Set: those paths refuse requests
+    # without it (403) and take the client address from X-Client-IP. Unset in a local
+    # environment (APP_ENV development or test): no check, and the socket /
+    # TRUSTED_PROXY_HOPS address is used. Unset anywhere else (production, the default):
+    # those paths answer 503 unavailable and /health/ready reports it.
+    public_proxy_secret: SecretStr | None = None
+    # Chat assistant (P2, chat.py). OpenAI-compatible chat completions with tools; the
+    # default is Sarvam. Unset API key: the chat answers with guided quick replies only.
+    chat_llm_base_url: str = "https://api.sarvam.ai/v1"
+    chat_llm_model: str = "sarvam-105b"
+    chat_llm_api_key: SecretStr | None = None
+    # Header carrying the key: "api-subscription-key" (Sarvam) or "authorization"
+    # (Authorization: Bearer <key>, OpenAI style).
+    chat_llm_auth_header: str = "api-subscription-key"
+    chat_llm_timeout_seconds: float = Field(default=25.0, ge=1.0, le=60.0)
+    chat_llm_max_tokens: int = Field(default=1500, ge=64, le=8192)
+    chat_max_turns: int = Field(default=40, ge=1, le=500)
+    chat_session_ip_per_hour: int = Field(default=10, ge=1, le=10000)
+    chat_message_ip_per_hour: int = Field(default=120, ge=1, le=100000)
+    # Transcript reloads (GET /v1/chat/sessions/{id}) per client address per hour.
+    chat_history_ip_per_hour: int = Field(default=300, ge=1, le=100000)
+    # Model calls (each tool round is one) per clinic per UTC day, all sessions together.
+    # Over it the chat answers with the fallback text and quick replies, never an error.
+    chat_llm_calls_per_clinic_per_day: int = Field(default=3000, ge=1, le=1000000)
+
+    @field_validator("worker_tick_secret", "public_proxy_secret")
+    @classmethod
+    def _tick_secret(cls, value, info):
+        if value is None or not value.get_secret_value():
+            return None
+        if len(value.get_secret_value()) < 32:
+            raise ValueError(f"{info.field_name} must be at least 32 characters")
+        return value
+
+    @field_validator("chat_llm_base_url")
+    @classmethod
+    def _chat_base(cls, value):
+        checked = _https_or_loopback(value, "chat_llm_base_url")
+        if checked is None:
+            raise ValueError("chat_llm_base_url is required")
+        return checked.rstrip("/")
+
+    @field_validator("chat_llm_auth_header")
+    @classmethod
+    def _chat_header(cls, value):
+        value = value.strip().lower()
+        if value not in ("api-subscription-key", "authorization"):
+            raise ValueError("chat_llm_auth_header must be api-subscription-key or authorization")
+        return value
+
+    def local_environment(self) -> bool:
+        """APP_ENV development or test: a developer machine or the test suite."""
+        return self.app_env.strip().lower() in LOCAL_ENVIRONMENTS
+
+    def proxy_gate_missing(self) -> bool:
+        """Outside a local environment the patient-facing paths need PUBLIC_PROXY_SECRET;
+        True when it is unset there (edge.require_proxy answers 503)."""
+        return self.public_proxy_secret is None and not self.local_environment()
+
+    def chat_configured(self) -> bool:
+        return bool(self.chat_llm_api_key and self.chat_llm_api_key.get_secret_value())
 
     @field_validator("dashboard_origins")
     @classmethod

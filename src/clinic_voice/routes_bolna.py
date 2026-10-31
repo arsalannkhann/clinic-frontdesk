@@ -8,6 +8,14 @@ credential alone selects the clinic; call-context fields in the body never do. T
 /v1/tools/* API refuses bolna-scope tokens (deps.tool_caller).
 Responses are private (no-store) and carry no patient data or caller number.
 
+Unusable call context: a body whose execution_id, from_number or agent_id still holds its
+template ("{from_number}", "%(agent_id)s", "<agent_id>", a bare variable name) fails
+validation (schemas.BolnaCallContext) and gets 422 code context_unsubstituted with a
+speakable handoff sentence and the field names, before the line gate and before any call
+session; an absent, null or blank execution_id gets the same 422 with code context_missing.
+An empty or malformed from_number/agent_id is accepted and ignored as before, with one log
+line naming the fields (gateway.note_context).
+
 Line gating (T10, gateway.require_line), before anything is written: booking-changing tools
 (reserve-slot, cancel-booking, reschedule-booking, opt-out) need provisioning state active,
 or verified with the owner's test_calls_enabled; context and read-only tools (check-slots,
@@ -73,12 +81,24 @@ async def reject_duplicate_keys(request: Request):
         return
 
 
-# Authentication runs first (an unauthenticated request gets 401 before any body check); the
-# endpoints' own Depends(tenant) reuses this result (FastAPI caches it per request).
+def authenticated(request: Request, clinic_id=Depends(tenant)):
+    """Router-wide authentication. Records the clinic on the request so the validation
+    handler can name it when it refuses an unsubstituted call context (api.py)."""
+    request.state.bolna_clinic_id = clinic_id
+
+
+# Ordering, as FastAPI actually runs it: the request body is read and JSON-decoded first, so
+# a body that is not valid JSON gets FastAPI's generic 422 (type json_invalid) before any
+# dependency, even without a credential. That 422 names locations and types only (api.py) and
+# reveals nothing about the clinic. For a body that parses, the dependencies are solved next
+# (authentication, then the duplicate-key check) and only then is the body validated against
+# the route's model, so an unauthenticated request gets 401 before the call-context 422s
+# (context_unsubstituted, context_missing) and every other model check. The endpoints' own
+# Depends(tenant) reuses this result (FastAPI caches it per request).
 router = APIRouter(
     prefix="/v1/bolna",
     tags=["bolna"],
-    dependencies=[Depends(tenant), Depends(reject_duplicate_keys)],
+    dependencies=[Depends(authenticated), Depends(reject_duplicate_keys)],
 )
 NO_STORE = {"Cache-Control": "no-store"}
 
@@ -96,7 +116,7 @@ def context(
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=False)
         if call is not None:
-            gateway.upsert_session(conn, clinic_id, call, crypto)
+            gateway.upsert_session(conn, clinic_id, call, crypto, tool="context")
         return gateway.clinic_context(conn, clinic_id)
 
 
@@ -106,7 +126,7 @@ def check_slots(query: BolnaSlotQuery, response: Response, clinic_id=Depends(ten
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=False)
-        gateway.upsert_session(conn, clinic_id, query, crypto)
+        gateway.upsert_session(conn, clinic_id, query, crypto, tool="check-slots")
         return gateway.check_slots(conn, clinic_id, query)
 
 
@@ -117,7 +137,7 @@ def reserve_slot(request: BolnaReservation, response: Response, clinic_id=Depend
     crypto = gateway.session_crypto(settings)
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=True)
-        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        session_id = gateway.upsert_session(conn, clinic_id, request, crypto, tool="reserve-slot")
         gateway.refuse_reminder_call(conn, clinic_id, request)
         doctor_id, service_id = gateway.resolve(conn, clinic_id, request.doctor, request.service)
     # The lookup connection is closed before service.reserve opens its own.
@@ -139,7 +159,7 @@ def appointment_status(query: BolnaStatusQuery, response: Response, clinic_id=De
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=False)
-        gateway.upsert_session(conn, clinic_id, query, crypto)
+        gateway.upsert_session(conn, clinic_id, query, crypto, tool="appointment-status")
         return gateway.appointment_status(conn, clinic_id, query)
 
 
@@ -149,7 +169,7 @@ def verify_booking(query: BolnaVerify, response: Response, clinic_id=Depends(ten
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=False)
-        session_id = gateway.upsert_session(conn, clinic_id, query, crypto)
+        session_id = gateway.upsert_session(conn, clinic_id, query, crypto, tool="verify-booking")
         gateway.refuse_reminder_call(conn, clinic_id, query)
         return bookings.verify(conn, clinic_id, session_id, query, crypto[1])
 
@@ -160,7 +180,7 @@ def cancel_booking(request: BolnaCancel, response: Response, clinic_id=Depends(t
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=True)
-        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        session_id = gateway.upsert_session(conn, clinic_id, request, crypto, tool="cancel-booking")
         gateway.refuse_reminder_call(conn, clinic_id, request)
         return bookings.cancel(conn, clinic_id, session_id, request)
 
@@ -172,7 +192,9 @@ def reschedule_booking(request: BolnaReschedule, response: Response, clinic_id=D
     crypto = gateway.session_crypto(settings)
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=True)
-        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        session_id = gateway.upsert_session(
+            conn, clinic_id, request, crypto, tool="reschedule-booking"
+        )
         gateway.refuse_reminder_call(conn, clinic_id, request)
     return bookings.reschedule(
         settings.database_url.get_secret_value(),
@@ -191,6 +213,6 @@ def opt_out(request: BolnaOptOut, response: Response, clinic_id=Depends(tenant))
     crypto = gateway.session_crypto(get_settings())
     with database() as conn:
         gateway.require_line(conn, clinic_id, changes=True)
-        session_id = gateway.upsert_session(conn, clinic_id, request, crypto)
+        session_id = gateway.upsert_session(conn, clinic_id, request, crypto, tool="opt-out")
         gateway.refuse_reminder_call(conn, clinic_id, request)
         return bookings.opt_out(conn, clinic_id, session_id, request)

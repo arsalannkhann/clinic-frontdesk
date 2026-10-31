@@ -5,24 +5,34 @@ from typing import Annotated
 from uuid import UUID
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg import Error as DatabaseError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from clinic_voice import staff as staff_service
+from clinic_voice import staff_platform
 from clinic_voice.bolna.gateway import KEY_PREFIX as BOLNA_KEY_PREFIX
-from clinic_voice.bolna.gateway import require_line
+from clinic_voice.bolna.gateway import refuse_context, require_line
+from clinic_voice.chat import KEY_PREFIX as CHAT_KEY_PREFIX
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database, require_role, staff_session, tool_caller
-from clinic_voice.errors import NotFound
+from clinic_voice.errors import NotFound, PublicError
+from clinic_voice.public import KEY_PREFIX as WEB_KEY_PREFIX
 from clinic_voice.routes_admin import router as admin_router
 from clinic_voice.routes_appointments import router as appointments_router
 from clinic_voice.routes_bolna import router as bolna_router
 from clinic_voice.routes_calendar import admin_router as calendar_admin_router
 from clinic_voice.routes_calendar import oauth_router
+from clinic_voice.routes_chat import router as chat_router
+from clinic_voice.routes_internal import router as internal_router
+from clinic_voice.routes_public import router as public_router
+from clinic_voice.routes_staff import router as staff_router
 from clinic_voice.routes_webhooks import router as webhooks_router
 from clinic_voice.schemas import (
+    CONTEXT_CODES,
     SLOT_SOURCE,
     AppointmentStatusRequest,
     AppointmentStatusResponse,
@@ -33,6 +43,7 @@ from clinic_voice.schemas import (
     SessionResponse,
     SlotQuery,
     SlotResponse,
+    StaffMe,
     StaffUser,
     StaffUserCreate,
     StaffUserDetail,
@@ -46,6 +57,8 @@ from clinic_voice.service import appointment_status, reserve, slots
 # slashes and unknown (404) paths are redacted too.
 TOKEN_SHAPE = re.compile(r"cv[tbws]_[0-9a-fA-F]{32}\.[A-Za-z0-9_-]{43}")
 WEBHOOK_SEGMENT = re.compile(r"(/webhooks/+[^/?#]+/+)[^/?#]+")
+# A chat session id is a bearer secret in the path (/v1/chat/sessions/<id>/...).
+CHAT_SEGMENT = re.compile(r"(/chat/+sessions/+)[^/?#]+")
 REDACTED_SEGMENT = "<redacted>"
 
 
@@ -53,6 +66,7 @@ def redact_path(path: str) -> str:
     """The request path without its query string and with credential segments redacted."""
     path = path.split("?", 1)[0]
     path = TOKEN_SHAPE.sub(REDACTED_SEGMENT, path)
+    path = CHAT_SEGMENT.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path)
     return WEBHOOK_SEGMENT.sub(lambda m: m.group(1) + REDACTED_SEGMENT, path)
 
 
@@ -186,10 +200,62 @@ app.include_router(calendar_admin_router)
 app.include_router(oauth_router)
 app.include_router(bolna_router)
 app.include_router(webhooks_router)
+app.include_router(public_router)
+app.include_router(chat_router)
+app.include_router(staff_router)
+app.include_router(internal_router)
+
+PUBLIC_PATHS = ("/v1/public/", "/v1/chat/")
+PUBLIC_CODES = {
+    400: "invalid_request",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    409: "conflict",
+    413: "too_large",
+    422: "invalid_request",
+    429: "rate_limited",
+    503: "unavailable",
+}
+
+
+def _is_public(request) -> bool:
+    path = request.scope["path"]
+    root = request.scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root) :]
+    return path.startswith(PUBLIC_PATHS)
+
+
+def envelope(status: int, code: str, message: str, headers=None) -> JSONResponse:
+    """The public API error body: {"error": {"code", "message"}}, never cached."""
+    return JSONResponse(
+        status_code=status,
+        content={"error": {"code": code, "message": message}},
+        headers={**(headers or {}), "Cache-Control": "no-store"},
+    )
+
+
+@app.exception_handler(PublicError)
+async def public_error(request, exc):
+    return envelope(exc.status, exc.code, exc.message)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error(request, exc):
+    """HTTP errors on public paths (including unknown routes under them) use the
+    envelope with a code per status; every other path keeps FastAPI's {"detail"} body."""
+    if not _is_public(request):
+        return await http_exception_handler(request, exc)
+    code = PUBLIC_CODES.get(exc.status_code, "error")
+    message = exc.detail if isinstance(exc.detail, str) else code
+    return envelope(exc.status_code, code, message, getattr(exc, "headers", None))
 
 
 @app.exception_handler(DatabaseError)
 async def database_error(request, exc):
+    if _is_public(request):
+        return envelope(503, "unavailable", "Booking is unavailable; please try again later")
     return JSONResponse(
         status_code=503, content={"detail": "Scheduling unavailable; retry the same action later"}
     )
@@ -202,16 +268,35 @@ async def not_found(request, exc):
 
 @app.exception_handler(RequestValidationError)
 async def validation_error(request, exc):
+    errors = exc.errors()
+    for code in CONTEXT_CODES:  # Unsubstituted first: a template is the likelier root cause.
+        unusable = [error for error in errors if error["type"] == code]
+        if unusable:
+            # A Bolna tool body with literal call-context templates, or without an
+            # execution_id (schemas.BolnaCallContext). Only reachable after authentication
+            # (routes_bolna.authenticated), which named the clinic. The tool is the last
+            # path segment (context, check-slots, ...).
+            fields = list(dict.fromkeys(name for e in unusable for name in e["ctx"]["fields"]))
+            tool = request.url.path.rstrip("/").rsplit("/", 1)[-1]
+            clinic_id = getattr(request.state, "bolna_clinic_id", None)
+            return refuse_context(clinic_id, tool, code, fields)
     # Pydantic errors can echo sensitive submitted values. Return locations/types only.
+    if _is_public(request):
+        fields = ", ".join(
+            dict.fromkeys(".".join(str(part) for part in e["loc"][1:]) or "body" for e in errors)
+        )
+        return envelope(422, "invalid_request", f"Invalid request: {fields}"[:300])
     return JSONResponse(
         status_code=422,
         content={
-            "detail": [{"loc": list(error["loc"]), "type": error["type"]} for error in exc.errors()]
+            "detail": [{"loc": list(error["loc"]), "type": error["type"]} for error in errors]
         },
     )
 
 
-REQUIRED_MIGRATION = "016_tool_scopes.sql"
+# Keys the Bolna gateway, the website, the chat confirm, staff bookings and the seed derive.
+RESERVED_KEY_PREFIXES = (BOLNA_KEY_PREFIX, WEB_KEY_PREFIX, CHAT_KEY_PREFIX, "staff:", "seed:")
+REQUIRED_MIGRATION = "020_chat_review.sql"
 
 
 @app.get("/health/live")
@@ -228,7 +313,16 @@ def ready():
                 raise HTTPException(503, "Schema not ready")
     except DatabaseError:
         raise HTTPException(503, "Database unavailable") from None
-    return {"status": "ready", "integrations": "not_configured"}
+    result = {"status": "ready", "integrations": "not_configured"}
+    # Configuration problems that leave part of the API refusing requests. Names only,
+    # never values. The instance still serves staff and gateway traffic, so this stays 200.
+    problems = []
+    if get_settings().proxy_gate_missing():
+        problems.append("public_proxy_secret_missing")
+    if problems:
+        result["status"] = "degraded"
+        result["problems"] = problems
+    return result
 
 
 # Generic tool API. Authenticated by a tools-scope credential only (a bolna-scope credential,
@@ -253,8 +347,9 @@ def reserve_slot(
     ],
     caller=Depends(tool_caller),
 ):
-    if idempotency_key.startswith(BOLNA_KEY_PREFIX):
-        # Reserved for keys the Bolna gateway derives, which bind appointments to a call session.
+    if idempotency_key.startswith(RESERVED_KEY_PREFIXES):
+        # Reserved for keys the Bolna gateway and the public booking API derive (Bolna keys
+        # bind appointments to a call session; web keys to a contact).
         raise HTTPException(422, "Idempotency key prefix is reserved")
     clinic_id = caller.clinic_id
     with database() as conn:
@@ -296,9 +391,11 @@ def staff_logout(staff=Depends(staff_session)):
     return Response(status_code=204)
 
 
-@app.get("/v1/staff/me", response_model=StaffUser)
+@app.get("/v1/staff/me", response_model=StaffMe)
 def staff_me(staff=Depends(staff_session)):
-    return staff_service.public(staff)
+    """The signed-in staff member and their clinic {id, name, timezone, public_slug}."""
+    with database() as conn:
+        return staff_platform.me(conn, staff)
 
 
 @app.post("/v1/staff/me/password", status_code=204)

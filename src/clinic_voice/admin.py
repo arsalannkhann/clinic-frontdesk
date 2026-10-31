@@ -29,10 +29,31 @@ def _update(conn, table, columns, clinic_id, row_id, changes):
 CLINIC_COLUMNS = (
     "id,name,timezone,lead_time_minutes,horizon_days,outbound_enabled,quiet_hours_start,"
     "quiet_hours_end,reminder_lead_minutes,daily_contact_budget,emergency_text,handoff_text,"
-    "scripts_approved,test_calls_enabled,include_reference_in_messages"
+    "scripts_approved,test_calls_enabled,include_reference_in_messages,public_slug,"
+    "public_enabled,public_tagline,public_address,public_map_url,public_phone_display,"
+    "public_email,public_hours_note,public_about,public_voice_number,public_chat_enabled,"
+    "bolna_outbound_from_number"
 )
 SCRIPT_COLUMNS = ("emergency_text", "handoff_text")
-OWNER_COLUMNS = ("scripts_approved", "test_calls_enabled", "include_reference_in_messages")
+OWNER_COLUMNS = (
+    "scripts_approved",
+    "test_calls_enabled",
+    "include_reference_in_messages",
+    "bolna_outbound_from_number",
+)
+# Website and chat profile (P2, migration 018). public_slug and public_enabled stay
+# operator-set (cli); owners and admins edit the copy and turn the chat assistant on or off.
+PUBLIC_COLUMNS = (
+    "public_tagline",
+    "public_address",
+    "public_map_url",
+    "public_phone_display",
+    "public_email",
+    "public_hours_note",
+    "public_about",
+    "public_voice_number",
+    "public_chat_enabled",
+)
 
 
 def _clinic_out(row):
@@ -72,6 +93,11 @@ def update_clinic(conn, staff, changes):
     include_reference_in_messages (T12, owner only, default off): whether confirmation and
     reminder messages carry the booking reference (ADR 0008). Audited as
     'clinic.reference_in_messages_enabled' / 'clinic.reference_in_messages_disabled'.
+
+    Public profile (P2): the PUBLIC_COLUMNS (website copy, voice number, chat on/off), owners
+    and admins, audited as 'clinic.public_profile_updated' (plus 'clinic.chat_enabled' /
+    'clinic.chat_disabled'). bolna_outbound_from_number (owner only): the caller number of
+    staff callback calls, audited as 'clinic.outbound_number_updated'.
     """
     clinic_id = staff["clinic_id"]
     columns = (
@@ -86,6 +112,7 @@ def update_clinic(conn, staff, changes):
         "daily_contact_budget",
         *SCRIPT_COLUMNS,
         *OWNER_COLUMNS,
+        *PUBLIC_COLUMNS,
     )
     if not changes or not set(changes) <= set(columns):
         raise ValueError("invalid update columns")
@@ -108,6 +135,12 @@ def update_clinic(conn, staff, changes):
             raise HTTPException(
                 422, "emergency and handoff texts are required before approval"
             ) from None
+        if error.diag.constraint_name == "clinics_outbound_agent_check":
+            raise HTTPException(422, "invalid outbound settings") from None
+        if "public" in (error.diag.constraint_name or "") or "bolna" in (
+            error.diag.constraint_name or ""
+        ):
+            raise HTTPException(422, "invalid public profile value") from None
         raise HTTPException(422, "quiet hours start and end must differ") from None
     audit(conn, clinic_id, staff["id"], "clinic.updated", clinic_id)
     if changes.get("scripts_approved"):
@@ -131,6 +164,13 @@ def update_clinic(conn, staff, changes):
             "clinic.outbound_enabled" if changes["outbound_enabled"] else "clinic.outbound_disabled"
         )
         audit(conn, clinic_id, staff["id"], action, clinic_id)
+    if set(PUBLIC_COLUMNS) & set(changes):
+        audit(conn, clinic_id, staff["id"], "clinic.public_profile_updated", clinic_id)
+    if "public_chat_enabled" in changes:
+        action = "clinic.chat_enabled" if changes["public_chat_enabled"] else "clinic.chat_disabled"
+        audit(conn, clinic_id, staff["id"], action, clinic_id)
+    if "bolna_outbound_from_number" in changes:
+        audit(conn, clinic_id, staff["id"], "clinic.outbound_number_updated", clinic_id)
     return _clinic_out(row)
 
 

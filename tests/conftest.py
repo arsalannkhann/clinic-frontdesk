@@ -1,12 +1,29 @@
+# Tests never read a .env file: a developer's .env holds real secrets (Bolna API key,
+# encryption keys) and would leak into tests that expect a setting to be unset. Settings
+# reads model_config["env_file"] on every instantiation, so clearing it here covers
+# get_settings() and direct Settings(...) calls alike. It runs before any other clinic_voice
+# import (and so before any test module is collected), so not even an import-time Settings
+# could read .env; clinic_voice.config itself builds none at import. Tests configure
+# settings through monkeypatch.setenv only. Production keeps reading .env from the working
+# directory (config.ENV_FILE).
 import os
-from pathlib import Path
-from uuid import uuid4
 
-import pytest
-from psycopg.conninfo import conninfo_to_dict
+from clinic_voice.config import Settings, get_settings
 
-from clinic_voice.cli import seed
-from clinic_voice.db import connect, migrate
+Settings.model_config["env_file"] = None
+# The suite is a local environment (config.LOCAL_ENVIRONMENTS): the patient-facing paths
+# work without PUBLIC_PROXY_SECRET. Tests of the production gate set APP_ENV themselves.
+os.environ["APP_ENV"] = "test"
+get_settings.cache_clear()
+
+from pathlib import Path  # noqa: E402
+from uuid import uuid4  # noqa: E402
+
+import pytest  # noqa: E402
+from psycopg.conninfo import conninfo_to_dict  # noqa: E402
+
+from clinic_voice.cli import seed  # noqa: E402
+from clinic_voice.db import connect, migrate  # noqa: E402
 
 
 @pytest.fixture
@@ -19,7 +36,7 @@ def database():
     migrate(url, Path("migrations"))
     with connect(url) as conn:
         conn.execute(
-            "TRUNCATE provisioning_events, provisioning, reminders, contact_preferences, webhook_inbox, appointment_changes, call_session_verifications, call_session_verification_failures, consents, patients, call_sessions, oauth_states, calendar_accounts, external_busy, schedule_exceptions, audit_events, staff_sessions, staff_users, tenant_credentials, outbox, appointments, working_hours, services, doctors,"
+            "TRUNCATE chat_proposals, chat_messages, chat_sessions, public_rate_limits, callback_requests, provisioning_events, provisioning, reminders, contact_preferences, webhook_inbox, appointment_changes, call_session_verifications, call_session_verification_failures, consents, patients, call_sessions, oauth_states, calendar_accounts, external_busy, schedule_exceptions, audit_events, staff_sessions, staff_users, tenant_credentials, outbox, appointments, working_hours, services, doctors,"
             " clinics CASCADE"
         )
     seed(url)

@@ -524,6 +524,20 @@ def test_concurrent_set_agent_is_not_overwritten(env):
     assert rows(env["url"], "SELECT bolna_agent_id FROM clinics WHERE id=%s", (CLINIC,)) == [
         {"bolna_agent_id": hand_set}
     ]
+    # The agent just written is not the clinic's: it must not keep working credentials.
+    row = provisioning_row(env)
+    assert row["agent_create_pending"] is False  # The create succeeded; nothing is unresolved.
+    assert (row["attempt_credential_id"], row["attempt_webhook_credential_id"]) == (None, None)
+    assert (row["tool_credential_id"], row["webhook_credential_id"]) == (None, None)
+    [tool] = provisioning_credentials(env)
+    [hook] = webhook_credentials(env)
+    assert tool["revoked_at"] is not None and hook["revoked_at"] is not None
+    [agent_id] = fake.agents
+    with connect(env["url"]) as conn:
+        assert credentials.authenticate(conn, agent_token(fake, agent_id), "bolna") is None
+        assert (
+            credentials.authenticate(conn, agent_webhook_token(fake, agent_id), "webhook") is None
+        )
 
 
 class Unauthorized(ProviderPermanent):
@@ -589,11 +603,12 @@ def provisioning_row(env, clinic=CLINIC):
     return rows(env["url"], "SELECT * FROM provisioning WHERE clinic_id=%s", (clinic,))[0]
 
 
-def provisioning_credentials(env):
+def provisioning_credentials(env, clinic=CLINIC):
     return rows(
         env["url"],
-        "SELECT id, revoked_at FROM tenant_credentials WHERE label=%s ORDER BY created_at",
-        (service.CREDENTIAL_LABEL,),
+        "SELECT id, revoked_at FROM tenant_credentials WHERE label=%s AND clinic_id=%s"
+        " ORDER BY created_at",
+        (service.CREDENTIAL_LABEL, clinic),
     )
 
 
@@ -862,6 +877,453 @@ def test_verify_and_activate_require_an_active_tool_credential(env):
     assert r.status_code == 409 and "credential" in r.json()["detail"]
 
 
+# Webhook credential (the agent's webhook_url)
+
+
+def webhook_credentials(env, clinic=CLINIC):
+    return rows(
+        env["url"],
+        "SELECT id, scope, revoked_at FROM tenant_credentials WHERE label=%s AND clinic_id=%s"
+        " ORDER BY created_at",
+        (service.WEBHOOK_LABEL, clinic),
+    )
+
+
+def agent_webhook_token(fake, agent_id):
+    url = fake.agents[agent_id]["agent_config"]["webhook_url"]
+    prefix = GATEWAY + "/v1/webhooks/bolna/"
+    assert url.startswith(prefix)
+    return url.removeprefix(prefix)
+
+
+def hand_webhook(env):
+    """An operator-issued webhook credential (another label): provisioning never touches it."""
+    with connect(env["url"]) as conn:
+        credential_id, _ = credentials.issue(conn, CLINIC, "bolna-webhook", scope="webhook")
+    return credential_id
+
+
+def active(env, credential_id):
+    [row] = rows(
+        env["url"], "SELECT revoked_at FROM tenant_credentials WHERE id=%s", (credential_id,)
+    )
+    return row["revoked_at"] is None
+
+
+def test_agent_webhook_url_carries_a_clinic_webhook_credential(env):
+    owner = headers(env)
+    connect_calendar(env)
+    hand = hand_webhook(env)
+    created = to_state(env, owner, "agent_created")
+    agent_id = created["agent_id"]
+    token = agent_webhook_token(env["fake"], agent_id)
+    row = provisioning_row(env)
+    assert credentials.parse(token, "webhook")[0] == row["webhook_credential_id"]
+    assert row["attempt_webhook_credential_id"] is None
+    [issued] = webhook_credentials(env)
+    assert (issued["scope"], issued["revoked_at"]) == ("webhook", None)
+    # A distinct credential from the tool token, and neither works in the other's place.
+    tool = agent_token(env["fake"], agent_id)
+    with connect(env["url"]) as conn:
+        assert credentials.authenticate(conn, token, "webhook") == CLINIC
+        assert credentials.authenticate(conn, token, "bolna") is None
+        assert credentials.authenticate(conn, tool, "webhook") is None
+    # Bolna's delivery to that URL authenticates for this clinic and is stored.
+    body = {"id": "66666666-6666-4666-8666-666666666666", "agent_id": agent_id, "status": "queued"}
+    r = env["client"].post(f"/v1/webhooks/bolna/{token}", json=body)
+    assert r.status_code in (200, 202), r.text
+    [stored] = rows(env["url"], "SELECT clinic_id FROM webhook_inbox")
+    assert stored["clinic_id"] == CLINIC
+    assert active(env, hand)
+
+
+def test_agent_update_promotes_a_new_webhook_credential_and_revokes_the_old(env):
+    owner = headers(env)
+    connect_calendar(env)
+    hand = hand_webhook(env)
+    first = to_state(env, owner, "number_assigned")
+    old = provisioning_row(env)["webhook_credential_id"]
+    tools = env["fake"].agents[first["agent_id"]]["agent_config"]["tasks"][0]["tools_config"]
+    tools["api_tools"]["tools_params"]["check_slots"]["url"] = "https://evil.example.test/x"
+    assert step(env, owner)["last_error"] == "tools_mismatch"
+    assert active(env, old)  # Held by the agent through the review.
+    env["client"].post(f"{BASE}/reset", headers=h(owner))
+    assert step(env, owner)["state"] == "agent_created"  # PUT with a fresh webhook credential.
+    row = provisioning_row(env)
+    new = row["webhook_credential_id"]
+    assert new != old and row["attempt_webhook_credential_id"] is None
+    assert not active(env, old) and active(env, new)
+    token = agent_webhook_token(env["fake"], first["agent_id"])
+    assert credentials.parse(token, "webhook")[0] == new
+    assert active(env, hand)
+    assert to_state(env, owner, "verified")["events"][0]["outcome"] == "ok"
+
+
+def test_review_keeps_held_and_possibly_held_webhook_credentials(env):
+    owner = headers(env)
+    connect_calendar(env)
+    hand = hand_webhook(env)
+    to_state(env, owner, "calendar_connected")
+    env["fake"].consistent_agent_lookup = False
+    env["fake"].timeout_after_write.add("create_agent")  # Created; the client saw a timeout.
+    step(env, owner)
+    held = provisioning_row(env)["attempt_webhook_credential_id"]
+    assert held is not None
+    # A stray (unheld) provisioning webhook credential, as a crash between issue and the
+    # write could leave behind.
+    with connect(env["url"]) as conn:
+        stray, _ = credentials.issue(conn, CLINIC, service.WEBHOOK_LABEL, scope="webhook")
+    env["fake"].fail_next("list_agents", 50, ProviderRetryable)
+    for _ in range(service.STEP_MAX_ATTEMPTS + 1):
+        work(env)
+    review = state(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "retries_exhausted")
+    assert active(env, held)  # The created agent may hold it.
+    assert not active(env, stray)
+    assert active(env, hand)
+    [agent_id] = env["fake"].agents
+    with connect(env["url"]) as conn:
+        token = agent_webhook_token(env["fake"], agent_id)
+        assert credentials.authenticate(conn, token, "webhook") == CLINIC
+    # Reconciled after reset: the agent gets a new one; the held one is revoked.
+    env["fake"]._failures["list_agents"] = []  # noqa: SLF001
+    env["client"].post(f"{BASE}/reset", headers=h(owner))
+    assert step(env, owner)["state"] == "agent_created"
+    assert not active(env, held)
+    assert active(env, provisioning_row(env)["webhook_credential_id"])
+    assert active(env, hand)
+
+
+@pytest.mark.parametrize(
+    "refusal", ["provider_permanent", "agent_config_invalid", "prompt_unavailable"]
+)
+def test_refused_write_gives_its_webhook_credential_up_and_keeps_the_earlier_one(
+    env, monkeypatch, tmp_path, refusal
+):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    env["fake"].fail_next("create_agent", 1, ProviderTimeout)  # Nothing created in fact.
+    step(env, owner)
+    earlier = provisioning_row(env)
+    assert earlier["attempt_webhook_credential_id"] is not None
+    if refusal == "provider_permanent":
+        env["fake"].fail_next("create_agent", 1, ProviderPermanent)
+    elif refusal == "prompt_unavailable":
+        from clinic_voice.bolna import agent_config
+
+        # The prompt file is missing from the deployment bundle: a real FileNotFoundError.
+        original, missing = agent_config.load_prompt, tmp_path / "prompts"
+        monkeypatch.setattr(
+            agent_config, "load_prompt", lambda name="receptionist": original(name, missing)
+        )
+    else:
+        from clinic_voice.bolna import agent_config
+
+        def invalid(*args, **kwargs):
+            raise ValueError("synthetic")
+
+        monkeypatch.setattr(agent_config, "compile_agent", invalid)
+    work(env)
+    failed = state(env, owner)
+    assert (failed["state"], failed["last_error"]) == ("failed", refusal)
+    row = provisioning_row(env)
+    # The earlier timed-out create is still unresolved: its credentials stay recorded and
+    # active; this attempt's were never held and are revoked.
+    assert row["attempt_webhook_credential_id"] == earlier["attempt_webhook_credential_id"]
+    assert row["attempt_credential_id"] == earlier["attempt_credential_id"]
+    assert row["webhook_credential_id"] is None
+    kept, given_up = webhook_credentials(env)
+    assert kept["id"] == earlier["attempt_webhook_credential_id"] and kept["revoked_at"] is None
+    assert given_up["revoked_at"] is not None
+
+
+def test_permanent_refusal_revokes_the_only_webhook_credential(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    env["fake"].fail_next("create_agent", 1, ProviderPermanent)
+    assert step(env, owner)["state"] == "failed"
+    [issued] = webhook_credentials(env)
+    assert issued["revoked_at"] is not None
+    row = provisioning_row(env)
+    assert (row["webhook_credential_id"], row["attempt_webhook_credential_id"]) == (None, None)
+
+
+def test_agent_conflict_after_the_write_revokes_the_webhook_credential(env):
+    owner = headers(env)
+    connect_calendar(env)
+    hand = hand_webhook(env)
+    to_state(env, owner, "calendar_connected")
+    fake = env["fake"]
+    original = fake.create_agent
+
+    def create_then_claimed(payload):
+        agent_id = original(payload)
+        execute(
+            env["url"], "UPDATE clinics SET bolna_agent_id=%s WHERE id=%s", (agent_id, OTHER_CLINIC)
+        )
+        return agent_id
+
+    fake.create_agent = create_then_claimed
+    review = step(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "agent_conflict")
+    row = provisioning_row(env)
+    assert (row["webhook_credential_id"], row["attempt_webhook_credential_id"]) == (None, None)
+    [issued] = webhook_credentials(env)
+    assert issued["revoked_at"] is not None  # The foreign agent must not keep it.
+    assert active(env, hand)
+
+
+def test_confirmed_reset_revokes_the_possibly_held_webhook_credential(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    env["fake"].consistent_agent_lookup = False
+    env["fake"].fail_next("create_agent", 1, ProviderTimeout)
+    step(env, owner)
+    work(env)
+    assert state(env, owner)["last_error"] == "create_uncertain"
+    held = provisioning_row(env)["attempt_webhook_credential_id"]
+    env["client"].post(f"{BASE}/reset", headers=h(owner))
+    assert provisioning_row(env)["attempt_webhook_credential_id"] == held  # Plain reset keeps it.
+    assert active(env, held)
+    step(env, owner)
+    r = env["client"].post(f"{BASE}/reset", headers=h(owner), json={"confirm_no_stray_agent": True})
+    assert r.status_code == 200
+    assert provisioning_row(env)["attempt_webhook_credential_id"] is None
+    assert not active(env, held)
+
+
+def agent_record(env, agent_id):
+    return env["fake"].agents[agent_id]["agent_config"]
+
+
+def test_verify_detects_a_webhook_url_naming_another_credential_or_host(env):
+    owner = headers(env)
+    connect_calendar(env)
+    assigned = to_state(env, owner, "number_assigned")
+    config = agent_record(env, assigned["agent_id"])
+    good = config["webhook_url"]
+    with connect(env["url"]) as conn:
+        _, other = credentials.issue(conn, CLINIC, "bolna-webhook", scope="webhook")
+    config["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{other}"
+    review = step(env, owner)
+    assert (review["state"], review["last_error"], review["resume_state"]) == (
+        "manual_review",
+        "webhook_mismatch",
+        "calendar_connected",
+    )
+    env["client"].post(f"{BASE}/reset", headers=h(owner))
+    to_state(env, owner, "number_assigned")
+    config = agent_record(env, assigned["agent_id"])
+    for wrong in (
+        config["webhook_url"].replace(GATEWAY, "https://evil.example.test"),
+        f"{GATEWAY}/v1/webhooks/bolna/not-a-token",
+        42,
+        good,  # The previous credential, revoked when the agent was rewritten.
+    ):
+        config = agent_record(env, assigned["agent_id"])
+        current = config["webhook_url"]
+        config["webhook_url"] = wrong
+        assert step(env, owner)["last_error"] == "webhook_mismatch"
+        env["client"].post(f"{BASE}/reset", headers=h(owner))
+        to_state(env, owner, "number_assigned")
+        assert agent_record(env, assigned["agent_id"])["webhook_url"] != current
+
+
+@pytest.mark.parametrize(
+    ("mask_token", "outcome"),
+    [(False, "webhook_unchecked"), (True, "token_and_webhook_unchecked")],
+)
+def test_verify_without_an_exposed_webhook_url_is_unchecked(env, mask_token, outcome):
+    owner = headers(env)
+    connect_calendar(env)
+    assigned = to_state(env, owner, "number_assigned")
+    config = agent_record(env, assigned["agent_id"])
+    del config["webhook_url"]  # GET /v2/agent does not document webhook_url.
+    if mask_token:
+        for entry in config["tasks"][0]["tools_config"]["api_tools"]["tools_params"].values():
+            entry["api_token"] = "Bearer ****"
+    verified = step(env, owner)
+    assert verified["state"] == "verified"
+    assert verified["events"][0]["outcome"] == outcome
+
+
+def test_verify_and_activate_require_an_active_webhook_credential(env):
+    owner = headers(env)
+    connect_calendar(env)
+    approve_scripts(env, owner)
+    to_state(env, owner, "number_assigned")
+    execute(
+        env["url"],
+        "UPDATE tenant_credentials SET revoked_at=now() WHERE id=%s",
+        (provisioning_row(env)["webhook_credential_id"],),
+    )
+    review = step(env, owner)
+    assert (review["state"], review["last_error"], review["resume_state"]) == (
+        "manual_review",
+        "credential_inactive",
+        "calendar_connected",
+    )
+    assert not calls(env["fake"], "get_agent")
+    assert env["client"].post(f"{BASE}/reset", headers=h(owner)).status_code == 200
+    to_state(env, owner, "verified")
+    execute(
+        env["url"],
+        "UPDATE tenant_credentials SET expires_at=now() - interval '1 second' WHERE id=%s",
+        (provisioning_row(env)["webhook_credential_id"],),
+    )
+    r = env["client"].post(f"{BASE}/activate", headers=h(owner))
+    assert r.status_code == 409 and "webhook" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("exposed", [False, True])
+def test_row_provisioned_before_webhook_management_verifies_unchecked(env, exposed):
+    """A row past the agent step when migration 017 ran has no webhook_credential_id: its
+    webhook URL is not managed (an operator set it by hand), so verify does not check it and
+    activation does not require it."""
+    owner = headers(env)
+    connect_calendar(env)
+    approve_scripts(env, owner)
+    assigned = to_state(env, owner, "number_assigned")
+    config = agent_record(env, assigned["agent_id"])
+    hand = hand_webhook(env)
+    with connect(env["url"]) as conn:
+        _, hand_token = credentials.issue(conn, CLINIC, "bolna-webhook-2", scope="webhook")
+    if exposed:
+        config["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{hand_token}"
+    else:
+        del config["webhook_url"]
+    execute(
+        env["url"],
+        "UPDATE tenant_credentials SET revoked_at=now() WHERE label=%s",
+        (service.WEBHOOK_LABEL,),
+    )
+    execute(env["url"], "UPDATE provisioning SET webhook_credential_id=NULL")
+    verified = step(env, owner)
+    assert verified["state"] == "verified"
+    assert verified["events"][0]["outcome"] == "webhook_unchecked"
+    r = env["client"].post(f"{BASE}/activate", headers=h(owner))
+    assert r.status_code == 200 and r.json()["state"] == "active"
+    assert active(env, hand)
+
+
+def other_secret(token):
+    """The same credential id with a different (wrong) secret."""
+    prefix, _, secret = token.partition(".")
+    return f"{prefix}.{'Z' * 43 if secret != 'Z' * 43 else 'Y' * 43}"
+
+
+def test_verify_compares_the_webhook_token_secret_not_only_its_id(env):
+    """A webhook_url naming the recorded credential with a mangled secret would 401 on every
+    delivery: verify compares the secret's digest with the stored hash."""
+    owner = headers(env)
+    connect_calendar(env)
+    assigned = to_state(env, owner, "number_assigned")
+    config = agent_record(env, assigned["agent_id"])
+    token = agent_webhook_token(env["fake"], assigned["agent_id"])
+    config["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{other_secret(token)}"
+    review = step(env, owner)
+    assert (review["state"], review["last_error"], review["resume_state"]) == (
+        "manual_review",
+        "webhook_mismatch",
+        "calendar_connected",
+    )
+
+
+@pytest.mark.parametrize("which", ["all", "one"])
+def test_verify_compares_the_tool_token_secret_not_only_its_id(env, which):
+    owner = headers(env)
+    connect_calendar(env)
+    assigned = to_state(env, owner, "number_assigned")
+    params = agent_record(env, assigned["agent_id"])["tasks"][0]["tools_config"]["api_tools"][
+        "tools_params"
+    ]
+    entries = list(params.values())
+    for entry in entries if which == "all" else entries[:1]:
+        token = entry["api_token"].removeprefix("Bearer ")
+        entry["api_token"] = "Bearer " + other_secret(token)
+    review = step(env, owner)
+    assert (review["state"], review["last_error"], review["resume_state"]) == (
+        "manual_review",
+        "credential_mismatch",
+        "calendar_connected",
+    )
+
+
+@pytest.mark.parametrize(
+    ("base", "expected"),
+    [
+        (GATEWAY, ("verified", None, "webhook_unchecked")),
+        ("https://evil.example.test", ("manual_review", "webhook_mismatch", None)),
+    ],
+)
+def test_verify_with_a_masked_webhook_token_still_compares_the_url(env, base, expected):
+    owner = headers(env)
+    connect_calendar(env)
+    assigned = to_state(env, owner, "number_assigned")
+    agent_record(env, assigned["agent_id"])["webhook_url"] = f"{base}/v1/webhooks/bolna/****"
+    after = step(env, owner)
+    outcome = after["events"][0]["outcome"] if after["state"] == "verified" else None
+    assert (after["state"], after["last_error"], outcome) == expected
+
+
+def test_two_timeouts_then_success_leave_one_active_managed_credential_of_each_label(env):
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    env["fake"].fail_next("create_agent", 2, ProviderTimeout)  # Refused before any write.
+    step(env, owner)
+    work(env)
+    work(env)
+    assert state(env, owner)["state"] == "agent_created"
+    assert len(env["fake"].agents) == 1
+    row = provisioning_row(env)
+    hooks = webhook_credentials(env)
+    assert len(hooks) == 3
+    assert [c["id"] for c in hooks if c["revoked_at"] is None] == [row["webhook_credential_id"]]
+    tools = provisioning_credentials(env)
+    assert len(tools) == 3
+    assert [c["id"] for c in tools if c["revoked_at"] is None] == [row["tool_credential_id"]]
+
+
+def test_other_clinics_provisioning_credentials_survive_this_clinics_steps(env):
+    """Promotion, a stop (review) and a confirmed reset revoke only this clinic's
+    provisioning credentials."""
+    owner = headers(env)
+    connect_calendar(env)
+    with connect(env["url"]) as conn:
+        foreign = [
+            credentials.issue(conn, OTHER_CLINIC, service.WEBHOOK_LABEL, scope="webhook")[0],
+            credentials.issue(conn, OTHER_CLINIC, service.CREDENTIAL_LABEL, scope="bolna")[0],
+        ]
+
+    def survived():
+        assert all(active(env, credential_id) for credential_id in foreign)
+        assert len(webhook_credentials(env, OTHER_CLINIC)) == 1
+        assert len(provisioning_credentials(env, OTHER_CLINIC)) == 1
+
+    to_state(env, owner, "calendar_connected")
+    env["fake"].consistent_agent_lookup = False
+    env["fake"].fail_next("create_agent", 1, ProviderTimeout)
+    step(env, owner)
+    work(env)
+    review = state(env, owner)
+    assert (review["state"], review["last_error"]) == ("manual_review", "create_uncertain")
+    survived()  # Stop.
+    r = env["client"].post(f"{BASE}/reset", headers=h(owner), json={"confirm_no_stray_agent": True})
+    assert r.status_code == 200
+    survived()  # Confirmed reset.
+    assert step(env, owner)["state"] == "agent_created"
+    survived()  # Promotion.
+    assigned = to_state(env, owner, "number_assigned")
+    tools = agent_record(env, assigned["agent_id"])["tasks"][0]["tools_config"]
+    tools["api_tools"]["tools_params"]["check_slots"]["url"] = "https://evil.example.test/x"
+    assert step(env, owner)["last_error"] == "tools_mismatch"
+    survived()  # Stop after the agent was recorded.
+
+
 # Activation
 
 
@@ -1044,6 +1506,21 @@ def test_worker_without_bolna_leaves_provisioning_jobs(env):
 # Secrets and append-only history
 
 
+def database_text(env):
+    """Every row of every public table, as JSON text."""
+    tables = [
+        r["tablename"]
+        for r in rows(env["url"], "SELECT tablename FROM pg_tables WHERE schemaname='public'")
+    ]
+    dump = []
+    for table in tables:
+        dump += [
+            r["row"]
+            for r in rows(env["url"], f"SELECT row_to_json(t)::text AS row FROM {table} t")  # noqa: S608
+        ]
+    return "\n".join(dump)
+
+
 def test_no_credential_plaintext_or_phone_number_in_database_or_logs(env, caplog):
     caplog.set_level(logging.DEBUG)
     owner = headers(env)
@@ -1055,25 +1532,55 @@ def test_no_credential_plaintext_or_phone_number_in_database_or_logs(env, caplog
     to_state(env, owner, "verified")
     approve_scripts(env, owner)
     env["client"].post(f"{BASE}/activate", headers=h(owner))
-    token = agent_token(env["fake"], state(env, owner)["agent_id"])
+    agent_id = state(env, owner)["agent_id"]
+    token = agent_token(env["fake"], agent_id)
     secret = token.split(".", 1)[1]
-    tables = [
-        r["tablename"]
-        for r in rows(env["url"], "SELECT tablename FROM pg_tables WHERE schemaname='public'")
-    ]
-    dump = []
-    for table in tables:
-        dump += [
-            r["row"]
-            for r in rows(env["url"], f"SELECT row_to_json(t)::text AS row FROM {table} t")  # noqa: S608
-        ]
-    text = "\n".join(dump)
+    hook_secret = agent_webhook_token(env["fake"], agent_id).split(".", 1)[1]
+    text = database_text(env)
     assert secret not in text and LINE not in text and "Bearer" not in text
+    assert hook_secret not in text and "cvw_" not in text
     assert NUMBER_ID in text  # The id is stored; the number is not.
     logged = "\n".join(r.getMessage() for r in caplog.records)
-    assert secret not in logged and LINE not in logged
+    assert secret not in logged and LINE not in logged and hook_secret not in logged
     view = json.dumps(state(env, owner))
-    assert secret not in view and LINE not in view
+    assert secret not in view and LINE not in view and hook_secret not in view
+
+
+@pytest.mark.parametrize("path", ["timeout", "permanent", "dead_letter"])
+def test_no_credential_plaintext_after_a_failed_agent_write(env, caplog, path):
+    """The tokens sent in a write that timed out, was refused (4xx) or dead-lettered are
+    found nowhere in the database (credential rows, provisioning_events) or the logs."""
+    caplog.set_level(logging.DEBUG)
+    owner = headers(env)
+    connect_calendar(env)
+    to_state(env, owner, "calendar_connected")
+    error = ProviderPermanent if path == "permanent" else ProviderTimeout
+    env["fake"].fail_next("create_agent", 1, error)
+    assert advance(env, owner).status_code == 202
+    if path == "dead_letter":
+        execute(
+            env["url"],
+            "UPDATE outbox SET max_attempts=1 WHERE kind='provision.step' AND status='pending'",
+        )
+    work(env)
+    expected = {
+        "timeout": "calendar_connected",
+        "permanent": "failed",
+        "dead_letter": "manual_review",
+    }
+    assert state(env, owner)["state"] == expected[path]
+    [(_, (payload,))] = calls(env["fake"], "create_agent")
+    params = payload["agent_config"]["tasks"][0]["tools_config"]["api_tools"]["tools_params"]
+    [tool] = {entry["api_token"].removeprefix("Bearer ") for entry in params.values()}
+    hook = payload["agent_config"]["webhook_url"].rsplit("/", 1)[1]
+    secrets_sent = [tool.split(".", 1)[1], hook.split(".", 1)[1]]
+    text = database_text(env)
+    logged = "\n".join(r.getMessage() for r in caplog.records)
+    events = json.dumps(state(env, owner)["events"])
+    for secret in secrets_sent:
+        assert secret not in text and secret not in logged and secret not in events
+    for prefix in ("cvb_", "cvw_"):
+        assert prefix not in text and prefix not in logged
 
 
 def test_events_are_append_only(env):
@@ -1196,6 +1703,58 @@ def test_summarize_agent_accepts_string_encoded_tools_and_masked_tokens():
         assert summarize_agent(body).token_credential_ids == (UNREADABLE,)
     assert summarize_agent({"id": "bad id"}) is None
     assert summarize_agent([]) is None
+
+
+def test_summarize_agent_reads_an_optional_webhook_url_without_its_secret():
+    """GET /v2/agent does not document webhook_url: absent reads as unexposed (None); present,
+    only the credential id and the URL without its last segment are kept."""
+    body = agent_body()
+    agent = summarize_agent(body)
+    assert (agent.webhook_base, agent.webhook_credential_id) == (None, None)
+    hook = "cvw_" + "c" * 32 + "." + "d" * 43
+    body["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{hook}"
+    agent = summarize_agent(body)
+    assert agent.webhook_base == GATEWAY + "/v1/webhooks/bolna"
+    assert agent.webhook_credential_id == "c" * 32
+    assert "d" * 43 not in repr(agent)
+    for value, expected in (
+        (None, (None, None)),
+        ("", (None, None)),
+        (f"{GATEWAY}/v1/webhooks/bolna/****", (GATEWAY + "/v1/webhooks/bolna", None)),
+        (f"{GATEWAY}/v1/webhooks/bolna/cvt_{'c' * 32}.{'d' * 43}", None),
+        (f"{GATEWAY}/v1/webhooks/bolna/garbage", None),
+        (42, None),
+    ):
+        body["webhook_url"] = value
+        agent = summarize_agent(body)
+        if expected is None:
+            assert agent.webhook_credential_id == UNREADABLE
+        else:
+            assert (agent.webhook_base, agent.webhook_credential_id) == expected
+    # The adapter passes it through from GET /v2/agent/{id} when (and only when) present.
+    body["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/{hook}"
+    bolna = client(lambda request: httpx.Response(200, json=body))
+    assert bolna.get_agent(AGENT).webhook_credential_id == "c" * 32
+
+
+def test_summarize_agent_keeps_only_secret_digests():
+    """The adapter keeps a sha256 digest of each token secret (the form tenant_credentials
+    stores), never the secret; a masked or unreadable token has none."""
+    secret = "b" * 43
+    body = agent_body("cvb_" + "a" * 32 + "." + secret)
+    hook_secret = "d" * 43
+    body["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/cvw_{'c' * 32}.{hook_secret}"
+    agent = summarize_agent(body)
+    assert agent.token_secret_digests == (credentials.digest(secret),)
+    assert agent.webhook_secret_digest == credentials.digest(hook_secret)
+    assert secret not in repr(agent) and hook_secret not in repr(agent)
+    assert credentials.digest(secret).hex() not in repr(agent)
+    body["webhook_url"] = f"{GATEWAY}/v1/webhooks/bolna/****"
+    body["tasks"][0]["tools_config"]["api_tools"]["tools_params"]["check_slots"]["api_token"] = (
+        "Bearer ****"
+    )
+    agent = summarize_agent(body)
+    assert (agent.token_secret_digests, agent.webhook_secret_digest) == ((None,), None)
 
 
 # Gateway gating (state x tool)
@@ -1387,6 +1946,25 @@ def test_manual_activation_checks_prerequisites_and_opens_the_line(env, capsys):
     assert call_tool(env, token, "reserve-slot").json().get("detail") != gateway.NOT_ACCEPTING
     with pytest.raises(SystemExit, match="already has provisioning"):
         manual(env)
+
+
+def test_manual_activation_accepts_a_ledger_calendar_without_an_account(env):
+    owner = headers(env)
+    approve_scripts(env, owner)
+    execute(
+        env["url"],
+        "UPDATE clinics SET bolna_agent_id='77777777-7777-4777-8777-777777777777' WHERE id=%s",
+        (CLINIC,),
+    )
+    with pytest.raises(SystemExit, match="calendar"):
+        manual(env)
+    execute(
+        env["url"],
+        "UPDATE doctors SET booking_calendar_id='ledger:' || id::text WHERE clinic_id=%s",
+        (CLINIC,),
+    )
+    manual(env)
+    assert state(env, owner)["state"] == "active"
 
 
 def test_hand_configured_clinic_cannot_start_api_provisioning(env):

@@ -1,10 +1,12 @@
+import subprocess
+import sys
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from clinic_voice.api import app, tool_caller
-from clinic_voice.config import get_settings
+from clinic_voice.config import ENV_FILE, Settings, get_settings
 from clinic_voice.credentials import parse
 from clinic_voice.deps import ToolCaller
 
@@ -90,3 +92,31 @@ def test_tenant_in_body_rejected(authorized):
         },
     )
     assert r.status_code == 422
+
+
+def test_tests_never_read_dotenv(tmp_path, monkeypatch):
+    """The suite must not see a developer's .env (real secrets, conftest.py). Production
+    still reads .env from the working directory."""
+    (tmp_path / ".env").write_text(
+        "DATABASE_URL=postgresql://from-dotenv/x\nBOLNA_API_KEY=synthetic-dotenv-key\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("BOLNA_API_KEY", raising=False)
+    monkeypatch.setenv("DATABASE_URL", "postgresql://from-env/x")
+    get_settings.cache_clear()
+    try:
+        settings = get_settings()
+        assert settings.bolna_api_key is None
+        assert settings.database_url.get_secret_value() == "postgresql://from-env/x"
+    finally:
+        get_settings.cache_clear()
+    # The declared production default, not conftest's override: config.ENV_FILE, and a fresh
+    # interpreter (no conftest) shows Settings is configured with it.
+    assert ENV_FILE == ".env"
+    code = (
+        "from clinic_voice.config import ENV_FILE, Settings\n"
+        "assert Settings.model_config['env_file'] == ENV_FILE == '.env'\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True, cwd=tmp_path)
+    explicit = Settings(_env_file=ENV_FILE)
+    assert explicit.bolna_api_key.get_secret_value() == "synthetic-dotenv-key"

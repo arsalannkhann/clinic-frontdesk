@@ -1275,7 +1275,7 @@ def test_callback_refuses_second_active_account(client, database, fake):
 # Logging and housekeeping
 
 
-def test_access_log_filter_installed_at_import():
+def test_access_log_filter_installed_at_import(tmp_path):
     import subprocess
     import sys
 
@@ -1288,7 +1288,8 @@ def test_access_log_filter_installed_at_import():
         "assert count() == 1\n"
     )
     env = {**os.environ, "DATABASE_URL": "postgresql://unused@localhost/unused_test"}
-    subprocess.run([sys.executable, "-c", code], check=True, env=env)
+    # From an empty directory, so no repository .env is reachable (the package is installed).
+    subprocess.run([sys.executable, "-c", code], check=True, env=env, cwd=tmp_path)
 
 
 def test_prune_oauth_states(database):

@@ -195,6 +195,29 @@ def record_consents(
     return kept
 
 
+def create_from_form(
+    conn,
+    keyring: Keyring,
+    clinic_id,
+    details: PatientDetails,
+    phone: tuple[str, bytes],
+    retention_until: datetime,
+    source: str,
+) -> UUID:
+    """A new patient for a booking whose name and phone were typed into a form (website,
+    chat confirmation card), inside the reservation transaction, with its consent grants.
+
+    Attach policy for form channels (ADR 0010): always a new row, never a match. A form
+    proves nothing about who owns a number (anyone can type any phone and name), so
+    attaching would let a stranger add bookings, consent or contact preferences to another
+    patient's record, and later lookups by that phone would mix the two people. Duplicate
+    rows for a returning patient are the accepted cost; staff can see both. The new row
+    takes the declines and language as given, since it is only this booking's patient."""
+    patient_id = _create(conn, keyring, clinic_id, details, phone, retention_until)
+    record_consents(conn, clinic_id, patient_id, details.consents, source, allow_revoke=True)
+    return patient_id
+
+
 def attach(
     conn,
     keyring: Keyring,

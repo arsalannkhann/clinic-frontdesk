@@ -224,10 +224,13 @@ def excluded_kinds(ports) -> tuple[str, ...] | None:
     return excluded or None
 
 
-def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None, exclude=None) -> list[Job]:
+def claim(
+    conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None, exclude=None, ids=None
+) -> list[Job]:
     """Lease up to `limit` due jobs to worker_id and commit (database clock throughout).
     `kinds` limits the claim to those kinds; `exclude` skips kinds (neither claimed nor
-    dead-lettered).
+    dead-lettered); `ids` limits it to those job ids (the inline confirm of one booking,
+    tick.confirm_inline).
 
     Due: pending with available_at <= now(), or processing with an expired lease. An expired
     job that already used all its attempts is dead-lettered ('lease_expired') instead of
@@ -237,6 +240,7 @@ def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None, exclude=No
     params = {
         "kinds": list(kinds) if kinds is not None else None,
         "exclude": list(exclude) if exclude else None,
+        "ids": list(ids) if ids is not None else None,
         "limit": limit,
         "worker": worker_id,
         "lease": lease,
@@ -244,6 +248,7 @@ def claim(conn, worker_id, limit=10, lease=DEFAULT_LEASE, kinds=None, exclude=No
     kind_filter = (
         "(%(kinds)s::text[] IS NULL OR kind = ANY(%(kinds)s::text[]))"
         " AND (%(exclude)s::text[] IS NULL OR kind <> ALL(%(exclude)s::text[]))"
+        " AND (%(ids)s::uuid[] IS NULL OR id = ANY(%(ids)s::uuid[]))"
     )
     exhausted = conn.execute(
         f"""WITH stale AS (
@@ -485,14 +490,15 @@ HOUSEKEEPING_INTERVAL = 600.0
 
 
 def _default_housekeeping(conn, ports=None):
-    """Prune expired OAuth states; move contacts whose job is gone to review
+    """Prune expired OAuth states and old public rate-limit windows; move contacts whose job is gone to review
     (reminders.sweep_lost); backfill reminders of confirmed appointments
     (reminders.schedule_due, outbound-enabled clinics only); with a Bolna port, also enqueue
     (bounded) reconciliation of call sessions that have no final provider status."""
-    from clinic_voice import reminders
+    from clinic_voice import ratelimit, reminders
     from clinic_voice.calendar_accounts import prune_oauth_states
 
     prune_oauth_states(conn)
+    ratelimit.prune(conn)
     reminders.sweep_lost(conn)
     reminders.schedule_due(conn)
     if ports is not None and getattr(ports, "bolna", None) is not None:

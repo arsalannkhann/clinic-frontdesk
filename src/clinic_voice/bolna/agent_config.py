@@ -8,19 +8,28 @@ payload has never been sent to Bolna. Nothing here makes network calls or persis
 Credentials: the tool token is an argument, injected only into the in-memory payload (each
 tool's `api_token`, which Bolna sends as the Authorization header). Pass REDACTED to build a
 payload for review; redact() strips tokens from a compiled payload before it is printed.
+The optional webhook URL (webhook_url()) carries a webhook-scope token as its last path
+segment (ADR 0007); redact() strips that too.
 """
 
 import copy
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from clinic_voice.bolna.gateway import SUPPORTED_LANGUAGES
 from clinic_voice.config import LOOPBACK_HOSTS
-from clinic_voice.credentials import GATEWAY_SCOPES, parse_any
+from clinic_voice.credentials import GATEWAY_SCOPES, PREFIXES, parse, parse_any
 
 REDACTED = "<redacted>"
+# Anything shaped like a tenant credential (credentials.PATTERNS, any scope), unanchored and
+# with a secret of any length, so redact() finds tokens wherever they sit in a string.
+CREDENTIAL_SHAPE = re.compile(
+    rf"(?:{'|'.join(sorted(PREFIXES.values()))})_[0-9a-f]{{32}}\.[A-Za-z0-9_-]+"
+)
+WEBHOOK_PATH = "/v1/webhooks/bolna"
 PROMPTS = Path(__file__).resolve().parents[3] / "agents" / "prompts"
 # Call-context variables rendered by Bolna into prompts and tool params (SOURCE_REVIEW).
 CONTEXT_PARAMS = {
@@ -51,7 +60,9 @@ class AgentProfile:
     llm_provider: str = "openai"
     llm_model: str = "gpt-5.4-mini"
     llm_temperature: float = 1.0  # Bolna: GPT-5 models require temperature 1.
-    llm_max_tokens: int = 150
+    # Covers a spoken turn plus a full tool call: reserve_slot arguments alone exceed 150
+    # tokens, and a truncated call reaches Bolna as unparseable JSON (live test, 31 Oct 2026).
+    llm_max_tokens: int = 500
     transcriber_model: str = "saaras:v4"
     endpointing_ms: int = 500
     voices: dict = field(default_factory=lambda: {code: VoiceSettings() for code in ("en", "hi")})
@@ -179,14 +190,45 @@ TOOLS = (
 )
 
 
+def _no_userinfo(parts, what: str) -> None:
+    # user:pass@ would be sent to Bolna in the agent and logged with the URL by proxies.
+    if parts.username is not None or parts.password is not None:
+        raise ValueError(f"{what} must not carry a username or password")
+
+
 def gateway_url(value: str) -> str:
     parts = urlsplit(value or "")
     host = (parts.hostname or "").lower()
     if parts.query or parts.fragment or not host:
         raise ValueError("gateway URL must be an absolute base URL")
+    _no_userinfo(parts, "gateway URL")
     if parts.scheme != "https" and not (parts.scheme == "http" and host in LOOPBACK_HOSTS):
         raise ValueError("gateway URL must be https (http only for localhost)")
     return value.rstrip("/")
+
+
+def webhook_url(base_url: str, webhook_token: str) -> str:
+    """The agent's webhook_url: <base>/v1/webhooks/bolna/<webhook token>. Pass REDACTED to
+    build it for review. The result is a secret unless redacted."""
+    if webhook_token != REDACTED and parse(webhook_token, "webhook") is None:
+        raise ValueError("webhook token is not a tenant webhook credential")
+    return f"{gateway_url(base_url)}{WEBHOOK_PATH}/{webhook_token}"
+
+
+def _checked_webhook_url(value: str) -> str:
+    parts = urlsplit(value or "")
+    host = (parts.hostname or "").lower()
+    if parts.query or parts.fragment or not host:
+        raise ValueError("webhook URL must be an absolute URL")
+    _no_userinfo(parts, "webhook URL")
+    segment = parts.path.rpartition("/")[2]
+    if segment != REDACTED and parse(segment, "webhook") is None:
+        # The token is the last path segment (webhook_url()); nothing may follow it (no
+        # trailing slash), and only a webhook credential's shape is redact()ed by shape.
+        raise ValueError("webhook URL must end with a webhook token")
+    if parts.scheme != "https" and not (parts.scheme == "http" and host in LOOPBACK_HOSTS):
+        raise ValueError("webhook URL must be https (http only for localhost)")
+    return value
 
 
 def load_prompt(name: str = "receptionist", directory: Path = PROMPTS) -> str:
@@ -300,9 +342,11 @@ def compile_agent(
     tool_token: str,
     profile: AgentProfile | None = None,
     prompt: str | None = None,
+    webhook_url: str | None = None,
 ) -> dict:
     """The full agent payload for one clinic. `clinic` needs name and timezone. The result
-    holds the tool token (unless REDACTED); keep it in memory and never persist it."""
+    holds the tool token (unless REDACTED) and, when given, the webhook URL (build it with
+    webhook_url()); keep it in memory and never persist it."""
     profile = profile or AgentProfile()
     base = prompt if prompt is not None else load_prompt()
     active = profile.active_language
@@ -349,27 +393,43 @@ def compile_agent(
             "call_terminate": profile.call_terminate,
         },
     }
+    config = {
+        "agent_name": f"{name} receptionist"[:120],
+        "agent_welcome_message": (
+            f"Namaste, this is the AI assistant for {name}. How can I help you today?"
+        ),
+        "tasks": [task],
+    }
+    if webhook_url is not None:
+        # The only webhook field the create docs define (SOURCE_REVIEW): no header or secret.
+        config["webhook_url"] = _checked_webhook_url(webhook_url)
     return {
-        "agent_config": {
-            "agent_name": f"{name} receptionist"[:120],
-            "agent_welcome_message": (
-                f"Namaste, this is the AI assistant for {name}. How can I help you today?"
-            ),
-            "tasks": [task],
-        },
+        "agent_config": config,
         "agent_prompts": {"task_1": {"system_prompt": system_prompt(base, clinic)}},
     }
 
 
+def _redact_shapes(value):
+    if isinstance(value, str):
+        return CREDENTIAL_SHAPE.sub(REDACTED, value)
+    if isinstance(value, dict):
+        return {key: _redact_shapes(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_shapes(item) for item in value]
+    return value
+
+
 def redact(payload: dict) -> dict:
-    """A deep copy with every tool api_token replaced."""
+    """A copy with every tool api_token replaced and every credential-shaped string (the
+    webhook URL's token, wherever it sits) redacted. The original is left intact."""
     result = copy.deepcopy(payload)
-    for task in result.get("agent_config", {}).get("tasks", []):
+    config = result.get("agent_config", {})
+    for task in config.get("tasks", []):
         params = task.get("tools_config", {}).get("api_tools", {}).get("tools_params", {})
         for entry in params.values():
             if "api_token" in entry:
                 entry["api_token"] = f"Bearer {REDACTED}"
-    return result
+    return _redact_shapes(result)
 
 
 def load_clinic(conn, clinic_id) -> dict:
