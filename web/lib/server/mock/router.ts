@@ -263,7 +263,8 @@ function seedState(): State {
       for (const [open, close] of hoursFor(doctor.id, date, state)) {
         let cursor = open;
         while (cursor < close) {
-          const service = SERVICES.find((s) => s.id === doctor.service_ids[Math.floor(random() * doctor.service_ids.length)])!;
+          const serviceId = doctor.service_ids[Math.floor(random() * doctor.service_ids.length)];
+          const service = SERVICES.find((s) => s.id === serviceId)!;
           const end = cursor + service.duration_minutes * MINUTE;
           if (end > close) break;
           if (random() < 0.42) {
