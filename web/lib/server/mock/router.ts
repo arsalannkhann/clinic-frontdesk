@@ -102,6 +102,8 @@ interface ChatSession {
   proposals: Map<string, Proposal>;
   lastProposal: Proposal | null;
   messages: { role: "user" | "assistant"; text: string; created_at: string }[];
+  /** The quick replies last offered, for restoring the conversation after a reload. */
+  quick: string[];
   turns: number;
 }
 
@@ -228,6 +230,15 @@ function seedState(): State {
       scripts_approved: true,
       test_calls_enabled: false,
       include_reference_in_messages: false,
+      tagline: PROFILE.tagline,
+      address: PROFILE.address,
+      map_url: PROFILE.map_url,
+      phone_display: PROFILE.phone_display,
+      email: PROFILE.email,
+      hours_note: PROFILE.hours_note,
+      about: PROFILE.about,
+      voice_number: PROFILE.voice_number,
+      chat_enabled: PROFILE.chat_enabled,
     },
     doctors: DOCTORS.map((d) => ({
       id: d.id,
@@ -539,7 +550,12 @@ function patientFields(body: Record<string, unknown>, requireConsent: boolean): 
 
 function publicRoutes(state: State, method: string, rest: string[], url: URLSearchParams, body: Record<string, unknown>): UpstreamResult {
   const path = rest.join("/");
-  if (method === "GET" && path === "") return ok(PROFILE);
+  if (method === "GET" && path === "") {
+    // The public profile follows what the owner saves in Settings > Clinic profile.
+    const profile: Record<string, unknown> = { ...PROFILE, name: state.clinic.name, timezone: state.clinic.timezone };
+    for (const field of PROFILE_FIELDS) profile[field] = state.clinic[field] ?? null;
+    return ok(profile);
+  }
   if (method === "GET" && path === "services") {
     return ok(SERVICES.map(({ buffer: _buffer, ...s }) => s));
   }
@@ -721,16 +737,47 @@ function chatReply(state: State, session: ChatSession, text: string): UpstreamRe
   return say("I can help you book an appointment, check our hours and location, or arrange a call back. What would you like to do?");
 }
 
+function publicProposal(proposal: Proposal) {
+  const doctor = doctorById(proposal.doctor_id)!;
+  const service = serviceById(proposal.service_id)!;
+  return {
+    id: proposal.id,
+    doctor_name: doctor.name,
+    service_name: service.name,
+    starts_at: isoIst(proposal.starts),
+    expires_at: isoIst(proposal.expires),
+  };
+}
+
 function chatRoutes(state: State, method: string, rest: string[], body: Record<string, unknown>): UpstreamResult {
-  if (method !== "POST") return fail(405, "method_not_allowed", "Method not allowed.");
-  if (rest[0] === "clinics" && rest[2] === "sessions" && rest.length === 3) {
-    const session: ChatSession = { id: hex(16), created: Date.now(), proposals: new Map(), lastProposal: null, messages: [], turns: 0 };
+  if (method === "POST" && rest[0] === "clinics" && rest[2] === "sessions" && rest.length === 3) {
+    const session: ChatSession = {
+      id: hex(16),
+      created: Date.now(),
+      proposals: new Map(),
+      lastProposal: null,
+      messages: [{ role: "assistant", text: GREETING, created_at: isoIst(Date.now()) }],
+      quick: QUICK,
+      turns: 0,
+    };
     state.chats.set(session.id, session);
     return ok({ session_id: session.id, greeting: GREETING, quick_replies: QUICK }, 201);
   }
   if (rest[0] !== "sessions" || !rest[1]) return fail(404, "not_found", "Not found.");
   const session = state.chats.get(rest[1]);
   if (!session) return fail(404, "session_not_found", "This conversation has ended. Start a new one.");
+  if (method === "GET" && rest.length === 2) {
+    // The transcript for a reload: messages in order, the open proposal (if still bookable)
+    // and the quick replies last offered.
+    const open = session.lastProposal;
+    const live = open && !open.consumed && open.expires > Date.now() ? publicProposal(open) : null;
+    return ok({
+      messages: session.messages.map(({ role, text }) => ({ role, text })),
+      proposal: live,
+      quick_replies: session.quick,
+    });
+  }
+  if (method !== "POST") return fail(405, "method_not_allowed", "Method not allowed.");
   if (rest[2] === "messages" && rest.length === 3) {
     const text = typeof body.text === "string" ? body.text.trim() : "";
     if (!text || text.length > 1000) return fail(422, "invalid_text", "Messages can be up to 1000 characters.");
@@ -738,9 +785,11 @@ function chatRoutes(state: State, method: string, rest: string[], body: Record<s
     session.turns += 1;
     session.messages.push({ role: "user", text, created_at: isoIst(Date.now()) });
     const reply = chatReply(state, session, text);
-    for (const m of (reply.body as { messages: { role: "assistant"; text: string }[] }).messages) {
+    const replyBody = reply.body as { messages: { role: "assistant"; text: string }[]; quick_replies: string[] };
+    for (const m of replyBody.messages) {
       session.messages.push({ ...m, created_at: isoIst(Date.now()) });
     }
+    session.quick = replyBody.quick_replies;
     return reply;
   }
   if (rest[2] === "proposals" && rest[3] && rest[4] === "confirm" && rest.length === 5) {
@@ -762,7 +811,14 @@ function chatRoutes(state: State, method: string, rest: string[], body: Record<s
       phone: patient.phone,
       channel: "chat",
     });
-    return ok(bookingResult(appt), 202);
+    const result = bookingResult(appt);
+    session.messages.push({
+      role: "assistant",
+      text: `You're booked for ${result.service_name} with ${result.doctor_name} on ${formatSlot(proposal.starts)}. Your reference is ${result.reference}.`,
+      created_at: isoIst(Date.now()),
+    });
+    session.quick = [];
+    return ok(result, 202);
   }
   return fail(404, "not_found", "Not found.");
 }
@@ -874,7 +930,12 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
       if (!state.clinic.outbound_enabled) {
         return fail(409, "outbound_disabled", "Outbound calling is turned off for this clinic. The owner can turn it on in Settings.");
       }
-      return fail(409, "no_from_number", "No outbound caller number is set up yet. The owner needs to connect one before calls can be placed.");
+      if (!MOCK_OUTBOUND.has_from_number) {
+        return fail(409, "no_from_number", "No outbound caller number is set up yet. The owner needs to connect one before calls can be placed.");
+      }
+      // Mock mode never dials anyone: the request is only marked as calling.
+      item.status = "calling";
+      return ok({ status: "calling", execution_id: `mock-${hex(8)}` }, 202);
     }
     if (action === "resolve" && method === "POST") {
       if (!canWrite(user)) return forbidden();
@@ -897,6 +958,9 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
     if (!conversation) return fail(404, "not_found", "That conversation was not found.");
     return ok(conversation);
   }
+  if (first === "outbound-status" && rest.length === 1 && method === "GET") {
+    return ok({ enabled: state.clinic.outbound_enabled, ...MOCK_OUTBOUND });
+  }
   if (first === "stats" && method === "GET") {
     const today = istDate(Date.now());
     const weekEnd = dayStart(addDays(today, 7));
@@ -914,8 +978,26 @@ function staffRoutes(state: State, user: StaffUser, method: string, rest: string
   return fail(404, "not_found", "Not found.");
 }
 
-const OWNER_ONLY = new Set(["scripts_approved", "test_calls_enabled", "include_reference_in_messages"]);
-const CLINIC_FIELDS = new Set([
+/**
+ * Mock outbound readiness: a calling number and an outbound agent are "configured", so the
+ * owner's outbound toggle alone decides whether Call now is available. Nothing is dialled.
+ */
+const MOCK_OUTBOUND = { has_from_number: true, has_outbound_agent: true } as const;
+
+const OWNER_ONLY = new Set(["outbound_enabled", "scripts_approved", "test_calls_enabled", "include_reference_in_messages"]);
+const PROFILE_FIELDS = [
+  "tagline",
+  "address",
+  "map_url",
+  "phone_display",
+  "email",
+  "hours_note",
+  "about",
+  "voice_number",
+  "chat_enabled",
+] as const;
+const CLINIC_FIELDS = new Set<string>([
+  ...PROFILE_FIELDS,
   "name",
   "timezone",
   "lead_time_minutes",

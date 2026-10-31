@@ -112,6 +112,9 @@ export interface ChatReply {
   quick_replies: string[];
 }
 
+/** GET /v1/chat/sessions/{id}: the whole transcript so far, for a reload. */
+export type ChatTranscript = ChatReply;
+
 export interface ProposalConfirmBody {
   name: string;
   phone: string;
@@ -254,6 +257,26 @@ export interface ClinicConfig {
   scripts_approved: boolean;
   test_calls_enabled: boolean;
   include_reference_in_messages: boolean;
+  /*
+   * Public profile fields (the GET /v1/public/clinics/{slug} shape), assumed to be read and
+   * written through GET/PATCH /v1/admin/clinic. Optional until the backend adds them.
+   */
+  tagline?: string | null;
+  address?: string | null;
+  map_url?: string | null;
+  phone_display?: string | null;
+  email?: string | null;
+  hours_note?: string | null;
+  about?: string | null;
+  voice_number?: string | null;
+  chat_enabled?: boolean;
+}
+
+/** GET /v1/staff/outbound-status. */
+export interface OutboundStatus {
+  enabled: boolean;
+  has_from_number: boolean;
+  has_outbound_agent: boolean;
 }
 
 export interface AdminDoctor {
