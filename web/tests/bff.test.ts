@@ -370,6 +370,12 @@ describe("public and chat proxy", () => {
     expect(deleted.status).toBe(404);
     expect(calls).toHaveLength(1);
   });
+
+  it("exports GET and POST from the chat route file, so the transcript GET reaches the handler", async () => {
+    const route = await import("@/app/api/chat/[...path]/route");
+    expect(route.GET).toBe(chatHandler);
+    expect(route.POST).toBe(chatHandler);
+  });
 });
 
 describe("client IP and proxy secret", () => {
