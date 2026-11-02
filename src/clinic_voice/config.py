@@ -1,4 +1,5 @@
 import ipaddress
+import re
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
@@ -141,6 +142,13 @@ class Settings(BaseSettings):
     # Asked once instead when the model answers 429 (a per-minute cap that is not over within
     # a short wait). Providers such as Groq cap each model separately.
     chat_llm_fallback_model: str | None = None
+    # Claude on Microsoft Foundry (ADR 0013, providers/claude_llm.py). With the key set, chat
+    # and voice run on claude_model at https://<resource>.services.ai.azure.com/anthropic;
+    # CHAT_LLM_REASONING_EFFORT is its effort and CHAT_LLM_MAX_TOKENS its max_tokens. The
+    # CHAT_LLM_* model, when also configured, answers any call Claude fails.
+    claude_foundry_resource: str | None = None
+    claude_foundry_api_key: SecretStr | None = None
+    claude_model: str = "claude-haiku-5-5"
     chat_max_turns: int = Field(default=40, ge=1, le=500)
     chat_session_ip_per_hour: int = Field(default=10, ge=1, le=10000)
     chat_message_ip_per_hour: int = Field(default=120, ge=1, le=100000)
@@ -191,6 +199,17 @@ class Settings(BaseSettings):
             raise ValueError("speech_base_url is required")
         return checked.rstrip("/")
 
+    @field_validator("claude_foundry_resource")
+    @classmethod
+    def _foundry_resource(cls, value):
+        if value is None or not value.strip():
+            return None
+        value = value.strip().lower()
+        # The Azure resource name only: it becomes a host name label, never a URL.
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,62}", value):
+            raise ValueError("claude_foundry_resource must be an Azure resource name")
+        return value
+
     @field_validator("chat_llm_auth_header")
     @classmethod
     def _chat_header(cls, value):
@@ -208,8 +227,13 @@ class Settings(BaseSettings):
         True when it is unset there (edge.require_proxy answers 503)."""
         return self.public_proxy_secret is None and not self.local_environment()
 
+    def claude_configured(self) -> bool:
+        key = self.claude_foundry_api_key
+        return bool(self.claude_foundry_resource and key and key.get_secret_value())
+
     def chat_configured(self) -> bool:
-        return bool(self.chat_llm_api_key and self.chat_llm_api_key.get_secret_value())
+        key = self.chat_llm_api_key
+        return self.claude_configured() or bool(key and key.get_secret_value())
 
     def speech_configured(self) -> bool:
         return bool(self.speech_api_key and self.speech_api_key.get_secret_value())
