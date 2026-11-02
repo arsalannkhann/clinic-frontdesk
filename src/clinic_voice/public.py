@@ -100,9 +100,10 @@ def clinic_by_slug(conn, slug: str):
     return row
 
 
-def profile(clinic, voice_configured: bool = False) -> dict:
+def profile(clinic, voice_configured: bool = False, call_configured: bool = False) -> dict:
     """The public clinic profile. `voice_configured` is Settings.voice_configured(): the web
-    voice receptionist is offered where the chat is on and both keys are set."""
+    voice receptionist is offered where the chat is on and both keys are set;
+    `call_configured` (Settings.call_configured()) offers the real-time call instead."""
     return {
         "name": clinic["name"],
         "tagline": clinic["public_tagline"],
@@ -116,6 +117,7 @@ def profile(clinic, voice_configured: bool = False) -> dict:
         "voice_number": clinic["public_voice_number"],
         "chat_enabled": clinic["public_chat_enabled"],
         "voice_enabled": bool(clinic["public_chat_enabled"] and voice_configured),
+        "realtime_call": bool(clinic["public_chat_enabled"] and call_configured),
     }
 
 

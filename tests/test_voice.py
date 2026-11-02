@@ -509,7 +509,7 @@ def test_profile_voice_enabled(env, monkeypatch, speech_key, chat_key, chat_on, 
     body = env["client"].get(f"/v1/public/clinics/{SLUG}").json()
     assert body["chat_enabled"] is chat_on
     assert body["voice_enabled"] is expected
-    assert list(body)[-2:] == ["chat_enabled", "voice_enabled"]
+    assert list(body)[-3:] == ["chat_enabled", "voice_enabled", "realtime_call"]
 
 
 def test_sarvam_api_key_is_a_fallback_name(monkeypatch):

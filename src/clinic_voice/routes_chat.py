@@ -10,12 +10,13 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 
-from clinic_voice import chat, public, voice
+from clinic_voice import calls, chat, public, voice
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database
 from clinic_voice.edge import client_ip, require_proxy
 from clinic_voice.providers import chat_llm, speech
 from clinic_voice.schemas import (
+    ChatCallOut,
     ChatConfirmRequest,
     ChatMessageRequest,
     ChatSessionOut,
@@ -103,6 +104,15 @@ def send_voice(session_id: str, body: ChatVoiceRequest, request: Request, respon
         llm_for(settings),
         speech_for(settings),
     )
+
+
+@router.post("/sessions/{session_id}/call", response_model=ChatCallOut)
+def start_call(session_id: str, request: Request, response: Response):
+    """A real-time call on the session (ADR 0014): the LiveKit URL and a participant token for
+    a new room the call agent joins. 429 rate_limited (CALL_IP_PER_HOUR); 503 call_unavailable
+    (LiveKit or the chat model not configured)."""
+    response.headers["Cache-Control"] = "no-store"
+    return calls.start(_url(), get_settings(), session_id, client_ip(request))
 
 
 @router.post("/sessions/{session_id}/voice/greeting", response_model=ChatVoiceGreetingOut)

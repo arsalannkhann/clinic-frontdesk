@@ -554,6 +554,7 @@ def test_public_profile_and_catalogue(env):
         "voice_number": None,
         "chat_enabled": False,
         "voice_enabled": False,
+        "realtime_call": False,
     }
     assert r.headers["cache-control"] == "public, max-age=60"
     services = client.get(f"{BASE}/services").json()

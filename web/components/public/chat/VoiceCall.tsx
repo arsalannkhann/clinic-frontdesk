@@ -109,7 +109,7 @@ function Orb({ phase, muted, reduced }: { phase: CallPhase; muted: boolean; redu
 }
 
 /** What was booked on the call, in the clinic's time zone. */
-function BookedPanel({ booking, timeZone }: { booking: BookingResult; timeZone: string }) {
+export function BookedPanel({ booking, timeZone }: { booking: BookingResult; timeZone: string }) {
   return (
     <section aria-label="Booking" className="w-full rounded-lg border border-ok/30 bg-raised p-4 text-left">
       <div className="mb-2 flex items-center gap-2 text-ok">

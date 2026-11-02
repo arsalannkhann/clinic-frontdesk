@@ -66,7 +66,11 @@ def clinic_profile(slug: str, request: Request, response: Response):
     with database() as conn:
         settings = get_settings()
         _read(conn, request, "read-ip", settings.public_read_ip_per_hour)
-        return public.profile(public.clinic_by_slug(conn, slug), settings.voice_configured())
+        return public.profile(
+            public.clinic_by_slug(conn, slug),
+            settings.voice_configured(),
+            settings.call_configured(),
+        )
 
 
 @router.get("/services", response_model=list[PublicServiceOut])

@@ -24,6 +24,7 @@ import {
 } from "@/lib/chat";
 import { cx } from "@/lib/cx";
 import { ProposalCard } from "./ProposalCard";
+import { RealtimeCall } from "./RealtimeCall";
 import { usePrefersReducedMotion, VoiceCall } from "./VoiceCall";
 
 export const OPEN_CHAT_EVENT = "aster:open-chat";
@@ -46,6 +47,8 @@ interface ChatWidgetProps {
   callHref: string | null;
   /** The clinic offers the web voice call (profile voice_enabled). */
   voiceEnabled?: boolean;
+  /** Calls are real time over WebRTC (profile realtime_call, ADR 0014). */
+  realtimeCall?: boolean;
 }
 
 export { VOICE_MESSAGES } from "./VoiceCall";
@@ -522,6 +525,7 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
   const small = useMediaQuery(SMALL_SCREEN_QUERY);
   const modal = shown !== null && small;
   const voiceEnabled = props.voiceEnabled ?? false;
+  const CallScreen = props.realtimeCall ? RealtimeCall : VoiceCall;
 
   useEffect(() => {
     const onOpen = (event: Event) => {
@@ -602,7 +606,7 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
           className={cx(DIALOG_CLASS, callOpen && "animate-rise")}
         >
           {callMounted ? (
-            <VoiceCall
+            <CallScreen
               clinicName={props.clinicName}
               timeZone={props.timeZone}
               callHref={props.callHref}

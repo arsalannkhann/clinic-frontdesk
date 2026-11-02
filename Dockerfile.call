@@ -1,0 +1,16 @@
+# The real-time call agent (ADR 0014): a LiveKit Agents worker, built for LiveKit Cloud agent
+# hosting. The API image is Dockerfile; this one adds the `call` extra on its own lock
+# (livekit-plugins-anthropic needs anthropic<2).
+FROM python:3.12-slim
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+WORKDIR /app
+COPY requirements-call.lock ./
+RUN pip install --no-cache-dir -r requirements-call.lock
+COPY pyproject.toml ./
+COPY src ./src
+RUN pip install --no-deps . && useradd --uid 10001 --create-home app
+USER app
+# Bakes the VAD and turn detector models into the image. Settings are read at import, so the
+# build passes a placeholder database URL; the real one comes from the deployment's secrets.
+RUN DATABASE_URL=postgresql://build@localhost/build python -m clinic_voice.call_worker download-files
+CMD ["python", "-m", "clinic_voice.call_worker", "start"]
