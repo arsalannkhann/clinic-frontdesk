@@ -1,0 +1,53 @@
+name: Deploy call agent
+# After CI passes on main, redeploys the real-time call agent to LiveKit Cloud when the merge
+# changed its code (src/, Dockerfile.call, requirements-call.lock, pyproject.toml). Vercel
+# deploys the website and API on its own. Needs the LIVEKIT_URL, LIVEKIT_API_KEY and
+# LIVEKIT_API_SECRET repository secrets; run it by hand from the Actions tab to force a deploy.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deploy-call-agent
+  cancel-in-progress: false
+env:
+  LK_VERSION: 2.19.2
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 2
+      - name: Did the agent change?
+        id: changed
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ] ||
+             git diff --name-only HEAD~1 HEAD |
+               grep -qE '^(src/|Dockerfile\.call$|requirements-call\.lock$|pyproject\.toml$)'; then
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No agent changes in this merge; nothing to deploy."
+          fi
+      - name: Install the LiveKit CLI
+        if: steps.changed.outputs.deploy == 'true'
+        run: |
+          curl -fsSL "https://github.com/livekit/livekit-cli/releases/download/v${LK_VERSION}/lk_${LK_VERSION}_linux_amd64.tar.gz" |
+            sudo tar -xz -C /usr/local/bin lk
+          lk --version
+      - name: Deploy
+        if: steps.changed.outputs.deploy == 'true'
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+        run: scripts/deploy-call-agent.sh

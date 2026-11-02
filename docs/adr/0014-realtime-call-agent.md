@@ -38,7 +38,9 @@ Calls run as a streaming pipeline on LiveKit (open-source Agents framework, Live
 - The worker is deployed to LiveKit Cloud agent hosting in Mumbai (ap-south), next to the
   India-hosted speech models, from Dockerfile.call on its own lock (requirements-call.lock,
   because livekit-plugins-anthropic needs anthropic<2). The half-duplex /voice endpoint stays
-  as the fallback when LiveKit is not configured.
+  as the fallback when LiveKit is not configured. scripts/deploy-call-agent.sh deploys it;
+  the "Deploy call agent" workflow runs that after CI passes on main whenever a merge changes
+  the agent's code (LIVEKIT_* repository secrets).
 - The website's call screen (web/components/public/chat/RealtimeCall.tsx, livekit-client)
   is chosen when the profile reports realtime_call. It joins with echo cancellation and noise
   suppression, plays the agent's audio, shows the agent's state ("lk.agent.state"), live

@@ -5,6 +5,7 @@ import json
 import httpx2
 import pytest
 from anthropic import AnthropicFoundry
+from anthropic.types import Message
 
 from clinic_voice.chat import TOOLS
 from clinic_voice.config import Settings
@@ -200,6 +201,27 @@ def test_build_selects_provider():
     assert isinstance(chat_llm.build(_settings(chat_llm_api_key="g")), chat_llm.OpenAIChatLLM)
     assert _settings(**claude).voice_configured() is False  # Speech key still needed.
     assert "foundry-test-key" not in repr(both)
+
+
+def test_console_key_takes_precedence(monkeypatch):
+    seen = {}
+
+    def create(self, **body):
+        seen["base_url"] = str(self._client.base_url)
+        return Message.model_validate(_message([{"type": "text", "text": "Hi."}]))
+
+    monkeypatch.setattr("anthropic.resources.messages.Messages.create", create)
+    settings = _settings(
+        anthropic_api_key="console-test-key",
+        claude_foundry_resource="test-resource",
+        claude_foundry_api_key="foundry-test-key",
+    )
+    assert settings.claude_direct() and settings.chat_configured()
+    adapter = chat_llm.build(settings)
+    assert isinstance(adapter, claude_llm.ClaudeChatLLM)
+    assert adapter.complete(CONVERSATION, []).text == "Hi."
+    assert seen["base_url"].startswith("https://api.anthropic.com")
+    assert "console-test-key" not in repr(adapter) + repr(settings)
 
 
 def test_resource_must_be_a_name():

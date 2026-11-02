@@ -56,7 +56,7 @@ CALL_KEEPALIVE_SECONDS = 300.0
 
 
 class ClaudeLLM(lk_anthropic.LLM):
-    """Claude on Foundry with thinking disabled and the configured effort (ADR 0013)."""
+    """Claude (Claude API or Foundry, ADR 0013) with thinking disabled and its effort."""
 
     def chat(self, **kwargs):
         extra = dict(kwargs.pop("extra_kwargs", None) or {})
@@ -69,17 +69,22 @@ class ClaudeLLM(lk_anthropic.LLM):
 
 
 def make_llm():
-    key = settings.claude_foundry_api_key.get_secret_value()
-    client = anthropic.AsyncAnthropicFoundry(
-        resource=settings.claude_foundry_resource,
-        api_key=key,
-        max_retries=1,
+    options = {
+        "max_retries": 1,
         # The caller talks for several seconds between replies; httpx's default 5 s idle expiry
         # would close the connection each time and add a TLS handshake (about 0.7 s) per reply.
-        http_client=anthropic.DefaultAsyncHttpxClient(
+        "http_client": anthropic.DefaultAsyncHttpxClient(
             limits=httpx.Limits(keepalive_expiry=CALL_KEEPALIVE_SECONDS)
         ),
-    )
+    }
+    if settings.claude_direct():
+        key = settings.anthropic_api_key.get_secret_value()
+        client = anthropic.AsyncAnthropic(api_key=key, **options)
+    else:
+        key = settings.claude_foundry_api_key.get_secret_value()
+        client = anthropic.AsyncAnthropicFoundry(
+            resource=settings.claude_foundry_resource, api_key=key, **options
+        )
     return ClaudeLLM(
         model=settings.claude_model,
         client=client,

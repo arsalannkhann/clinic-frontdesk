@@ -31,3 +31,8 @@ Microsoft Foundry resource (Global Standard, hosted on Azure).
 About $0.10 / $0.50 per million input / output tokens: roughly $0.004 per booking call.
 Measured locally: a spoken booking call completes end to end with Claude answering every
 turn; model calls take about 1-2 s.
+
+Amendment (2 November 2026): ANTHROPIC_API_KEY, a Claude Console key, runs the same model on
+the Claude API (api.anthropic.com) and takes precedence over Foundry when set; the request
+shape, thinking and effort settings are unchanged. `scripts/set-claude-key.sh` stores the key
+in the API's Vercel project and the call agent's LiveKit secrets without echoing it.
