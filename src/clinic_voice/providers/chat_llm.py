@@ -14,6 +14,7 @@ header or provider message is ever placed in an exception or a log line.
 
 import json
 import re
+import time
 from dataclasses import dataclass, field
 from threading import Lock
 from typing import Protocol
@@ -99,6 +100,20 @@ def parse_reply(data) -> LLMReply:
     return LLMReply(text, calls)
 
 
+RETRY_AFTER_MAX_SECONDS = 3.0
+
+
+def _retry_after(response) -> float | None:
+    """Seconds a 429 asks us to wait, when short enough to wait inside a turn."""
+    if response.status_code != 429:
+        return None
+    try:
+        wait = float(response.headers.get("retry-after", ""))
+    except ValueError:
+        return None
+    return wait if 0 <= wait <= RETRY_AFTER_MAX_SECONDS else None
+
+
 class OpenAIChatLLM:
     """ChatLLMPort over an OpenAI-compatible /chat/completions endpoint."""
 
@@ -126,6 +141,14 @@ class OpenAIChatLLM:
             return {"Authorization": f"Bearer {self._key}"}
         return {"api-subscription-key": self._key}
 
+    def _post(self, body) -> httpx.Response:
+        try:
+            return self._client.post(self._url, json=body, headers=self._headers())
+        except httpx.TimeoutException:
+            raise ChatLLMError("timeout") from None
+        except httpx.HTTPError:
+            raise ChatLLMError("transport") from None
+
     def complete(self, messages, tools):
         body = {
             "model": self._model,
@@ -136,12 +159,11 @@ class OpenAIChatLLM:
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
-        try:
-            response = self._client.post(self._url, json=body, headers=self._headers())
-        except httpx.TimeoutException:
-            raise ChatLLMError("timeout") from None
-        except httpx.HTTPError:
-            raise ChatLLMError("transport") from None
+        response = self._post(body)
+        wait = _retry_after(response)
+        if response.status_code == 429 and wait is not None:
+            time.sleep(wait)  # A per-minute token limit (Groq free tier): one short retry.
+            response = self._post(body)
         if response.status_code in (401, 403):
             raise ChatLLMError("unauthorized")
         if not response.is_success:

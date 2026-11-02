@@ -2,7 +2,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { UpstreamRequest } from "@/lib/server/upstream";
-import { mockUpstream, resetMockState } from "@/lib/server/mock/router";
+import { MOCK_TRANSCRIPTS, mockUpstream, resetMockState } from "@/lib/server/mock/router";
 import { MOCK_PASSWORD } from "@/lib/server/mock/fixtures";
 
 const call = (method: string, path: string, opts: Partial<UpstreamRequest> = {}) =>
@@ -64,6 +64,35 @@ describe("dev mock API", () => {
     const profile = (await call("GET", "/v1/public/clinics/aster-dental")).body as { tagline: string; chat_enabled: boolean };
     expect(profile.tagline).toBe("New line");
     expect(profile.chat_enabled).toBe(false);
+  });
+
+  it("offers the web voice call and answers a voice turn with a canned transcript", async () => {
+    const profile = (await call("GET", "/v1/public/clinics/aster-dental")).body as { voice_enabled: boolean };
+    expect(profile.voice_enabled).toBe(true);
+    const created = await call("POST", "/v1/chat/clinics/aster-dental/sessions", { body: "{}" });
+    const id = (created.body as { session_id: string }).session_id;
+    const greeting = await call("POST", `/v1/chat/sessions/${id}/voice/greeting`);
+    expect(greeting.status).toBe(200);
+    expect(greeting.body).toMatchObject({ audio: null, audio_mime: "audio/mpeg" });
+    expect((greeting.body as { text: string }).text).toMatch(/AI receptionist/);
+
+    const audio = "UklGR".padEnd(8000, "A");
+    const turn = await call("POST", `/v1/chat/sessions/${id}/voice`, { body: JSON.stringify({ audio }) });
+    expect(turn.status).toBe(200);
+    const body = turn.body as { transcript: string; audio: null; proposal: { id: string } | null; messages: unknown[] };
+    expect(body.transcript).toBe(MOCK_TRANSCRIPTS[0]);
+    expect(body.audio).toBeNull();
+    expect(body.proposal?.id).toBeTruthy();
+    expect(body.messages.length).toBeGreaterThan(0);
+    // The heard line is in the transcript like a typed one.
+    const transcript = (await call("GET", `/v1/chat/sessions/${id}`)).body as { messages: { role: string; text: string }[] };
+    expect(transcript.messages[1]).toEqual({ role: "user", text: MOCK_TRANSCRIPTS[0] });
+
+    const short = await call("POST", `/v1/chat/sessions/${id}/voice`, { body: JSON.stringify({ audio: "UklGRg==" }) });
+    expect(short.status).toBe(422);
+    expect(short.body).toMatchObject({ error: { code: "no_speech" } });
+    expect((await call("POST", `/v1/chat/sessions/${id}/voice`, { body: "{}" })).status).toBe(422);
+    expect((await call("POST", "/v1/chat/sessions/0123456789abcdef0123456789abcdef/voice/greeting")).status).toBe(404);
   });
 
   it("returns a chat transcript for a reload, and 404 for an unknown session", async () => {

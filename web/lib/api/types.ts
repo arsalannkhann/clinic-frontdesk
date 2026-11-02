@@ -24,6 +24,8 @@ export interface ClinicProfile {
   about: string | null;
   voice_number: string | null;
   chat_enabled: boolean;
+  /** The web voice call ("Talk to the AI receptionist"). Read as false when absent. */
+  voice_enabled: boolean;
 }
 
 export interface PublicService {
@@ -114,6 +116,26 @@ export interface ChatReply {
 
 /** GET /v1/chat/sessions/{id}: the whole transcript so far, for a reload. */
 export type ChatTranscript = ChatReply;
+
+/** POST /v1/chat/sessions/{id}/voice body: one utterance, base64 16 kHz mono 16-bit PCM WAV. */
+export interface VoiceTurnBody {
+  audio: string;
+}
+
+/** POST /v1/chat/sessions/{id}/voice: the chat reply plus what was heard and the spoken reply. */
+export interface VoiceTurnReply extends ChatReply {
+  transcript: string;
+  /** Base64 audio of the reply, or null when the server has no speech for it. */
+  audio: string | null;
+  audio_mime?: string;
+}
+
+/** POST /v1/chat/sessions/{id}/voice/greeting. */
+export interface VoiceGreeting {
+  text: string;
+  audio: string | null;
+  audio_mime?: string;
+}
 
 export interface ProposalConfirmBody {
   name: string;

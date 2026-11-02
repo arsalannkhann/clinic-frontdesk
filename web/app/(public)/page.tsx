@@ -1,4 +1,4 @@
-import { ArrowRight, CalendarDays, ChevronDown, MapPin, Phone, Sparkles } from "lucide-react";
+import { ArrowRight, AudioLines, CalendarDays, ChevronDown, MapPin, Phone, Sparkles } from "lucide-react";
 import type { Metadata } from "next";
 import Link from "next/link";
 
@@ -80,6 +80,8 @@ export default async function HomePage() {
   const number = receptionNumber(profile);
   const serviceName = new Map((services ?? []).map((s) => [s.id, s.name]));
   const jsonLd = dentistJsonLd(profile, services, doctors, siteUrl());
+  // The web voice call runs inside the chat panel, so it needs chat too.
+  const voiceCall = profile.chat_enabled && profile.voice_enabled;
 
   return (
     <>
@@ -103,7 +105,14 @@ export default async function HomePage() {
             <ButtonLink href="/book" size="lg" icon={<CalendarDays className="size-4" aria-hidden="true" />}>
               Book online
             </ButtonLink>
-            <CallReceptionist profile={profile} />
+            {voiceCall ? (
+              <OpenChatButton mode="call" variant="secondary" size="lg" className="gap-2.5">
+                <AudioLines className="size-4" aria-hidden="true" />
+                Talk to our AI receptionist
+              </OpenChatButton>
+            ) : (
+              <CallReceptionist profile={profile} />
+            )}
           </div>
           {profile.hours_note ? <p className="mt-6 text-sm text-ink-3">{profile.hours_note}</p> : null}
         </div>
@@ -153,10 +162,21 @@ export default async function HomePage() {
               <Phone className="size-6 text-accent" aria-hidden="true" />
               <h3 className="font-display text-xl">Phone</h3>
               <p className="flex-1 text-ink-2">
-                Our receptionist answers every call, books and reads your reference back. Prefer a person? Ask to be called back.
+                {voiceCall
+                  ? "Talk to our AI receptionist in your browser: it finds a time and you confirm it on screen. You can also call the clinic, or ask to be called back."
+                  : "Our receptionist answers every call, books and reads your reference back. Prefer a person? Ask to be called back."}
               </p>
+              {voiceCall ? (
+                <OpenChatButton mode="call" variant="quiet" size="md" className="justify-start">
+                  Talk to our AI receptionist <ArrowRight className="size-4" aria-hidden="true" />
+                </OpenChatButton>
+              ) : null}
               <div className="flex flex-wrap gap-x-4 gap-y-1">
-                {number ? (
+                {number && voiceCall ? (
+                  <a href={number.href} className="text-sm text-ink-2 tnum hover:text-ink">
+                    Or call {number.display}
+                  </a>
+                ) : number ? (
                   <a href={number.href} className="inline-flex items-center gap-1 font-semibold text-accent tnum hover:text-accent-strong">
                     {number.display} <ArrowRight className="size-4" aria-hidden="true" />
                   </a>

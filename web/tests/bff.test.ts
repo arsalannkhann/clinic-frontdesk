@@ -6,7 +6,7 @@ import { ConfigError, readConfig } from "@/lib/server/config";
 import { normaliseError } from "@/lib/server/errors";
 import { clientIp, isSameOriginWrite, readSessionToken, requestOrigin } from "@/lib/server/request";
 import { ADMIN_ROUTES, adminHandler, chatHandler, publicHandler, STAFF_ROUTES, staffHandler } from "@/lib/server/routes";
-import { pickQuery, readJsonBody, readLimitedText, safeSegments } from "@/lib/server/upstream";
+import { MAX_BODY_BYTES, pickQuery, readJsonBody, readLimitedText, safeSegments, VOICE_MAX_BODY_BYTES } from "@/lib/server/upstream";
 import { missingProductionSettings } from "@/instrumentation";
 import { getClinic, getDoctors, getServices } from "@/lib/server/publicData";
 
@@ -374,6 +374,55 @@ describe("public and chat proxy", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("maps the voice turn and greeting, by POST only", async () => {
+    await chatHandler(request("/api/chat/sessions/abc/voice", { method: "POST", body: '{"audio":"UklGRg=="}' }), ctx(["sessions", "abc", "voice"]));
+    await chatHandler(request("/api/chat/sessions/abc/voice/greeting", { method: "POST" }), ctx(["sessions", "abc", "voice", "greeting"]));
+    expect(calls.map((c) => c.url)).toEqual([`${API}/v1/chat/sessions/abc/voice`, `${API}/v1/chat/sessions/abc/voice/greeting`]);
+    expect(calls[0]!.init.body).toBe('{"audio":"UklGRg=="}');
+    expect(calls[1]!.init.body).toBeNull();
+    for (const [method, segments] of [
+      ["GET", ["sessions", "abc", "voice"]],
+      ["GET", ["sessions", "abc", "voice", "greeting"]],
+      ["POST", ["sessions", "abc", "voice", "other"]],
+      ["POST", ["sessions", "abc", "voice", "greeting", "x"]],
+      ["POST", ["sessions", "voice"]],
+    ] as const) {
+      const init = method === "POST" ? { method, body: "{}" } : { method };
+      const response = await chatHandler(request(`/api/chat/${segments.join("/")}`, init), ctx([...segments]));
+      expect(response.status).toBe(404);
+    }
+    expect(calls).toHaveLength(2);
+  });
+
+  it("rejects a cross-origin voice turn before calling the API", async () => {
+    const response = await chatHandler(
+      request("/api/chat/sessions/abc/voice", { method: "POST", headers: { origin: "https://evil.example" }, body: '{"audio":"AA=="}' }),
+      ctx(["sessions", "abc", "voice"]),
+    );
+    expect(response.status).toBe(403);
+    expect(calls).toHaveLength(0);
+  });
+
+  it("allows about 1.5 MB on the voice turn only, and 32 KB everywhere else", async () => {
+    const audio = JSON.stringify({ audio: "A".repeat(700_000) });
+    const voice = await chatHandler(request("/api/chat/sessions/abc/voice", { method: "POST", body: audio }), ctx(["sessions", "abc", "voice"]));
+    expect(voice.status).toBe(200);
+    expect(calls).toHaveLength(1);
+    const message = await chatHandler(request("/api/chat/sessions/abc/messages", { method: "POST", body: audio }), ctx(["sessions", "abc", "messages"]));
+    expect(message.status).toBe(413);
+    const greeting = await chatHandler(
+      request("/api/chat/sessions/abc/voice/greeting", { method: "POST", body: audio }),
+      ctx(["sessions", "abc", "voice", "greeting"]),
+    );
+    expect(greeting.status).toBe(413);
+    const huge = JSON.stringify({ audio: "A".repeat(1_700_000) });
+    const tooBig = await chatHandler(request("/api/chat/sessions/abc/voice", { method: "POST", body: huge }), ctx(["sessions", "abc", "voice"]));
+    expect(tooBig.status).toBe(413);
+    expect(calls).toHaveLength(1);
+    expect(MAX_BODY_BYTES).toBe(32 * 1024);
+    expect(VOICE_MAX_BODY_BYTES).toBe(1536 * 1024);
+  });
+
   it("exports GET and POST from the chat route file, so the transcript GET reaches the handler", async () => {
     const route = await import("@/app/api/chat/[...path]/route");
     expect(route.GET).toBe(chatHandler);
@@ -422,6 +471,8 @@ describe("client IP and proxy secret", () => {
   it("sends the secret on server-side public page reads, and falls back when the API refuses", async () => {
     respond = () => json({ name: "Aster Dental Studio", timezone: "Asia/Kolkata" });
     expect((await getClinic())?.name).toBe("Aster Dental Studio");
+    // An API without the voice call omits voice_enabled: it reads as false.
+    expect((await getClinic())?.voice_enabled).toBe(false);
     expect(calls[0]!.url).toBe(`${API}/v1/public/clinics/aster-dental`);
     expect(upstreamHeaders().get("x-proxy-secret")).toBe(PROXY_SECRET);
     // An API without its own PUBLIC_PROXY_SECRET answers 503 unavailable on every public
@@ -553,6 +604,21 @@ describe("errors and availability", () => {
     });
     expect(await readLimitedText(stream, 1024)).toBe('{"name":"Anaya ✓"}');
     expect(await readLimitedText(null, 1024)).toBe("");
+  });
+});
+
+describe("security headers", () => {
+  it("allows the microphone on this origin only and media from blob: and data:", async () => {
+    const config = (await import("@/next.config")).default;
+    const rules = await config.headers!();
+    const headers = rules[0]!.headers;
+    const value = (key: string) => headers.find((h: { key: string }) => h.key === key)!.value;
+    const permissions = value("Permissions-Policy");
+    expect(permissions).toContain("microphone=(self)");
+    for (const denied of ["camera=()", "geolocation=()", "payment=()", "usb=()"]) expect(permissions).toContain(denied);
+    const csp = value("Content-Security-Policy");
+    expect(csp).toContain("media-src 'self' blob: data:");
+    expect(csp).toContain("frame-ancestors 'none'");
   });
 });
 

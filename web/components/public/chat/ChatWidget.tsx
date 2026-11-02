@@ -1,11 +1,11 @@
 "use client";
 
-import { Phone, RotateCcw, SendHorizontal, Sparkles, X } from "lucide-react";
+import { AudioLines, Phone, RotateCcw, SendHorizontal, Sparkles, X } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { Fragment, useCallback, useEffect, useReducer, useRef, useState, type FormEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
 
 import { api, ApiError, errorMessage, newIdempotencyKey } from "@/lib/api/client";
-import type { BookingResult, ChatReply, ChatSessionCreated, ChatTranscript } from "@/lib/api/types";
+import type { BookingResult, ChatReply, ChatSessionCreated, ChatTranscript, VoiceGreeting, VoiceTurnReply } from "@/lib/api/types";
 import {
   chatReducer,
   CONFIRM_ERRORS,
@@ -18,23 +18,63 @@ import {
   readStoredSession,
   storeBooking,
   storeSession,
+  TURN_IN_PROGRESS,
   validMessage,
   visibleCount,
   type ChatLine,
 } from "@/lib/chat";
 import { cx } from "@/lib/cx";
+import { createPlayer, type Player } from "@/lib/voice/player";
+import { createRecorder, MicError, type Recorder } from "@/lib/voice/recorder";
+import { CallBar, type CallPhase } from "./CallBar";
 import { ProposalCard } from "./ProposalCard";
 
 export const OPEN_CHAT_EVENT = "aster:open-chat";
 
-export function openChat(prompt?: string) {
-  window.dispatchEvent(new CustomEvent(OPEN_CHAT_EVENT, { detail: { prompt } }));
+/** "call" opens the chat straight into a web voice call with the assistant. */
+export type ChatOpenMode = "text" | "call";
+
+export function openChat(prompt?: string, options: { mode?: ChatOpenMode } = {}) {
+  window.dispatchEvent(new CustomEvent(OPEN_CHAT_EVENT, { detail: { prompt, mode: options.mode ?? "text" } }));
 }
 
 interface ChatWidgetProps {
   clinicName: string;
   timeZone: string;
   callHref: string | null;
+  /** The clinic offers the web voice call (profile voice_enabled). */
+  voiceEnabled?: boolean;
+}
+
+/* ---------- voice call messages ---------- */
+
+export const VOICE_MESSAGES = {
+  micDenied:
+    "Microphone access was blocked, so the voice call couldn't start. You can keep typing here, or allow the microphone in your browser settings and tap Talk again.",
+  micUnsupported: "This browser can't record audio for a voice call. You can keep typing here.",
+  micMissing: "No microphone was found. You can keep typing here.",
+  micFailed: "The microphone couldn't be started. You can keep typing here.",
+  noSpeech: "Didn't catch that. Please say it again.",
+  allowMic: "Allow microphone access when your browser asks.",
+  unavailable: "Voice calls are unavailable right now. You can keep typing here, book online, or call the clinic.",
+  failed: "I couldn't get a reply just now. Please say that again.",
+  sessionLost: "Sorry, the conversation restarted. Please say that again.",
+} as const;
+
+function micMessage(error: unknown): string {
+  if (!(error instanceof MicError)) return VOICE_MESSAGES.micFailed;
+  if (error.kind === "denied") return VOICE_MESSAGES.micDenied;
+  if (error.kind === "unsupported") return VOICE_MESSAGES.micUnsupported;
+  if (error.kind === "no_device") return VOICE_MESSAGES.micMissing;
+  return VOICE_MESSAGES.micFailed;
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+interface CallSession {
+  recorder: Recorder;
+  player: Player;
+  active: boolean;
 }
 
 function usePrefersReducedMotion(): boolean {
@@ -90,7 +130,21 @@ function Bubble({ line, animate }: { line: ChatLine; animate: boolean }) {
   );
 }
 
-export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidgetProps & { onClose?: () => void }) {
+export function ChatPanel({
+  clinicName,
+  timeZone,
+  callHref,
+  voiceEnabled = false,
+  open = true,
+  callRequest = 0,
+  onClose,
+}: ChatWidgetProps & {
+  onClose?: () => void;
+  /** False while the launcher hides the panel: a voice call ends when it closes. */
+  open?: boolean;
+  /** Incremented to start a voice call (the "Talk to our AI receptionist" buttons). */
+  callRequest?: number;
+}) {
   const [state, dispatch] = useReducer(chatReducer, initialChat);
   const [draft, setDraft] = useState("");
   const router = useRouter();
@@ -103,6 +157,13 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   // One message at a time: set while a send is in flight, so Enter, a quick reply or Try again
   // can't send a second message before the first is answered.
   const inFlight = useRef(false);
+  // The first start or resume, so a voice call started on open waits for it instead of
+  // creating a second session.
+  const sessionReady = useRef<Promise<unknown> | null>(null);
+  const [call, setCall] = useState<{ phase: CallPhase; muted: boolean } | null>(null);
+  // During a call: a brief note in the call bar. Otherwise: why the call ended or never began.
+  const [callMessage, setCallMessage] = useState<string | null>(null);
+  const callRef = useRef<CallSession | null>(null);
 
   const startSession = useCallback(async (): Promise<string | null> => {
     dispatch({ type: "starting" });
@@ -148,8 +209,7 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
     if (initialised.current) return;
     initialised.current = true;
     const stored = readStoredSession();
-    if (stored) void resumeSession(stored);
-    else void startSession();
+    sessionReady.current = stored ? resumeSession(stored) : startSession();
   }, [resumeSession, startSession]);
 
   useEffect(() => {
@@ -160,7 +220,7 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
   useEffect(() => {
     const log = logRef.current;
     if (log) log.scrollTop = log.scrollHeight;
-  }, [state.lines.length, state.typing, state.proposalState]);
+  }, [state.lines.length, state.typing, state.proposalState, callMessage]);
 
   // Expire the card when the server-side proposal does.
   useEffect(() => {
@@ -175,6 +235,198 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
     const last = state.lines[state.lines.length - 1];
     if (last?.role === "assistant") setLastAnimated(last.id);
   }, [state.lines]);
+
+  /* ---------- voice call ---------- */
+
+  const setPhase = useCallback((phase: CallPhase) => setCall((current) => (current ? { ...current, phase } : current)), []);
+
+  /** Ends the call and releases the microphone; `message` says why, when it ended itself. */
+  const endCall = useCallback((message: string | null = null) => {
+    const current = callRef.current;
+    callRef.current = null;
+    if (current) {
+      current.active = false;
+      current.recorder.stop();
+      current.player.dispose();
+    }
+    setCall(null);
+    setCallMessage(message);
+  }, []);
+
+  const listen = useCallback(() => {
+    const current = callRef.current;
+    if (!current?.active) return;
+    current.recorder.resume();
+    setPhase("listening");
+  }, [setPhase]);
+
+  /** Plays a spoken reply with the microphone paused, so the assistant never hears itself. */
+  const speak = useCallback(
+    async (audio: string | null | undefined, mime: string | undefined) => {
+      const current = callRef.current;
+      if (!current?.active || !audio) return;
+      current.recorder.pause();
+      setPhase("speaking");
+      await current.player.play(audio, mime);
+    },
+    [setPhase],
+  );
+
+  /** One spoken turn: the utterance goes up, the transcript and reply come back into the log. */
+  const voiceTurn = useCallback(
+    async (audio: string) => {
+      const current = callRef.current;
+      if (!current?.active) return;
+      current.recorder.pause();
+      if (inFlight.current) {
+        // A typed message is still being answered; this utterance is dropped.
+        setCallMessage(TURN_IN_PROGRESS);
+        await wait(1500);
+        listen();
+        return;
+      }
+      inFlight.current = true;
+      setCallMessage(null);
+      setPhase("thinking");
+      dispatch({ type: "voicePending" });
+      let pause = 0;
+      try {
+        const id = sessionRef.current ?? (await startSession());
+        if (!id) {
+          dispatch({ type: "voiceIdle" });
+          endCall(VOICE_MESSAGES.unavailable);
+          return;
+        }
+        const reply = await api<VoiceTurnReply>(`/api/chat/sessions/${encodeURIComponent(id)}/voice`, {
+          method: "POST",
+          body: { audio },
+        });
+        dispatch({ type: "voiceTurn", transcript: reply.transcript ?? "", reply });
+        inFlight.current = false;
+        await speak(reply.audio, reply.audio_mime);
+      } catch (error) {
+        dispatch({ type: "voiceIdle" });
+        const code = error instanceof ApiError ? error.code : "request_failed";
+        const status = error instanceof ApiError ? error.status : 0;
+        if (code === "no_speech") {
+          setCallMessage(VOICE_MESSAGES.noSpeech);
+        } else if (code === "turn_in_progress") {
+          // The server is still answering an earlier turn: wait, then listen again.
+          setCallMessage(TURN_IN_PROGRESS);
+          pause = 1500;
+        } else if (code === "conversation_limit") {
+          endCall();
+          dispatch({ type: "replyFailed", message: CONVERSATION_LIMIT, final: true });
+          return;
+        } else if (code === "voice_unavailable" || status === 503) {
+          endCall(VOICE_MESSAGES.unavailable);
+          return;
+        } else if (status === 404) {
+          storeSession(null);
+          sessionRef.current = null;
+          dispatch({ type: "sessionLost" });
+          await startSession();
+          setCallMessage(VOICE_MESSAGES.sessionLost);
+        } else if (status === 429) {
+          setCallMessage(error instanceof ApiError ? error.message : VOICE_MESSAGES.failed);
+          pause = 3000;
+        } else {
+          setCallMessage(VOICE_MESSAGES.failed);
+        }
+      } finally {
+        inFlight.current = false;
+      }
+      if (pause) await wait(pause);
+      listen();
+    },
+    [endCall, listen, setPhase, speak, startSession],
+  );
+
+  const startCall = useCallback(async () => {
+    if (callRef.current) return;
+    // Unlocked inside the tap, so mobile browsers let the replies play later.
+    const player = createPlayer();
+    player.unlock();
+    const session: CallSession = {
+      player,
+      active: true,
+      recorder: createRecorder({
+        onSpeechStart: () => {
+          if (!session.active) return;
+          setCallMessage(null);
+          setPhase("hearing");
+        },
+        onUtterance: (audio) => void voiceTurn(audio),
+      }),
+    };
+    callRef.current = session;
+    setCallMessage(VOICE_MESSAGES.allowMic);
+    setCall({ phase: "connecting", muted: false });
+    try {
+      await session.recorder.start();
+    } catch (error) {
+      if (callRef.current === session) endCall(micMessage(error));
+      return;
+    }
+    if (!session.active) return;
+    setCallMessage(null);
+    session.recorder.pause();
+    if (sessionReady.current) await sessionReady.current.catch(() => undefined);
+    const id = sessionRef.current ?? (await startSession());
+    if (!session.active) return;
+    if (!id) {
+      endCall(VOICE_MESSAGES.unavailable);
+      return;
+    }
+    try {
+      const greeting = await api<VoiceGreeting>(`/api/chat/sessions/${encodeURIComponent(id)}/voice/greeting`, { method: "POST" });
+      if (!session.active) return;
+      dispatch({ type: "voiceGreeting", text: greeting.text ?? "" });
+      await speak(greeting.audio, greeting.audio_mime);
+    } catch (error) {
+      if (error instanceof ApiError && (error.code === "voice_unavailable" || error.status === 503)) {
+        endCall(VOICE_MESSAGES.unavailable);
+        return;
+      }
+      // Without a greeting the call still works: go straight to listening.
+    }
+    listen();
+  }, [endCall, listen, setPhase, speak, startSession, voiceTurn]);
+
+  function toggleMute() {
+    const current = callRef.current;
+    if (!current || !call) return;
+    const muted = !call.muted;
+    current.recorder.setMuted(muted);
+    setCall({ ...call, muted });
+  }
+
+  // A call request from outside (the landing page's Talk buttons), once per request.
+  const handledRequest = useRef(0);
+  useEffect(() => {
+    if (!callRequest || callRequest === handledRequest.current) return;
+    handledRequest.current = callRequest;
+    if (voiceEnabled) void startCall();
+  }, [callRequest, voiceEnabled, startCall]);
+
+  // Hiding the panel ends the call.
+  useEffect(() => {
+    if (!open && callRef.current) endCall();
+  }, [open, endCall]);
+
+  // Unmounting releases the microphone and stops playback.
+  useEffect(
+    () => () => {
+      const current = callRef.current;
+      callRef.current = null;
+      if (current) {
+        current.active = false;
+        current.recorder.stop();
+        current.player.dispose();
+      }
+    },
+    [],
+  );
 
   /** Sends one message; false when nothing was sent because a reply is still pending. */
   async function send(text: string, retried = false): Promise<boolean> {
@@ -332,6 +584,17 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
           </div>
         </div>
         <div className="flex items-center gap-1">
+          {voiceEnabled && !call ? (
+            <button
+              type="button"
+              onClick={() => void startCall()}
+              className="rounded-md p-2 text-accent hover:bg-accent-tint hover:text-accent-strong"
+              aria-label="Talk to the AI receptionist"
+              title="Talk to the AI receptionist"
+            >
+              <AudioLines className="size-5" aria-hidden="true" />
+            </button>
+          ) : null}
           {callHref ? (
             <a href={callHref} className="rounded-md p-2 text-ink-2 hover:bg-sunk hover:text-ink" aria-label="Call the clinic">
               <Phone className="size-4" aria-hidden="true" />
@@ -344,6 +607,18 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
           ) : null}
         </div>
       </header>
+
+      {call ? (
+        <CallBar
+          phase={call.phase}
+          muted={call.muted}
+          message={callMessage}
+          reduced={reduced}
+          onMute={toggleMute}
+          onEnd={() => endCall()}
+          onInterrupt={() => callRef.current?.player.stop()}
+        />
+      ) : null}
 
       <div ref={logRef} role="log" aria-live="polite" aria-label="Conversation" className="flex flex-1 flex-col gap-3 overflow-y-auto px-4 py-4">
         {state.status === "starting" && state.lines.length === 0 ? (
@@ -376,6 +651,11 @@ export function ChatPanel({ clinicName, timeZone, callHref, onClose }: ChatWidge
                 <RotateCcw className="size-3.5" aria-hidden="true" /> Try again
               </button>
             ) : null}
+          </div>
+        ) : null}
+        {!call && callMessage ? (
+          <div role="alert" className="rounded-md border border-warn/30 bg-warn-tint/70 px-3 py-2 text-sm text-ink">
+            <p>{callMessage}</p>
           </div>
         ) : null}
         {state.error ? (
@@ -467,6 +747,7 @@ const FOCUSABLE =
 export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
   const [open, setOpen] = useState(false);
   const [mounted, setMounted] = useState(false);
+  const [callRequest, setCallRequest] = useState(0);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const wasOpen = useRef(false);
@@ -474,9 +755,10 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
   const modal = open && small;
 
   useEffect(() => {
-    const onOpen = () => {
+    const onOpen = (event: Event) => {
       setMounted(true);
       setOpen(true);
+      if ((event as CustomEvent<{ mode?: ChatOpenMode }>).detail?.mode === "call") setCallRequest((n) => n + 1);
     };
     window.addEventListener(OPEN_CHAT_EVENT, onOpen);
     return () => window.removeEventListener(OPEN_CHAT_EVENT, onOpen);
@@ -533,7 +815,8 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
     }
   }
 
-  if (!props.enabled) return null;
+  const { enabled, ...panelProps } = props;
+  if (!enabled) return null;
 
   return (
     <>
@@ -550,7 +833,7 @@ export function ChatLauncher(props: ChatWidgetProps & { enabled: boolean }) {
           open && "animate-rise",
         )}
       >
-        {mounted ? <ChatPanel {...props} onClose={() => setOpen(false)} /> : null}
+        {mounted ? <ChatPanel {...panelProps} open={open} callRequest={callRequest} onClose={() => setOpen(false)} /> : null}
       </div>
       <button
         ref={buttonRef}

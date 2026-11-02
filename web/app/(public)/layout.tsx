@@ -25,6 +25,7 @@ export default async function PublicLayout({ children }: { children: React.React
       <SiteFooter profile={profile} />
       <ChatLauncher
         enabled={profile.chat_enabled}
+        voiceEnabled={profile.voice_enabled}
         clinicName={profile.name}
         timeZone={profile.timezone}
         callHref={number?.href ?? null}

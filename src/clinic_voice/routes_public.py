@@ -64,8 +64,9 @@ def _read(conn, request, name, count):
 def clinic_profile(slug: str, request: Request, response: Response):
     response.headers["Cache-Control"] = CATALOGUE_CACHE
     with database() as conn:
-        _read(conn, request, "read-ip", get_settings().public_read_ip_per_hour)
-        return public.profile(public.clinic_by_slug(conn, slug))
+        settings = get_settings()
+        _read(conn, request, "read-ip", settings.public_read_ip_per_hour)
+        return public.profile(public.clinic_by_slug(conn, slug), settings.voice_configured())
 
 
 @router.get("/services", response_model=list[PublicServiceOut])

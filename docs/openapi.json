@@ -3556,6 +3556,222 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/voice": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Send Voice",
+        "description": "One spoken turn (ADR 0012): base64 16 kHz mono WAV in; the transcript, the same turn\nresult as a typed message, and the reply as base64 MP3 (null if synthesis failed) out.\n422 no_speech (nothing heard, no turn used); 503 voice_unavailable (no speech key, or\nspeech-to-text failed).",
+        "operationId": "send_voice_v1_chat_sessions__session_id__voice_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChatVoiceRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatVoiceTurnOut"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Gone"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        }
+      }
+    },
+    "/v1/chat/sessions/{session_id}/voice/greeting": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Voice Greeting",
+        "description": "The session's greeting text and its audio (base64 MP3, null if synthesis failed).",
+        "operationId": "voice_greeting_v1_chat_sessions__session_id__voice_greeting_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatVoiceGreetingOut"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Gone"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/proposals/{proposal_id}/confirm": {
       "post": {
         "tags": [
@@ -6078,6 +6294,112 @@
         ],
         "title": "ChatTurnOut"
       },
+      "ChatVoiceGreetingOut": {
+        "properties": {
+          "text": {
+            "type": "string",
+            "title": "Text"
+          },
+          "audio": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio"
+          },
+          "audio_mime": {
+            "type": "string",
+            "const": "audio/mpeg",
+            "title": "Audio Mime",
+            "default": "audio/mpeg"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "text",
+          "audio"
+        ],
+        "title": "ChatVoiceGreetingOut"
+      },
+      "ChatVoiceRequest": {
+        "properties": {
+          "audio": {
+            "type": "string",
+            "maxLength": 1400000,
+            "minLength": 1,
+            "title": "Audio"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "audio"
+        ],
+        "title": "ChatVoiceRequest"
+      },
+      "ChatVoiceTurnOut": {
+        "properties": {
+          "messages": {
+            "items": {
+              "$ref": "#/components/schemas/ChatMessageOut"
+            },
+            "type": "array",
+            "title": "Messages"
+          },
+          "proposal": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChatProposalOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "quick_replies": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Quick Replies"
+          },
+          "transcript": {
+            "type": "string",
+            "title": "Transcript"
+          },
+          "audio": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Audio"
+          },
+          "audio_mime": {
+            "type": "string",
+            "const": "audio/mpeg",
+            "title": "Audio Mime",
+            "default": "audio/mpeg"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "messages",
+          "quick_replies",
+          "transcript",
+          "audio"
+        ],
+        "title": "ChatVoiceTurnOut"
+      },
       "ClinicConfig": {
         "properties": {
           "id": {
@@ -7540,6 +7862,10 @@
           "chat_enabled": {
             "type": "boolean",
             "title": "Chat Enabled"
+          },
+          "voice_enabled": {
+            "type": "boolean",
+            "title": "Voice Enabled"
           }
         },
         "additionalProperties": false,
@@ -7555,7 +7881,8 @@
           "hours_note",
           "about",
           "voice_number",
-          "chat_enabled"
+          "chat_enabled",
+          "voice_enabled"
         ],
         "title": "PublicClinicOut"
       },

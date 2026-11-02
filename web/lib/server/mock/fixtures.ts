@@ -40,6 +40,7 @@ export const PROFILE: ClinicProfile = {
     "the X-ray, and agree a plan before anything starts. Every estimate is written down first.",
   voice_number: "+919000000100",
   chat_enabled: true,
+  voice_enabled: true,
 };
 
 interface ServiceSeed extends PublicService {

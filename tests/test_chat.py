@@ -672,6 +672,30 @@ def test_adapter_bearer_auth_and_errors():
     assert "test-key" not in repr(_adapter(ok))
 
 
+def test_adapter_retries_a_short_rate_limit_once(monkeypatch):
+    monkeypatch.setattr("clinic_voice.providers.chat_llm.time.sleep", lambda seconds: None)
+    calls = []
+
+    def limited_then_ok(request):
+        calls.append(1)
+        if len(calls) == 1:
+            return httpx.Response(429, headers={"retry-after": "2"}, text="slow down")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Hello"}}]})
+
+    assert _adapter(limited_then_ok).complete([], []).text == "Hello"
+    assert len(calls) == 2
+
+    calls.clear()
+
+    def long_wait(request):
+        calls.append(1)
+        return httpx.Response(429, headers={"retry-after": "30"}, text="slow down")
+
+    with pytest.raises(ChatLLMError) as raised:
+        _adapter(long_wait).complete([], [])
+    assert raised.value.code == "http_429" and len(calls) == 1
+
+
 def test_chat_settings_validation(monkeypatch):
     from clinic_voice.config import Settings
 
