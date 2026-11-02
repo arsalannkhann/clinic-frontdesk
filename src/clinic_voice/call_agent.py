@@ -96,10 +96,27 @@ class CallState:
         self.turn = chat.Turn(url, settings, clinic, session, address, keyring, hash_key, conn)
         self.turn.token, self.turn.voice = token, True
         self.greeting = chat.voice_greeting(clinic)
+        # Set by user_said for the turns after it: the reply must not wait on the database.
+        self._ended = False
+        self._capped = False
+        self._closed = False
 
     @property
     def session_id(self):
         return self.turn.session["id"]
+
+    def precheck(self, text: str) -> str:
+        """The outcome of a caller utterance decided without the database, so the reply can
+        start at once while user_said stores it: "emergency" by the text, "limit" or "capped"
+        when an earlier user_said found the call over its turn limit or the clinic over its
+        daily model cap. A turn that crosses a limit is therefore stopped one turn late."""
+        if self._ended:
+            return "limit"
+        if chat.EMERGENCY.search(text):
+            return "emergency"
+        if self._capped:
+            return "capped"
+        return "ok"
 
     def user_said(self, text: str) -> str:
         """Store one caller utterance as a user turn. Returns "ok", "emergency" (the caller
@@ -113,8 +130,10 @@ class CallState:
                 (turn.session["clinic_id"], turn.session["id"]),
             ).fetchone()
             if row is None or row["status"] != "active":
+                self._ended = True
                 return "limit"
             if row["turn_count"] >= self.settings.chat_max_turns:
+                self._ended = True
                 return "limit"
             conn.execute(
                 "UPDATE chat_sessions SET turn_count=turn_count + 1 WHERE clinic_id=%s AND id=%s",
@@ -126,6 +145,7 @@ class CallState:
             return "emergency"
         if not chat._model_call_allowed(turn):
             log.warning("call model daily cap reached session=%s", self.session_id)
+            self._capped = True
             return "capped"
         return "ok"
 
@@ -136,7 +156,8 @@ class CallState:
         return chat.fallback_text(self.clinic)
 
     def agent_said(self, text: str) -> None:
-        if text.strip():
+        # The goodbye can arrive after the call closed; it is not stored then.
+        if text.strip() and not self._closed:
             self.turn.store("assistant", {"text": text})
 
     def run_tool(self, call_id: str, name: str, arguments: dict | None) -> dict:
@@ -179,4 +200,5 @@ class CallState:
         }
 
     def close(self) -> None:
+        self._closed = True
         self.turn.close()
