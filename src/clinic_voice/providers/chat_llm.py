@@ -125,6 +125,8 @@ class OpenAIChatLLM:
         api_key: str,
         auth_header: str = "api-subscription-key",
         max_tokens: int = 1500,
+        reasoning_effort: str | None = None,
+        fallback_model: str | None = None,
     ):
         self._client = client
         self._url = base_url.rstrip("/") + "/chat/completions"
@@ -132,6 +134,8 @@ class OpenAIChatLLM:
         self._key = api_key
         self._auth_header = auth_header
         self._max_tokens = max_tokens
+        self._reasoning_effort = reasoning_effort
+        self._fallback_model = fallback_model
 
     def __repr__(self):
         return f"OpenAIChatLLM(model={self._model!r})"  # Never the key.
@@ -156,6 +160,8 @@ class OpenAIChatLLM:
             "max_tokens": self._max_tokens,
             "temperature": 0.2,
         }
+        if self._reasoning_effort:
+            body["reasoning_effort"] = self._reasoning_effort
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -164,6 +170,8 @@ class OpenAIChatLLM:
         if response.status_code == 429 and wait is not None:
             time.sleep(wait)  # A per-minute token limit (Groq free tier): one short retry.
             response = self._post(body)
+        if response.status_code == 429 and self._fallback_model:
+            response = self._post({**body, "model": self._fallback_model})
         if response.status_code in (401, 403):
             raise ChatLLMError("unauthorized")
         if not response.is_success:
@@ -211,4 +219,6 @@ def build(settings) -> ChatLLMPort | None:
         settings.chat_llm_api_key.get_secret_value(),
         settings.chat_llm_auth_header,
         settings.chat_llm_max_tokens,
+        settings.chat_llm_reasoning_effort,
+        settings.chat_llm_fallback_model,
     )

@@ -6388,6 +6388,16 @@
             "const": "audio/mpeg",
             "title": "Audio Mime",
             "default": "audio/mpeg"
+          },
+          "booking": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublicBookingOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false,

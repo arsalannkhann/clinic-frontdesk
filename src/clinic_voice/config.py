@@ -1,5 +1,6 @@
 import ipaddress
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlsplit
 
 from pydantic import AliasChoices, Field, SecretStr, field_validator
@@ -134,6 +135,12 @@ class Settings(BaseSettings):
     chat_llm_auth_header: str = "api-subscription-key"
     chat_llm_timeout_seconds: float = Field(default=25.0, ge=1.0, le=60.0)
     chat_llm_max_tokens: int = Field(default=1500, ge=64, le=8192)
+    # Sent as reasoning_effort when set (reasoning models such as gpt-oss on Groq): "low" spends
+    # far fewer reasoning tokens per call, so turns are faster and fit a per-minute token cap.
+    chat_llm_reasoning_effort: Literal["low", "medium", "high"] | None = None
+    # Asked once instead when the model answers 429 (a per-minute cap that is not over within
+    # a short wait). Providers such as Groq cap each model separately.
+    chat_llm_fallback_model: str | None = None
     chat_max_turns: int = Field(default=40, ge=1, le=500)
     chat_session_ip_per_hour: int = Field(default=10, ge=1, le=10000)
     chat_message_ip_per_hour: int = Field(default=120, ge=1, le=100000)

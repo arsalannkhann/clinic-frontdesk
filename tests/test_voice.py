@@ -16,10 +16,12 @@ from test_chat import (
     CLINIC,
     HASH_KEY,
     KEYS,
+    NAME,
     NOW,
     PROXY_SECRET,
     SLUG,
     assert_envelope,
+    call,
     propose_script,
     session_row,
     start,
@@ -31,7 +33,7 @@ from clinic_voice.config import get_settings
 from clinic_voice.crypto import Keyring
 from clinic_voice.db import connect
 from clinic_voice.providers import speech as speech_module
-from clinic_voice.providers.chat_llm import FakeChatLLM, LLMReply
+from clinic_voice.providers.chat_llm import ChatLLMError, FakeChatLLM, LLMReply
 from clinic_voice.providers.speech import FakeSpeech, SarvamSpeech, SpeechError
 
 HEARD = "SYNTHETIC-VOICE-MARKER I need a consultation"
@@ -124,7 +126,9 @@ def test_voice_turn_transcribes_answers_and_speaks(env, caplog):
         "transcript",
         "audio",
         "audio_mime",
+        "booking",
     }
+    assert body["booking"] is None
     assert body["transcript"] == HEARD
     assert body["messages"] == [{"role": "assistant", "text": "**Sure.** Which day suits you?"}]
     assert base64.b64decode(body["audio"]) == MP3 and body["audio_mime"] == "audio/mpeg"
@@ -137,7 +141,7 @@ def test_voice_turn_transcribes_answers_and_speaks(env, caplog):
     assert session_row(env["url"])["turn_count"] == 1
     # The model got the spoken-reply rules; neither audio nor transcript reached the log.
     system = env["fake"].calls[0]["messages"][0]["content"]
-    assert system.endswith(chat.VOICE_RULES) and "tap confirm" in system
+    assert system.endswith(chat.VOICE_RULES) and "the card below" not in system
     assert "SYNTHETIC-VOICE-MARKER" not in caplog.text and WAV[:40] not in caplog.text
 
 
@@ -146,7 +150,7 @@ def test_typed_turns_have_no_voice_rules(env):
     r = env["client"].post(f"/v1/chat/sessions/{session}/messages", json={"text": "hi"})
     assert r.status_code == 200
     system = env["fake"].calls[0]["messages"][0]["content"]
-    assert "Voice:" not in system and "tap confirm" not in system
+    assert "Voice:" not in system and "book_appointment" not in system
 
 
 def test_voice_turn_proposes_and_never_books(env):
@@ -159,6 +163,141 @@ def test_voice_turn_proposes_and_never_books(env):
     assert body["proposal"] is not None and body["quick_replies"] == chat.PROPOSAL_QUICK_REPLIES
     with connect(env["url"]) as conn:
         assert conn.execute("SELECT count(*) AS n FROM appointments").fetchone()["n"] == 0
+
+
+def appointments(env) -> list[dict]:
+    with connect(env["url"]) as conn:
+        return conn.execute("SELECT channel FROM appointments").fetchall()
+
+
+def test_a_call_books_by_voice_after_name_number_and_consent(env):
+    session = start(env)
+    env["speech"].transcripts = [
+        ("book a consultation", "en-IN"),
+        (f"I am {NAME}, nine eight seven six five 43210", "en-IN"),
+        ("yes", "en-IN"),
+    ]
+    env["fake"].script = propose_script()
+    held = speak(env, session).json()
+    assert held["proposal"] is not None and held["booking"] is None
+    system = env["fake"].calls[0]["messages"][0]["content"]
+    assert "book_appointment" in system and "the card" not in system
+    assert "Choices" not in system.split("Voice:")[0]
+    assert set(env["fake"].calls[0]["tools"]) == chat.VOICE_TOOL_NAMES
+    env["fake"].script = [LLMReply("That's 98765 43210. May the clinic contact you on it?")]
+    speak(env, session)
+    env["fake"].script = [
+        LLMReply(
+            None,
+            [call("book_appointment", name=NAME, phone="98765 43210", consent_contact=True)],
+        ),
+        LLMReply("Your request is in for Tuesday at ten."),
+    ]
+    body = speak(env, session).json()
+    assert body["booking"]["reference"] and body["booking"]["service_name"] == "Consultation"
+    assert body["proposal"] is None
+    assert appointments(env) == [{"channel": "chat"}]
+
+
+def test_a_booked_call_hears_the_booking_even_if_the_model_then_fails(env):
+    session = start(env)
+    env["speech"].transcripts = [
+        ("book a consultation", "en-IN"),
+        (f"I am {NAME}, 9876543210", "en-IN"),
+        ("yes", "en-IN"),
+    ]
+    env["fake"].script = propose_script()
+    speak(env, session)
+    env["fake"].script = [LLMReply("May the clinic contact you on that number? (Wait for reply)")]
+    assert speak(env, session).json()["messages"][0]["text"] == (
+        "May the clinic contact you on that number?"
+    )
+    env["fake"].script = [
+        LLMReply(
+            None, [call("book_appointment", name=NAME, phone="9876543210", consent_contact=True)]
+        ),
+        ChatLLMError("http_429"),
+    ]
+    body = speak(env, session).json()
+    assert body["booking"] is not None
+    text = body["messages"][0]["text"]
+    assert (
+        text.startswith("Your Consultation with Demo Doctor is requested for")
+        and "Sorry" not in text
+    )
+
+
+@pytest.mark.parametrize(
+    ("said", "error"),
+    [
+        (["book a consultation", "yes"], "name_not_given"),
+        (["book a consultation", f"I am {NAME}", "yes"], "number_not_confirmed"),
+        # The number in the same turn as the booking: never read back or consented to.
+        (["book a consultation", f"I am {NAME}", "9876543210 yes"], "number_not_confirmed"),
+    ],
+)
+def test_a_call_never_books_details_the_caller_did_not_give(env, said, error):
+    session = start(env)
+    env["speech"].transcripts = [(text, "en-IN") for text in said]
+    env["fake"].script = propose_script()
+    speak(env, session)
+    for _ in said[1:-1]:
+        env["fake"].script = [LLMReply("Go on.")]
+        speak(env, session)
+    env["fake"].script = [
+        LLMReply(
+            None, [call("book_appointment", name=NAME, phone="+919876543210", consent_contact=True)]
+        ),
+        LLMReply("Let me check."),
+    ]
+    assert speak(env, session).json()["booking"] is None
+    tool = [m for m in env["fake"].calls[-1]["messages"] if m["role"] == "tool"][-1]
+    assert json.loads(tool["content"])["error"] == error
+    assert appointments(env) == []
+
+
+def test_spoken_digits_reads_numerals_words_and_devanagari():
+    assert chat._spoken_digits("Nine eight seven six five, 43210") == "9876543210"
+    assert chat._spoken_digits("double nine oh one") == "9901"
+    assert chat._spoken_digits("मेरा नंबर ९८७६५४३२१० है") == "9876543210"
+
+
+def test_a_call_does_not_book_without_consent(env):
+    session = start(env)
+    env["speech"].transcripts = [("book a consultation", "en-IN"), ("no", "en-IN")]
+    env["fake"].script = propose_script()
+    speak(env, session)
+    env["fake"].script = [
+        LLMReply(
+            None,
+            [call("book_appointment", name=NAME, phone="+919876543210", consent_contact=False)],
+        ),
+        LLMReply("No problem."),
+    ]
+    assert speak(env, session).json()["booking"] is None
+    tool = [m for m in env["fake"].calls[-1]["messages"] if m["role"] == "tool"][-1]
+    assert json.loads(tool["content"]) == {"error": "consent_required"}
+    assert appointments(env) == []
+
+
+def test_typed_chat_cannot_book_by_tool(env):
+    session = start(env)
+    env["fake"].script = propose_script()
+    env["client"].post(f"/v1/chat/sessions/{session}/messages", json={"text": "book"})
+    env["fake"].script = [
+        LLMReply(
+            None, [call("book_appointment", name=NAME, phone="+919876543210", consent_contact=True)]
+        ),
+        LLMReply("ok"),
+    ]
+    r = env["client"].post(f"/v1/chat/sessions/{session}/messages", json={"text": "yes"})
+    assert r.status_code == 200 and "booking" not in r.json()
+    assert appointments(env) == []
+
+
+def test_spoken_indian_mobile_is_normalized():
+    for spoken in ["98765 43210", "+91 98765-43210", "098765 43210", "919876543210"]:
+        assert chat.BookArgs(name=NAME, phone=spoken, consent_contact=True).phone == "+919876543210"
 
 
 def test_hindi_reply_is_spoken_in_hindi(env):
@@ -324,13 +463,13 @@ def test_greeting_is_spoken_once_and_cached(env):
     assert a.status_code == 200, a.text
     assert a.headers["cache-control"] == "no-store"
     assert a.json() == {
-        "text": first["greeting"],
+        "text": "Hello, Synthetic Demo Clinic. I'm the AI receptionist. How can I help you today?",
         "audio": base64.b64encode(MP3).decode(),
         "audio_mime": "audio/mpeg",
     }
     b = env["client"].post(f"/v1/chat/sessions/{second['session_id']}/voice/greeting")
     assert b.json() == a.json()
-    assert env["speech"].tts_calls == [(first["greeting"], "en-IN")]
+    assert env["speech"].tts_calls == [(a.json()["text"], "en-IN")]
     assert session_row(env["url"])["turn_count"] == 0
 
 

@@ -98,15 +98,15 @@ describe("voice activity detection", () => {
     expect(state.phase).toBe("onset");
   });
 
-  it("ends the utterance after 800 ms of silence", () => {
-    const { events, state } = run([...frames(1000, LOUD), ...frames(800, QUIET)]);
+  it("ends the utterance after 600 ms of silence", () => {
+    const { events, state } = run([...frames(1000, LOUD), ...frames(600, QUIET)]);
     expect(events.map((e) => e.event.type)).toEqual(["start", "end"]);
-    expect(events[1]).toEqual({ at: 1800, event: { type: "end", voicedMs: 1000, silenceMs: 800, capped: false } });
+    expect(events[1]).toEqual({ at: 1600, event: { type: "end", voicedMs: 1000, silenceMs: 600, capped: false } });
     expect(state.phase).toBe("silence");
   });
 
-  it("keeps going through pauses shorter than 800 ms", () => {
-    const { events } = run([...frames(600, LOUD), ...frames(700, QUIET), ...frames(600, LOUD)]);
+  it("keeps going through pauses shorter than 600 ms", () => {
+    const { events } = run([...frames(600, LOUD), ...frames(500, QUIET), ...frames(600, LOUD)]);
     expect(events.map((e) => e.event.type)).toEqual(["start"]);
   });
 

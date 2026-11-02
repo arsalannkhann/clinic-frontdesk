@@ -5,7 +5,7 @@ import type { ReactNode } from "react";
 import { buttonClass, type ButtonSize, type ButtonVariant } from "@/components/ui/Button";
 import { openChat, type ChatOpenMode } from "./chat/ChatWidget";
 
-/** Opens the chat panel; `mode="call"` opens it straight into a web voice call. */
+/** Opens the chat panel; `mode="call"` opens the voice call screen instead. */
 export function OpenChatButton({
   children,
   variant = "secondary",
