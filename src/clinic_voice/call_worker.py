@@ -44,10 +44,12 @@ from clinic_voice.call_agent import (
     parse_metadata,
     tool_schemas,
 )
-from clinic_voice.config import get_settings
+from clinic_voice.config import Settings
 
 log = logging.getLogger("clinic_voice.call_worker")
-settings = get_settings()
+# LiveKit Cloud injects its own LIVEKIT_URL (read by the LiveKit SDK, not by us), which need not
+# be the wss:// URL the API hands to browsers, so the worker's settings leave it out.
+settings = Settings(livekit_url=None)
 
 
 class ClaudeLLM(lk_anthropic.LLM):
