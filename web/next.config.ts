@@ -19,7 +19,8 @@ const csp = [
   "img-src 'self' data: blob:",
   // The web voice call plays the assistant's spoken reply from a blob: URL.
   "media-src 'self' blob: data:",
-  `connect-src 'self'${dev ? " ws: wss:" : ""}`,
+  // The real-time call (ADR 0014) signals and reconnects through LiveKit Cloud.
+  `connect-src 'self' wss://*.livekit.cloud https://*.livekit.cloud${dev ? " ws: wss:" : ""}`,
   "frame-src 'none'",
   "frame-ancestors 'none'",
   "base-uri 'self'",

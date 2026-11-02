@@ -6,3 +6,10 @@ __pycache__
 .pytest_cache
 .ruff_cache
 tests
+.venv-call
+node_modules
+web
+dashboard
+outreach
+.claude
+.codex

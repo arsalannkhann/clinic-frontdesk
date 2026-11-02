@@ -67,7 +67,8 @@ export const publicHandler: Handler = async (request, context) => {
 /**
  * /api/chat/* -> /v1/chat/*. Session creation is scoped to the configured clinic; the other
  * routes carry the session id, a 128-bit bearer secret for that conversation only. The voice
- * turn (one recorded utterance as base64 WAV) is the only route with a larger body cap.
+ * turn (one recorded utterance as base64 WAV) is the only route with a larger body cap; the
+ * call route mints a real-time call room token (ADR 0014).
  */
 export const chatHandler: Handler = async (request, context) => {
   const { path } = await context.params;
@@ -89,6 +90,8 @@ export const chatHandler: Handler = async (request, context) => {
     target = { path: `/v1/chat/sessions/${id}/voice`, chat: true, maxBodyBytes: VOICE_MAX_BODY_BYTES };
   } else if (method === "POST" && segments.length === 4 && kind === "voice" && pid === "greeting") {
     target = { path: `/v1/chat/sessions/${id}/voice/greeting`, chat: true };
+  } else if (method === "POST" && segments.length === 3 && kind === "call") {
+    target = { path: `/v1/chat/sessions/${id}/call` };
   } else if (method === "POST" && segments.length === 5 && kind === "proposals" && action === "confirm") {
     target = { path: `/v1/chat/sessions/${id}/proposals/${pid}/confirm`, chat: true };
   }

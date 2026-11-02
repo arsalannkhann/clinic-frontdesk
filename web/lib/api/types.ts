@@ -26,6 +26,8 @@ export interface ClinicProfile {
   chat_enabled: boolean;
   /** The web voice call ("Talk to the AI receptionist"). Read as false when absent. */
   voice_enabled: boolean;
+  /** Calls are real time (LiveKit, ADR 0014). Read as false when absent. */
+  realtime_call: boolean;
 }
 
 export interface PublicService {

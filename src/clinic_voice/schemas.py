@@ -905,6 +905,8 @@ class PublicClinicOut(StrictModel):
     chat_enabled: bool
     # Chat on, and both a speech key and a chat model key configured (ADR 0012).
     voice_enabled: bool
+    # A real-time call (ADR 0014, POST /v1/chat/sessions/{id}/call) is offered.
+    realtime_call: bool = False
 
 
 class PublicServiceOut(StrictModel):
@@ -1046,6 +1048,12 @@ class ChatVoiceTurnOut(ChatTurnOut):
     audio_mime: Literal["audio/mpeg"] = "audio/mpeg"
     # The booking this turn made by voice (book_appointment), if any.
     booking: PublicBookingOut | None = None
+
+
+class ChatCallOut(StrictModel):
+    server_url: str  # The LiveKit project URL the browser connects to.
+    participant_token: str  # Short-lived LiveKit access token for this call's room only.
+    room: str
 
 
 class ChatVoiceGreetingOut(StrictModel):

@@ -19,6 +19,7 @@ export const FALLBACK_PROFILE: ClinicProfile = {
   voice_number: null,
   chat_enabled: false,
   voice_enabled: false,
+  realtime_call: false,
 };
 
 export const JOURNEY = [

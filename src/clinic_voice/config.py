@@ -173,6 +173,28 @@ class Settings(BaseSettings):
     # Largest decoded recording a voice turn accepts (16 kHz mono 16-bit WAV: 1000000 bytes
     # is about 31 seconds).
     voice_max_audio_bytes: int = Field(default=1_000_000, ge=16_000, le=1_000_000)
+    # Real-time calls (ADR 0014, calls.py and call_agent.py): LiveKit project URL (wss://, or
+    # ws:// for a local server), API key and secret. With all three and a chat model set, the
+    # public profile offers realtime_call and POST /v1/chat/sessions/{id}/call mints a
+    # participant token that dispatches CALL_AGENT_NAME into a new room.
+    livekit_url: str | None = None
+    livekit_api_key: str | None = None
+    livekit_api_secret: SecretStr | None = None
+    call_agent_name: str = "clinic-receptionist"
+    call_ip_per_hour: int = Field(default=20, ge=1, le=10000)
+    # The call agent's speech providers: a LiveKit Inference model ("deepgram/nova-3",
+    # "cartesia/sonic-3"; LiveKit Cloud only) or "sarvam" (streaming, SPEECH_API_KEY).
+    # The call agent's model: "claude" (Claude on Foundry, ADR 0013) or a LiveKit Inference
+    # model id (LiveKit Cloud only), e.g. "google/gemini-2.5-flash", for a faster first token.
+    call_llm: str = "claude"
+    call_stt: str = "deepgram/nova-3"
+    call_stt_language: str = "multi"
+    call_tts: str = "cartesia/sonic-3"
+    call_tts_voice: str | None = None
+    call_tts_language: str = "en"
+    call_max_minutes: int = Field(default=10, ge=1, le=60)
+    # Seconds of caller silence before "are you still there?"; a second one ends the call.
+    call_silence_seconds: float = Field(default=8.0, ge=3.0, le=60.0)
 
     @field_validator("worker_tick_secret", "public_proxy_secret")
     @classmethod
@@ -190,6 +212,21 @@ class Settings(BaseSettings):
         if checked is None:
             raise ValueError("chat_llm_base_url is required")
         return checked.rstrip("/")
+
+    @field_validator("livekit_url")
+    @classmethod
+    def _livekit_url(cls, value):
+        if value is None or not value.strip():
+            return None
+        parts = urlsplit(value.strip())
+        host = (parts.hostname or "").lower()
+        if parts.username is not None or parts.password is not None:
+            raise ValueError("livekit_url must not carry a username or password")
+        if parts.scheme == "wss" and host:
+            return value.strip().rstrip("/")
+        if parts.scheme == "ws" and host in LOOPBACK_HOSTS:
+            return value.strip().rstrip("/")
+        raise ValueError("livekit_url must be wss:// (ws:// only for localhost)")
 
     @field_validator("speech_base_url")
     @classmethod
@@ -237,6 +274,17 @@ class Settings(BaseSettings):
 
     def speech_configured(self) -> bool:
         return bool(self.speech_api_key and self.speech_api_key.get_secret_value())
+
+    def call_configured(self) -> bool:
+        """Real-time calls need the LiveKit project and a chat model."""
+        secret = self.livekit_api_secret
+        return bool(
+            self.livekit_url
+            and self.livekit_api_key
+            and secret
+            and secret.get_secret_value()
+            and self.chat_configured()
+        )
 
     def voice_configured(self) -> bool:
         """Web voice needs both the speech key and the chat model key."""

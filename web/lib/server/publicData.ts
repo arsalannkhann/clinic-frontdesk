@@ -75,7 +75,7 @@ export const getClinic = cache(async (): Promise<ClinicProfile | null> => {
   const value = await load("");
   if (!isProfile(value)) return null;
   // An API without the voice call omits the flag: anything but true means no voice call.
-  return { ...value, voice_enabled: value.voice_enabled === true };
+  return { ...value, voice_enabled: value.voice_enabled === true, realtime_call: value.realtime_call === true };
 });
 
 export const getServices = cache(async (): Promise<PublicService[] | null> => {

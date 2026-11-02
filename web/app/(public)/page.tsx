@@ -81,7 +81,7 @@ export default async function HomePage() {
   const serviceName = new Map((services ?? []).map((s) => [s.id, s.name]));
   const jsonLd = dentistJsonLd(profile, services, doctors, siteUrl());
   // The web voice call runs inside the chat panel, so it needs chat too.
-  const voiceCall = profile.chat_enabled && profile.voice_enabled;
+  const voiceCall = profile.chat_enabled && (profile.voice_enabled || profile.realtime_call);
 
   return (
     <>

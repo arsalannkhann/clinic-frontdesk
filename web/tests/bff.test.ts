@@ -374,6 +374,20 @@ describe("public and chat proxy", () => {
     expect(calls).toHaveLength(1);
   });
 
+  it("maps the real-time call token, by POST only", async () => {
+    await chatHandler(request("/api/chat/sessions/abc/call", { method: "POST" }), ctx(["sessions", "abc", "call"]));
+    expect(calls.map((c) => c.url)).toEqual([`${API}/v1/chat/sessions/abc/call`]);
+    for (const [method, segments] of [
+      ["GET", ["sessions", "abc", "call"]],
+      ["POST", ["sessions", "abc", "call", "x"]],
+    ] as const) {
+      const init = method === "POST" ? { method, body: "{}" } : { method };
+      const response = await chatHandler(request(`/api/chat/${segments.join("/")}`, init), ctx([...segments]));
+      expect(response.status).toBe(404);
+    }
+    expect(calls).toHaveLength(1);
+  });
+
   it("maps the voice turn and greeting, by POST only", async () => {
     await chatHandler(request("/api/chat/sessions/abc/voice", { method: "POST", body: '{"audio":"UklGRg=="}' }), ctx(["sessions", "abc", "voice"]));
     await chatHandler(request("/api/chat/sessions/abc/voice/greeting", { method: "POST" }), ctx(["sessions", "abc", "voice", "greeting"]));

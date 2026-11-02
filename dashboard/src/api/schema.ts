@@ -852,6 +852,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/call": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start Call
+         * @description A real-time call on the session (ADR 0014): the LiveKit URL and a participant token for
+         *     a new room the call agent joins. 429 rate_limited (CALL_IP_PER_HOUR); 503 call_unavailable
+         *     (LiveKit or the chat model not configured).
+         */
+        post: operations["start_call_v1_chat_sessions__session_id__call_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/voice/greeting": {
         parameters: {
             query?: never;
@@ -1718,6 +1740,15 @@ export interface components {
             /** Revoked At */
             revoked_at: string | null;
         };
+        /** ChatCallOut */
+        ChatCallOut: {
+            /** Server Url */
+            server_url: string;
+            /** Participant Token */
+            participant_token: string;
+            /** Room */
+            room: string;
+        };
         /** ChatConfirmRequest */
         ChatConfirmRequest: {
             /** Name */
@@ -2327,6 +2358,11 @@ export interface components {
             chat_enabled: boolean;
             /** Voice Enabled */
             voice_enabled: boolean;
+            /**
+             * Realtime Call
+             * @default false
+             */
+            realtime_call: boolean;
         };
         /** PublicDoctorOut */
         PublicDoctorOut: {
@@ -5340,6 +5376,91 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatVoiceTurnOut"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Gone */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+        };
+    };
+    start_call_v1_chat_sessions__session_id__call_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatCallOut"];
                 };
             };
             /** @description Forbidden */

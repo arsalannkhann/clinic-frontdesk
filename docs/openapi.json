@@ -3669,6 +3669,109 @@
         }
       }
     },
+    "/v1/chat/sessions/{session_id}/call": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Start Call",
+        "description": "A real-time call on the session (ADR 0014): the LiveKit URL and a participant token for\na new room the call agent joins. 429 rate_limited (CALL_IP_PER_HOUR); 503 call_unavailable\n(LiveKit or the chat model not configured).",
+        "operationId": "start_call_v1_chat_sessions__session_id__call_post",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatCallOut"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "410": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Gone"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Unprocessable Content"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PublicErrorEnvelope"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        }
+      }
+    },
     "/v1/chat/sessions/{session_id}/voice/greeting": {
       "post": {
         "tags": [
@@ -6129,6 +6232,30 @@
         "title": "CalendarAccountOut",
         "description": "No token material, ever."
       },
+      "ChatCallOut": {
+        "properties": {
+          "server_url": {
+            "type": "string",
+            "title": "Server Url"
+          },
+          "participant_token": {
+            "type": "string",
+            "title": "Participant Token"
+          },
+          "room": {
+            "type": "string",
+            "title": "Room"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "server_url",
+          "participant_token",
+          "room"
+        ],
+        "title": "ChatCallOut"
+      },
       "ChatConfirmRequest": {
         "properties": {
           "name": {
@@ -7876,6 +8003,11 @@
           "voice_enabled": {
             "type": "boolean",
             "title": "Voice Enabled"
+          },
+          "realtime_call": {
+            "type": "boolean",
+            "title": "Realtime Call",
+            "default": false
           }
         },
         "additionalProperties": false,

@@ -41,6 +41,7 @@ export const PROFILE: ClinicProfile = {
   voice_number: "+919000000100",
   chat_enabled: true,
   voice_enabled: true,
+  realtime_call: false,
 };
 
 interface ServiceSeed extends PublicService {
