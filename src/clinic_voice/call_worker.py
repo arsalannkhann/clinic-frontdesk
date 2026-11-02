@@ -12,9 +12,11 @@ The synchronous half (session, transcript, limits, tools) is call_agent.CallStat
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 import anthropic
+import httpx
 from livekit import agents
 from livekit.agents import (
     Agent,
@@ -50,6 +52,7 @@ log = logging.getLogger("clinic_voice.call_worker")
 # LiveKit Cloud injects its own LIVEKIT_URL (read by the LiveKit SDK, not by us), which need not
 # be the wss:// URL the API hands to browsers, so the worker's settings leave it out.
 settings = Settings(livekit_url=None)
+CALL_KEEPALIVE_SECONDS = 300.0
 
 
 class ClaudeLLM(lk_anthropic.LLM):
@@ -68,7 +71,14 @@ class ClaudeLLM(lk_anthropic.LLM):
 def make_llm():
     key = settings.claude_foundry_api_key.get_secret_value()
     client = anthropic.AsyncAnthropicFoundry(
-        resource=settings.claude_foundry_resource, api_key=key, max_retries=1
+        resource=settings.claude_foundry_resource,
+        api_key=key,
+        max_retries=1,
+        # The caller talks for several seconds between replies; httpx's default 5 s idle expiry
+        # would close the connection each time and add a TLS handshake (about 0.7 s) per reply.
+        http_client=anthropic.DefaultAsyncHttpxClient(
+            limits=httpx.Limits(keepalive_expiry=CALL_KEEPALIVE_SECONDS)
+        ),
     )
     return ClaudeLLM(
         model=settings.claude_model,
@@ -129,6 +139,7 @@ class Call:
         self.session: AgentSession | None = None
         self._lock = asyncio.Lock()
         self._silences = 0
+        self._heard_at = time.monotonic()
         self._published: dict[str, str] = {}
         self._ending = False
 
@@ -174,10 +185,22 @@ class Call:
 
         asyncio.create_task(store())
 
+    def on_transcribed(self, event):
+        # Voice activity detection can miss soft speech that speech-to-text still hears; any
+        # words count as the caller being there.
+        self._heard_at = time.monotonic()
+        self._silences = 0
+
     def on_user_state(self, event):
         if event.new_state == "speaking":
             self._silences = 0
-        elif event.new_state == "away" and self.session is not None and not self._ending:
+        elif (
+            event.new_state == "away"
+            and self.session is not None
+            and not self._ending
+            and self.session.agent_state not in ("thinking", "speaking")
+            and time.monotonic() - self._heard_at >= settings.call_silence_seconds
+        ):
             self._silences += 1
             if self._silences == 1:
                 self.session.generate_reply(instructions=SILENCE_PROMPT)
@@ -311,6 +334,7 @@ async def entrypoint(ctx: JobContext):
     )
     call.session = session
     session.on("user_state_changed", call.on_user_state)
+    session.on("user_input_transcribed", call.on_transcribed)
     session.on("conversation_item_added", call.on_item)
     session.on("metrics_collected", call.on_metrics)
     await session.start(room=ctx.room, agent=Receptionist(call), record=False, session_host=False)
