@@ -18,7 +18,7 @@ import json
 import re
 
 import anthropic
-from anthropic import AnthropicFoundry
+from anthropic import Anthropic, AnthropicFoundry
 
 from clinic_voice.providers.chat_llm import MAX_TOOL_CALLS, ChatLLMError, LLMReply, ToolCall
 
@@ -168,13 +168,16 @@ class ClaudeChatLLM:
 
 
 def build(settings) -> ClaudeChatLLM:
-    client = AnthropicFoundry(
-        resource=settings.claude_foundry_resource,
-        api_key=settings.claude_foundry_api_key.get_secret_value(),
-        timeout=settings.chat_llm_timeout_seconds,
-        # No SDK retries: a failed call goes to the fallback model at once (chat_llm.build).
-        max_retries=0,
-    )
+    # No SDK retries: a failed call goes to the fallback model at once (chat_llm.build).
+    options = {"timeout": settings.chat_llm_timeout_seconds, "max_retries": 0}
+    if settings.claude_direct():
+        client = Anthropic(api_key=settings.anthropic_api_key.get_secret_value(), **options)
+    else:
+        client = AnthropicFoundry(
+            resource=settings.claude_foundry_resource,
+            api_key=settings.claude_foundry_api_key.get_secret_value(),
+            **options,
+        )
     return ClaudeChatLLM(
         client,
         settings.claude_model,

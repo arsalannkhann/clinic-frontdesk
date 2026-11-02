@@ -145,7 +145,10 @@ class Settings(BaseSettings):
     # Claude on Microsoft Foundry (ADR 0013, providers/claude_llm.py). With the key set, chat
     # and voice run on claude_model at https://<resource>.services.ai.azure.com/anthropic;
     # CHAT_LLM_REASONING_EFFORT is its effort and CHAT_LLM_MAX_TOKENS its max_tokens. The
-    # CHAT_LLM_* model, when also configured, answers any call Claude fails.
+    # CHAT_LLM_* model, when also configured, answers any call Claude fails. ANTHROPIC_API_KEY
+    # (a Claude Console key) runs the same model on the Claude API instead, taking precedence
+    # over Foundry.
+    anthropic_api_key: SecretStr | None = None
     claude_foundry_resource: str | None = None
     claude_foundry_api_key: SecretStr | None = None
     claude_model: str = "claude-haiku-5-5"
@@ -264,9 +267,15 @@ class Settings(BaseSettings):
         True when it is unset there (edge.require_proxy answers 503)."""
         return self.public_proxy_secret is None and not self.local_environment()
 
+    def claude_direct(self) -> bool:
+        """True when Claude runs on the Claude API (ANTHROPIC_API_KEY) rather than Foundry."""
+        key = self.anthropic_api_key
+        return bool(key and key.get_secret_value())
+
     def claude_configured(self) -> bool:
         key = self.claude_foundry_api_key
-        return bool(self.claude_foundry_resource and key and key.get_secret_value())
+        foundry = bool(self.claude_foundry_resource and key and key.get_secret_value())
+        return self.claude_direct() or foundry
 
     def chat_configured(self) -> bool:
         key = self.chat_llm_api_key
