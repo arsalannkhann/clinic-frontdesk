@@ -3,7 +3,7 @@
  * one frame's RMS at a time, plus a segmenter that turns microphone chunks into utterances.
  *
  * - Speech starts once the level stays above the start threshold for `startMs` (150 ms).
- * - The utterance ends after `endSilenceMs` (800 ms) below the (lower) continue threshold.
+ * - The utterance ends after `endSilenceMs` (600 ms) below the (lower) continue threshold.
  * - An utterance is cut at `maxMs` (15 s) and sent as it is.
  * - Anything with under `minMs` (400 ms) of speech is discarded as a cough or a click.
  * - The threshold adapts to the room: the larger of `minThreshold` and `noiseFactor` times a
@@ -40,7 +40,7 @@ export interface VadConfig {
 
 export const VAD_DEFAULTS: VadConfig = {
   startMs: 150,
-  endSilenceMs: 800,
+  endSilenceMs: 600,
   maxMs: 15_000,
   minMs: 400,
   preRollMs: 300,

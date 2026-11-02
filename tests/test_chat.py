@@ -3,6 +3,7 @@ the OpenAI-compatible adapter. Synthetic data and a scripted model only; no netw
 
 import json
 import logging
+import re
 from datetime import UTC, datetime, time, timedelta
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -696,6 +697,36 @@ def test_adapter_retries_a_short_rate_limit_once(monkeypatch):
     assert raised.value.code == "http_429" and len(calls) == 1
 
 
+def test_adapter_sends_reasoning_effort_only_when_set():
+    bodies = []
+
+    def handler(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Hi"}}]})
+
+    _adapter(handler).complete([], [])
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    OpenAIChatLLM(client, "https://llm.example/v1", "m", "k", reasoning_effort="low").complete(
+        [], []
+    )
+    assert "reasoning_effort" not in bodies[0] and bodies[1]["reasoning_effort"] == "low"
+
+
+def test_adapter_asks_the_fallback_model_once_on_a_rate_limit():
+    models = []
+
+    def handler(request):
+        models.append(json.loads(request.content)["model"])
+        if len(models) == 1:
+            return httpx.Response(429, headers={"retry-after": "40"}, text="slow down")
+        return httpx.Response(200, json={"choices": [{"message": {"content": "Hi"}}]})
+
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    adapter = OpenAIChatLLM(client, "https://llm.example/v1", "big", "k", fallback_model="small")
+    assert adapter.complete([], []).text == "Hi"
+    assert models == ["big", "small"]
+
+
 def test_chat_settings_validation(monkeypatch):
     from clinic_voice.config import Settings
 
@@ -1360,3 +1391,45 @@ def test_history_drops_assistant_tool_calls_without_results(env):
         "earlier question",
         "are you there?",
     ]
+
+
+def test_choices_line_becomes_the_quick_replies_and_leaves_the_text(env):
+    session = start(env)
+    env["fake"].script = [
+        LLMReply("Which service would you like?\nChoices: Cleaning | Whitening | Check-up")
+    ]
+    body = say(env, session, "book an appointment").json()
+    assert body["messages"][0]["text"] == "Which service would you like?"
+    assert body["quick_replies"] == ["Cleaning", "Whitening", "Check-up"]
+    history = env["client"].get(f"/v1/chat/sessions/{session}").json()
+    assert history["messages"][-1]["text"] == "Which service would you like?"
+
+
+def test_found_times_are_the_quick_replies_when_the_model_offers_none(env):
+    session = start(env)
+    env["fake"].script = [
+        LLMReply(
+            None,
+            [call("check_slots", service_id=str(SERVICE_ID), date=SLOT.date().isoformat())],
+        ),
+        LLMReply("Which time suits you?"),
+    ]
+    quick = say(env, session, "a cleaning that day").json()["quick_replies"]
+    assert quick and len(quick) <= chat.MAX_CHOICES
+    assert all(re.fullmatch(r"[A-Z][a-z]{2} \d\d:\d\d", q) for q in quick)
+
+
+def test_listed_services_are_the_quick_replies_when_the_model_offers_none(env):
+    session = start(env)
+    env["fake"].script = [LLMReply(None, [call("list_services")]), LLMReply("Which one?")]
+    quick = say(env, session, "what do you offer?").json()["quick_replies"]
+    assert quick and quick != chat.QUICK_REPLIES
+
+
+def test_split_choices_bounds_and_cleans_the_options():
+    long = "x" * (chat.MAX_CHOICE_LENGTH + 1)
+    text, choices = chat.split_choices(f"Pick.\noptions: a | a | {long} | *b* | c | d | e")
+    assert text == "Pick."
+    assert choices == ["a", "b", "c", "d"]
+    assert chat.split_choices("No choices here: really") == ("No choices here: really", [])
+    assert chat.split_choices("Choices: a | b") == ("", ["a", "b"])

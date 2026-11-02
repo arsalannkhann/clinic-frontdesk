@@ -70,15 +70,7 @@ export type ChatAction =
   | { type: "confirmed"; result: BookingResult }
   | { type: "confirmFailed"; message: string; code: string }
   | { type: "withdraw" }
-  | { type: "expire" }
-  /** Voice call: an utterance was sent; the assistant is "typing" until the turn returns. */
-  | { type: "voicePending" }
-  /** Voice call: what the server heard (a user line) and its reply. */
-  | { type: "voiceTurn"; transcript: string; reply: ChatReply }
-  /** Voice call: the turn was refused or failed; nothing new goes in the transcript. */
-  | { type: "voiceIdle" }
-  /** Voice call: the spoken greeting, unless it repeats the assistant's last line. */
-  | { type: "voiceGreeting"; text: string };
+  | { type: "expire" };
 
 export const MAX_MESSAGE = 1000;
 
@@ -261,21 +253,6 @@ export function chatReducer(state: ChatState, action: ChatAction): ChatState {
       return state.proposalState === "open" ? { ...state, proposalState: "withdrawn" } : state;
     case "expire":
       return state.proposalState === "open" ? { ...state, proposalState: "expired" } : state;
-    case "voicePending":
-      return { ...state, typing: true, error: null, notice: null, quickReplies: [] };
-    case "voiceTurn": {
-      const heard = action.transcript.trim();
-      const withUser = heard ? { ...state, lines: [...state.lines, { id: lineId(), role: "user" as const, text: heard }] } : state;
-      return chatReducer(withUser, { type: "reply", reply: action.reply });
-    }
-    case "voiceIdle":
-      return { ...state, typing: false };
-    case "voiceGreeting": {
-      const text = action.text.trim();
-      const last = state.lines.findLast((line) => line.role === "assistant");
-      if (!text || last?.text.trim() === text) return state;
-      return { ...state, lines: [...state.lines, { id: lineId(), role: "assistant", text }] };
-    }
   }
 }
 

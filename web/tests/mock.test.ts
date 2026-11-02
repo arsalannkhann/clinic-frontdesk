@@ -2,8 +2,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import type { UpstreamRequest } from "@/lib/server/upstream";
-import { MOCK_TRANSCRIPTS, mockUpstream, resetMockState } from "@/lib/server/mock/router";
-import { MOCK_PASSWORD } from "@/lib/server/mock/fixtures";
+import { istDate, MOCK_CALL, mockUpstream, resetMockState } from "@/lib/server/mock/router";
+import { DOCTORS, MOCK_PASSWORD, SERVICES } from "@/lib/server/mock/fixtures";
 
 const call = (method: string, path: string, opts: Partial<UpstreamRequest> = {}) =>
   mockUpstream({ method, path, search: "", body: null, token: null, ip: null, idempotencyKey: null, ...opts });
@@ -66,7 +66,7 @@ describe("dev mock API", () => {
     expect(profile.chat_enabled).toBe(false);
   });
 
-  it("offers the web voice call and answers a voice turn with a canned transcript", async () => {
+  it("offers the web voice call and walks a scripted call to a booking by voice", async () => {
     const profile = (await call("GET", "/v1/public/clinics/aster-dental")).body as { voice_enabled: boolean };
     expect(profile.voice_enabled).toBe(true);
     const created = await call("POST", "/v1/chat/clinics/aster-dental/sessions", { body: "{}" });
@@ -74,19 +74,83 @@ describe("dev mock API", () => {
     const greeting = await call("POST", `/v1/chat/sessions/${id}/voice/greeting`);
     expect(greeting.status).toBe(200);
     expect(greeting.body).toMatchObject({ audio: null, audio_mime: "audio/mpeg" });
-    expect((greeting.body as { text: string }).text).toMatch(/AI receptionist/);
+    expect((greeting.body as { text: string }).text).toBe("Hello, Aster Dental Studio. I'm the AI receptionist. How can I help you today?");
 
+    type Turn = {
+      transcript: string;
+      audio: null;
+      proposal: { id: string; starts_at: string; doctor_name: string } | null;
+      messages: { role: string; text: string }[];
+      quick_replies: string[];
+      booking: { reference: string; status: string; starts_at: string; doctor_name: string; service_name: string } | null;
+    };
     const audio = "UklGR".padEnd(8000, "A");
-    const turn = await call("POST", `/v1/chat/sessions/${id}/voice`, { body: JSON.stringify({ audio }) });
-    expect(turn.status).toBe(200);
-    const body = turn.body as { transcript: string; audio: null; proposal: { id: string } | null; messages: unknown[] };
-    expect(body.transcript).toBe(MOCK_TRANSCRIPTS[0]);
-    expect(body.audio).toBeNull();
-    expect(body.proposal?.id).toBeTruthy();
-    expect(body.messages.length).toBeGreaterThan(0);
-    // The heard line is in the transcript like a typed one.
+    const say = async () => {
+      const turn = await call("POST", `/v1/chat/sessions/${id}/voice`, { body: JSON.stringify({ audio }) });
+      expect(turn.status).toBe(200);
+      return turn.body as Turn;
+    };
+    const spoken = (turn: Turn) => turn.messages.map((m) => m.text).join(" ");
+
+    // Asking to book offers two real open times, spoken, with nothing held yet.
+    const ask = await say();
+    expect(ask.transcript).toBe(MOCK_CALL[0]);
+    expect(ask.audio).toBeNull();
+    expect(ask.proposal).toBeNull();
+    expect(ask.booking).toBeNull();
+    expect(spoken(ask)).toMatch(/I have two times for a check-up and cleaning: .+ with Dr\. .+, or .+ with Dr\. .+\. Which would you like\?/);
+
+    // Choosing one holds it (the proposal), then name, number and consent are asked aloud.
+    const pick = await say();
+    expect(pick.transcript).toBe(MOCK_CALL[1]);
+    expect(pick.proposal?.id).toBeTruthy();
+    expect(spoken(pick)).toMatch(/full name/);
+    const name = await say();
+    expect(name.transcript).toBe("My name is Asha Rao");
+    expect(spoken(name)).toMatch(/mobile number/);
+    const number = await say();
+    expect(spoken(number)).toMatch(/98765 43210/);
+    expect(spoken(number)).toMatch(/may the clinic contact you/);
+    expect(number.booking).toBeNull();
+    // Nothing is booked before consent: the held time is still open.
+    const held = Date.parse(pick.proposal!.starts_at);
+    const open = async () => {
+      const date = istDate(held);
+      const result = await call("GET", "/v1/public/clinics/aster-dental/slots", { search: `?service_id=${SERVICES[0]!.id}&date=${date}&days=1` });
+      // Another doctor may be free at the same time, so the slot is matched by doctor too.
+      const doctor = DOCTORS.find((d) => d.name === pick.proposal!.doctor_name)!.id;
+      return (result.body as { slots: { starts_at: string; doctor_id: string }[] }).slots.some(
+        (slot) => Date.parse(slot.starts_at) === held && slot.doctor_id === doctor,
+      );
+    };
+    expect(await open()).toBe(true);
+
+    const yes = await say();
+    expect(yes.transcript).toBe(MOCK_CALL[4]);
+    expect(yes.proposal).toBeNull();
+    expect(yes.booking).toMatchObject({ status: "confirmed", service_name: "Check-up and cleaning" });
+    expect(yes.booking!.starts_at).toBe(pick.proposal!.starts_at);
+    expect(spoken(yes)).toMatch(/You're booked for .+ Your reference is .+ Is there anything else/);
+    for (const turn of [ask, pick, name, number, yes]) expect(spoken(turn)).not.toMatch(/card|screen|tap|below|button/i);
+
+    // The booking is real in the mock: the held slot is no longer open and the reference looks up.
+    expect(await open()).toBe(false);
+    const lookup = await call("POST", "/v1/public/clinics/aster-dental/bookings/lookup", {
+      body: JSON.stringify({ reference: yes.booking!.reference, phone: "+919876543210" }),
+    });
+    expect(lookup.status).toBe(200);
+    expect(lookup.body).toMatchObject({ reference: yes.booking!.reference });
+
+    // Later turns carry on without booking again.
+    const after = await say();
+    expect(after.booking).toBeNull();
+    expect(spoken(after)).toMatch(/anything else/);
+    expect((await say()).booking).toBeNull();
+
+    // The heard lines are in the transcript like typed ones; the booking note is hidden.
     const transcript = (await call("GET", `/v1/chat/sessions/${id}`)).body as { messages: { role: string; text: string }[] };
-    expect(transcript.messages[1]).toEqual({ role: "user", text: MOCK_TRANSCRIPTS[0] });
+    expect(transcript.messages[1]).toEqual({ role: "user", text: MOCK_CALL[0] });
+    expect(transcript.messages.some((m) => m.role === "system")).toBe(false);
 
     const short = await call("POST", `/v1/chat/sessions/${id}/voice`, { body: JSON.stringify({ audio: "UklGRg==" }) });
     expect(short.status).toBe(422);

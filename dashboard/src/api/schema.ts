@@ -1816,6 +1816,7 @@ export interface components {
              * @constant
              */
             audio_mime: "audio/mpeg";
+            booking?: components["schemas"]["PublicBookingOut"] | null;
         };
         /** ClinicConfig */
         ClinicConfig: {

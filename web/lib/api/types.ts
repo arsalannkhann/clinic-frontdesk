@@ -128,6 +128,8 @@ export interface VoiceTurnReply extends ChatReply {
   /** Base64 audio of the reply, or null when the server has no speech for it. */
   audio: string | null;
   audio_mime?: string;
+  /** Set on the turn the assistant booked by voice (name, mobile and consent given aloud). */
+  booking?: BookingResult | null;
 }
 
 /** POST /v1/chat/sessions/{id}/voice/greeting. */

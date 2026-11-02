@@ -1044,6 +1044,8 @@ class ChatVoiceTurnOut(ChatTurnOut):
     transcript: str  # What the speech-to-text heard (stored as the user message).
     audio: str | None  # Base64 MP3 of the reply; null when speech synthesis failed.
     audio_mime: Literal["audio/mpeg"] = "audio/mpeg"
+    # The booking this turn made by voice (book_appointment), if any.
+    booking: PublicBookingOut | None = None
 
 
 class ChatVoiceGreetingOut(StrictModel):

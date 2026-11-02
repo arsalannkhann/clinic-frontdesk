@@ -106,8 +106,15 @@ interface ChatSession {
   /** The quick replies last offered, for restoring the conversation after a reload. */
   quick: string[];
   turns: number;
-  /** Voice turns so far, to pick the next canned transcript. */
-  voiceTurns: number;
+  /** Where the scripted voice call has got to. */
+  voice: VoiceScript;
+}
+
+/** The mock's scripted booking call: what was offered, held and given so far. */
+interface VoiceScript {
+  step: number;
+  offered: Slot[];
+  held: Proposal | null;
 }
 
 interface State {
@@ -816,12 +823,116 @@ function publicProposal(proposal: Proposal) {
   };
 }
 
-const VOICE_GREETING =
-  "Hello, you're through to Aster Dental Studio's AI receptionist. How can I help you today?";
-/** What the mock "hears", in turn: enough to show a proposal and a follow-up. */
-export const MOCK_TRANSCRIPTS = ["I'd like to book a check-up", "Do you have a later time?", "What are your opening hours?"];
+/** What the mock "hears", in turn, on a web voice call: a whole booking by voice. */
+export const MOCK_CALL = [
+  "I'd like to book a check-up",
+  "The first one, please",
+  "My name is Asha Rao",
+  "Nine eight seven six five four three two one zero",
+  "Yes, that's fine",
+  "What are your opening hours?",
+  "No, that's all. Thank you.",
+] as const;
+const MOCK_CALLER = { name: "Asha Rao", phone: "+919876543210", spoken: "98765 43210" };
 /** A recording shorter than this (about a tenth of a second of 16 kHz WAV) is "no speech". */
 const MOCK_MIN_AUDIO_CHARS = 4000;
+
+/** The spoken greeting: short, like the API's. */
+function voiceGreeting(state: State): string {
+  return `Hello, ${state.clinic.name}. I'm the AI receptionist. How can I help you today?`;
+}
+
+/** Two open check-up times a couple of hours apart (or the next two), for the call to offer. */
+function offerTimes(state: State): Slot[] {
+  const service = SERVICES[0]!;
+  const slots = computeSlots(state, service.id, null, istDate(Date.now()), 7);
+  const first = slots[0];
+  if (!first) return [];
+  const second = slots.find((s) => Date.parse(s.starts_at) >= Date.parse(first.starts_at) + 2 * 60 * MINUTE) ?? slots[1];
+  return second ? [first, second] : [first];
+}
+
+const spokenSlot = (slot: { starts_at: string; doctor_id: string }) =>
+  `${formatSlot(Date.parse(slot.starts_at))} with ${doctorById(slot.doctor_id)!.name}`;
+
+/**
+ * One scripted voice turn: plain spoken sentences, no cards or screens. The held time is the
+ * reply's proposal until the booking is made; the booking goes out once, on the turn that
+ * makes it, through the same appointment path as a chat confirm.
+ */
+function voiceReply(state: State, session: ChatSession, step: number): { text: string; proposal: Proposal | null; booking: BookingResult | null } {
+  const script = session.voice;
+  const service = SERVICES[0]!;
+  const offer = () => {
+    script.offered = offerTimes(state);
+    script.held = null;
+    const [a, b] = script.offered;
+    // The next turn picks from these times; with none, the call starts over.
+    script.step = a ? 1 : 0;
+    if (!a) return `I couldn't find an opening for a ${service.name.toLowerCase()} in the next week. I can ask the front desk to call you back with more options.`;
+    return b
+      ? `I have two times for a ${service.name.toLowerCase()}: ${spokenSlot(a)}, or ${spokenSlot(b)}. Which would you like?`
+      : `The next opening for a ${service.name.toLowerCase()} is ${spokenSlot(a)}. Would that suit you?`;
+  };
+  const anythingElse = "Is there anything else I can help you with?";
+  if (step === 0) return { text: offer(), proposal: null, booking: null };
+  if (step === 1) {
+    const slot = script.offered[0];
+    if (!slot) return { text: offer(), proposal: null, booking: null };
+    const held: Proposal = {
+      id: hex(16),
+      doctor_id: slot.doctor_id,
+      service_id: service.id,
+      starts: Date.parse(slot.starts_at),
+      expires: Date.now() + 10 * MINUTE,
+      consumed: false,
+    };
+    session.proposals.set(held.id, held);
+    session.lastProposal = held;
+    script.held = held;
+    return { text: `Lovely, I'm holding ${spokenSlot(slot)} for you. May I have your full name, please?`, proposal: held, booking: null };
+  }
+  if (step === 2) {
+    return { text: `Thank you, ${MOCK_CALLER.name.split(" ")[0]}. What's the best mobile number to reach you on?`, proposal: script.held, booking: null };
+  }
+  if (step === 3) {
+    return {
+      text: `I have ${MOCK_CALLER.spoken}. Is that right, and may the clinic contact you on that number about this appointment?`,
+      proposal: script.held,
+      booking: null,
+    };
+  }
+  if (step === 4) {
+    const held = script.held;
+    if (!held || held.consumed || held.expires < Date.now() || !slotOpen(state, held.service_id, held.doctor_id, held.starts)) {
+      return { text: `I'm sorry, that time has just gone. ${offer()}`, proposal: null, booking: null };
+    }
+    held.consumed = true;
+    const appt = createAppt(state, {
+      service_id: held.service_id,
+      doctor_id: held.doctor_id,
+      starts: held.starts,
+      name: MOCK_CALLER.name,
+      phone: MOCK_CALLER.phone,
+      channel: "chat",
+    });
+    const result = bookingResult(appt);
+    session.messages.push({
+      role: "system",
+      text: `Booking requested from this call: reference ${result.reference}, status ${result.status}.`,
+      created_at: isoIst(Date.now()),
+    });
+    const ref = result.reference.split("").join(" ");
+    const done = result.status === "confirmed" ? "You're booked" : "I've sent your booking to the clinic";
+    return {
+      text: `${done} for ${spokenSlot({ starts_at: isoIst(held.starts), doctor_id: held.doctor_id })}. Your reference is ${ref}. ${anythingElse}`,
+      proposal: null,
+      booking: result,
+    };
+  }
+  if (step === 5) return { text: `${PROFILE.hours_note!} ${anythingElse}`, proposal: null, booking: null };
+  return { text: `You're welcome, ${MOCK_CALLER.name.split(" ")[0]}. We look forward to seeing you. Goodbye!`, proposal: null, booking: null };
+}
 
 /** One patient turn, typed or spoken: the turn limit, the transcript and the reply. */
 function chatTurn(state: State, session: ChatSession, text: string): UpstreamResult {
@@ -847,7 +958,7 @@ function chatRoutes(state: State, method: string, rest: string[], body: Record<s
       messages: [{ role: "assistant", text: GREETING, created_at: isoIst(Date.now()) }],
       quick: QUICK,
       turns: 0,
-      voiceTurns: 0,
+      voice: { step: 0, offered: [], held: null },
     };
     state.chats.set(session.id, session);
     return ok({ session_id: session.id, greeting: GREETING, quick_replies: QUICK }, 201);
@@ -873,19 +984,32 @@ function chatRoutes(state: State, method: string, rest: string[], body: Record<s
     return chatTurn(state, session, text);
   }
   if (rest[2] === "voice" && rest.length === 3) {
-    // No speech recognition here: any recording of a plausible size "says" the next canned
-    // line, so the call mode can be tried without a backend. The reply has no audio.
+    // No speech recognition here: any recording of a plausible size "says" the next line of
+    // a scripted booking call, so the call can be tried without a backend. No reply audio.
     const audio = typeof body.audio === "string" ? body.audio : "";
     if (!audio || !/^[A-Za-z0-9+/]+=*$/.test(audio)) return fail(422, "invalid_audio", "Send the recording as base64 WAV.");
     if (audio.length < MOCK_MIN_AUDIO_CHARS) return fail(422, "no_speech", "We couldn't hear that. Please try again.");
-    const transcript = MOCK_TRANSCRIPTS[session.voiceTurns % MOCK_TRANSCRIPTS.length]!;
-    const reply = chatTurn(state, session, transcript);
-    if (reply.status !== 200) return reply;
-    session.voiceTurns += 1;
-    return ok({ ...(reply.body as object), transcript, audio: null, audio_mime: "audio/mpeg" });
+    if (session.turns >= 40) return fail(409, "conversation_limit", "This conversation is full; please start a new chat or call the clinic.");
+    const step = Math.min(session.voice.step, MOCK_CALL.length - 1);
+    const transcript = MOCK_CALL[step]!;
+    session.turns += 1;
+    session.voice.step = step + 1;
+    session.messages.push({ role: "user", text: transcript, created_at: isoIst(Date.now()) });
+    const reply = voiceReply(state, session, step);
+    session.messages.push({ role: "assistant", text: reply.text, created_at: isoIst(Date.now()) });
+    session.quick = [];
+    return ok({
+      messages: [{ role: "assistant", text: reply.text }],
+      proposal: reply.proposal ? publicProposal(reply.proposal) : null,
+      quick_replies: [],
+      transcript,
+      audio: null,
+      audio_mime: "audio/mpeg",
+      booking: reply.booking,
+    });
   }
   if (rest[2] === "voice" && rest[3] === "greeting" && rest.length === 4) {
-    return ok({ text: VOICE_GREETING, audio: null, audio_mime: "audio/mpeg" });
+    return ok({ text: voiceGreeting(state), audio: null, audio_mime: "audio/mpeg" });
   }
   if (rest[2] === "proposals" && rest[3] && rest[4] === "confirm" && rest.length === 5) {
     const proposal = session.proposals.get(rest[3]);

@@ -5,8 +5,9 @@ session is checked first (the same 404, 429 and 409 refusals as a typed message,
 speech call is paid for), then the audio is transcribed; an empty transcript is 422 no_speech
 and consumes no turn. The transcript then runs as an ordinary chat turn (chat.send with
 voice=True: the same tools, proposal flow, emergency script, limits and encrypted history,
-plus spoken-reply rules in the system prompt), and the reply is synthesized. Booking still
-happens only through the proposal card the patient fills in and confirms on screen.
+plus call rules in the system prompt), and the reply is synthesized. A call books by voice:
+the model holds a time (propose_booking), asks for the name and mobile number, reads the number
+back, asks consent, and books it (book_appointment, through chat.confirm's checks and limits).
 
 Audio is never stored or logged. The transcript is stored only as the session's encrypted
 user message (chat.send). Logs carry session ids and error codes only. A failed synthesis
@@ -17,6 +18,7 @@ import base64
 import binascii
 import logging
 import re
+import time
 from threading import Lock
 
 from clinic_voice import chat, public, service
@@ -165,6 +167,7 @@ def turn(url, settings, token, audio: str, address, llm, speech: SpeechPort | No
         raise unavailable()
     session = _precheck(url, settings, token, address)
     wav = decode_wav(audio, settings.voice_max_audio_bytes)
+    started = time.monotonic()
     try:
         heard, language = speech.transcribe(wav)
     except SpeechError as error:
@@ -178,16 +181,21 @@ def turn(url, settings, token, audio: str, address, llm, speech: SpeechPort | No
     if not text:
         log.info("voice no speech session=%s", session["id"])
         raise no_speech()
+    heard_at = time.monotonic()
     result = chat.send(url, settings, token, text, address, llm, voice=True)
     reply = " ".join(m["text"] for m in result["messages"] if m["role"] == "assistant")
+    answered_at = time.monotonic()
     result["transcript"] = text
     result["audio"] = _synthesize(speech, reply, tts_language(reply, language), session["id"])
     result["audio_mime"] = AUDIO_MIME
     log.info(
-        "voice turn session=%s language=%s audio=%s",
+        "voice turn session=%s language=%s audio=%s stt_ms=%d turn_ms=%d tts_ms=%d",
         session["id"],
         language or "unknown",
         "yes" if result["audio"] else "no",
+        (heard_at - started) * 1000,
+        (answered_at - heard_at) * 1000,
+        (time.monotonic() - answered_at) * 1000,
     )
     return result
 
@@ -202,8 +210,8 @@ def clear_greeting_cache() -> None:
 
 
 def greeting(url, settings, token, address, speech: SpeechPort | None) -> dict:
-    """POST /v1/chat/sessions/{id}/voice/greeting: the session's greeting text (as
-    create_session returned it) and its audio, synthesized once per adapter, clinic, text and
+    """POST /v1/chat/sessions/{id}/voice/greeting: the call's short greeting
+    (chat.voice_greeting) and its audio, synthesized once per adapter, clinic, text and
     language and then served from memory. Counted against CHAT_HISTORY_IP_PER_HOUR before the
     session lookup, like a transcript reload."""
     if speech is None:
@@ -220,7 +228,7 @@ def greeting(url, settings, token, address, speech: SpeechPort | None) -> dict:
         )
         session = chat.find_session(conn, token)
         clinic = chat._clinic(conn, session["clinic_id"])
-    text = chat.greeting(clinic)
+    text = chat.voice_greeting(clinic)
     language = tts_language(text, None)
     key = (id(speech), clinic["id"], text, language)
     with _greetings_lock:
