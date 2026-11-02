@@ -829,6 +829,49 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/chat/sessions/{session_id}/voice": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Send Voice
+         * @description One spoken turn (ADR 0012): base64 16 kHz mono WAV in; the transcript, the same turn
+         *     result as a typed message, and the reply as base64 MP3 (null if synthesis failed) out.
+         *     422 no_speech (nothing heard, no turn used); 503 voice_unavailable (no speech key, or
+         *     speech-to-text failed).
+         */
+        post: operations["send_voice_v1_chat_sessions__session_id__voice_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/chat/sessions/{session_id}/voice/greeting": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Voice Greeting
+         * @description The session's greeting text and its audio (base64 MP3, null if synthesis failed).
+         */
+        post: operations["voice_greeting_v1_chat_sessions__session_id__voice_greeting_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/chat/sessions/{session_id}/proposals/{proposal_id}/confirm": {
         parameters: {
             query?: never;
@@ -1738,6 +1781,42 @@ export interface components {
             /** Quick Replies */
             quick_replies: string[];
         };
+        /** ChatVoiceGreetingOut */
+        ChatVoiceGreetingOut: {
+            /** Text */
+            text: string;
+            /** Audio */
+            audio: string | null;
+            /**
+             * Audio Mime
+             * @default audio/mpeg
+             * @constant
+             */
+            audio_mime: "audio/mpeg";
+        };
+        /** ChatVoiceRequest */
+        ChatVoiceRequest: {
+            /** Audio */
+            audio: string;
+        };
+        /** ChatVoiceTurnOut */
+        ChatVoiceTurnOut: {
+            /** Messages */
+            messages: components["schemas"]["ChatMessageOut"][];
+            proposal?: components["schemas"]["ChatProposalOut"] | null;
+            /** Quick Replies */
+            quick_replies: string[];
+            /** Transcript */
+            transcript: string;
+            /** Audio */
+            audio: string | null;
+            /**
+             * Audio Mime
+             * @default audio/mpeg
+             * @constant
+             */
+            audio_mime: "audio/mpeg";
+        };
         /** ClinicConfig */
         ClinicConfig: {
             /**
@@ -2245,6 +2324,8 @@ export interface components {
             voice_number: string | null;
             /** Chat Enabled */
             chat_enabled: boolean;
+            /** Voice Enabled */
+            voice_enabled: boolean;
         };
         /** PublicDoctorOut */
         PublicDoctorOut: {
@@ -5169,6 +5250,180 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ChatTurnOut"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Gone */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+        };
+    };
+    send_voice_v1_chat_sessions__session_id__voice_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChatVoiceRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatVoiceTurnOut"];
+                };
+            };
+            /** @description Forbidden */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Not Found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Gone */
+            410: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Unprocessable Content */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Too Many Requests */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PublicErrorEnvelope"];
+                };
+            };
+        };
+    };
+    voice_greeting_v1_chat_sessions__session_id__voice_greeting_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                session_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChatVoiceGreetingOut"];
                 };
             };
             /** @description Forbidden */
