@@ -13,6 +13,7 @@ header or provider message is ever placed in an exception or a log line.
 """
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -26,6 +27,8 @@ THINK = re.compile(r"<think>.*?</think>", re.S | re.I)
 # opening tag to the end of the text is reasoning, never shown.
 UNCLOSED_THINK = re.compile(r"<think>.*\Z", re.S | re.I)
 MAX_TOOL_CALLS = 8
+
+log = logging.getLogger(__name__)
 
 
 class ChatLLMError(Exception):
@@ -208,17 +211,52 @@ class FakeChatLLM:
         return item
 
 
-def build(settings) -> ChatLLMPort | None:
-    """The configured adapter, or None when CHAT_LLM_API_KEY is unset."""
-    if not settings.chat_configured():
+class FallbackChatLLM:
+    """The primary model, and the secondary one for any call the primary fails (rate limit,
+    overload, timeout). Both take the same OpenAI-format messages, so a turn can switch
+    between tool rounds."""
+
+    def __init__(self, primary: ChatLLMPort, secondary: ChatLLMPort):
+        self._primary = primary
+        self._secondary = secondary
+
+    def __repr__(self):
+        return f"FallbackChatLLM({self._primary!r}, {self._secondary!r})"
+
+    def complete(self, messages, tools):
+        try:
+            return self._primary.complete(messages, tools)
+        except ChatLLMError as error:
+            log.warning("chat model fallback code=%s", error.code)
+            return self._secondary.complete(messages, tools)
+
+
+def _openai(settings) -> OpenAIChatLLM | None:
+    key = settings.chat_llm_api_key
+    if not (key and key.get_secret_value()):
         return None
     return OpenAIChatLLM(
         httpx.Client(timeout=settings.chat_llm_timeout_seconds, follow_redirects=False),
         settings.chat_llm_base_url,
         settings.chat_llm_model,
-        settings.chat_llm_api_key.get_secret_value(),
+        key.get_secret_value(),
         settings.chat_llm_auth_header,
         settings.chat_llm_max_tokens,
         settings.chat_llm_reasoning_effort,
         settings.chat_llm_fallback_model,
     )
+
+
+def build(settings) -> ChatLLMPort | None:
+    """The configured adapter, or None when no chat model is configured. Claude on Foundry
+    (CLAUDE_FOUNDRY_API_KEY) is the primary when set, with the CHAT_LLM_* model as its
+    fallback when that is configured too."""
+    if not settings.chat_configured():
+        return None
+    openai = _openai(settings)
+    if not settings.claude_configured():
+        return openai
+    from clinic_voice.providers import claude_llm  # The SDK loads only when Claude is used.
+
+    claude = claude_llm.build(settings)
+    return FallbackChatLLM(claude, openai) if openai else claude
