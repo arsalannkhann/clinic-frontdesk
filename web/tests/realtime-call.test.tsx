@@ -2,7 +2,7 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { addCaption, agentPhase, parseAttribute, RealtimeCall } from "@/components/public/chat/RealtimeCall";
+import { agentPhase, parseAttribute, RealtimeCall, setCaption } from "@/components/public/chat/RealtimeCall";
 import { VOICE_MESSAGES } from "@/components/public/chat/VoiceCall";
 
 // jsdom has no WebRTC: the LiveKit room is a fake the test drives through its events.
@@ -126,10 +126,10 @@ describe("real-time call helpers", () => {
     expect(agentPhase(undefined)).toBe("connecting");
     expect(parseAttribute('{"a":1}')).toEqual({ a: 1 });
     for (const bad of [undefined, "", "not json", "3", "null"]) expect(parseAttribute(bad)).toBeNull();
-    let lines = addCaption([], "s1", "agent", "Hello");
-    lines = addCaption(lines, "s1", "agent", " there");
-    expect(lines).toEqual([{ id: "s1", who: "agent", text: "Hello there" }]);
-    for (let i = 2; i <= 6; i++) lines = addCaption(lines, `s${i}`, "caller", "x");
+    let lines = setCaption([], "s1", "caller", "You can");
+    lines = setCaption(lines, "s1", "caller", "You can book a cleaning");
+    expect(lines).toEqual([{ id: "s1", who: "caller", text: "You can book a cleaning" }]);
+    for (let i = 2; i <= 6; i++) lines = setCaption(lines, `s${i}`, "caller", "x");
     expect(lines.map((l) => l.id)).toEqual(["s3", "s4", "s5", "s6"]);
   });
 });
@@ -147,6 +147,8 @@ describe("real-time call screen", () => {
 
     await act(async () => {
       room().textHandler(stream("seg1", ["Hello, ", "how can I help?"]), { identity: "agent-1" });
+      // The caller's interim guesses arrive as new streams for the same segment.
+      room().textHandler(stream("seg2", ["A clean"]), { identity: "caller-1" });
       room().textHandler(stream("seg2", ["A cleaning please"]), { identity: "caller-1" });
     });
     const captions = screen.getByRole("list", { name: "Live captions" });

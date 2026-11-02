@@ -58,12 +58,14 @@ export interface CaptionLine {
   text: string;
 }
 
-/** Adds a streamed caption chunk: a segment's chunks accumulate; at most `keep` lines stay. */
-export function addCaption(lines: CaptionLine[], id: string, who: CaptionLine["who"], chunk: string, keep = 4): CaptionLine[] {
+/** Sets a segment's caption text (each transcription stream carries the segment's text so far,
+ * and the caller's interim guesses arrive as new streams for the same segment); at most `keep`
+ * lines stay. */
+export function setCaption(lines: CaptionLine[], id: string, who: CaptionLine["who"], text: string, keep = 4): CaptionLine[] {
   if (lines.some((line) => line.id === id)) {
-    return lines.map((line) => (line.id === id ? { ...line, text: line.text + chunk } : line));
+    return lines.map((line) => (line.id === id ? { ...line, text } : line));
   }
-  return [...lines, { id, who, text: chunk }].slice(-keep);
+  return [...lines, { id, who, text }].slice(-keep);
 }
 
 interface CallToken {
@@ -262,7 +264,12 @@ export function RealtimeCall({ clinicName, timeZone, callHref, open, onClose, on
       const who: CaptionLine["who"] = from.identity === room.localParticipant.identity ? "caller" : "agent";
       void (async () => {
         try {
-          for await (const chunk of reader) setCaptions((lines) => addCaption(lines, id, who, chunk));
+          let text = "";
+          for await (const chunk of reader) {
+            text += chunk;
+            const current = text;
+            setCaptions((lines) => setCaption(lines, id, who, current));
+          }
         } catch {
           /* The stream ends with the call. */
         }

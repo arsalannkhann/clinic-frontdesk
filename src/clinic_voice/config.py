@@ -194,7 +194,7 @@ class Settings(BaseSettings):
     call_tts_language: str = "en"
     call_max_minutes: int = Field(default=10, ge=1, le=60)
     # Seconds of caller silence before "are you still there?"; a second one ends the call.
-    call_silence_seconds: float = Field(default=8.0, ge=3.0, le=60.0)
+    call_silence_seconds: float = Field(default=12.0, ge=3.0, le=60.0)
 
     @field_validator("worker_tick_secret", "public_proxy_secret")
     @classmethod
