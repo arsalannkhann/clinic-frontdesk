@@ -903,6 +903,8 @@ class PublicClinicOut(StrictModel):
     about: str
     voice_number: str | None  # E.164; null until the clinic has a voice line.
     chat_enabled: bool
+    # Chat on, and both a speech key and a chat model key configured (ADR 0012).
+    voice_enabled: bool
 
 
 class PublicServiceOut(StrictModel):
@@ -1026,6 +1028,28 @@ class ChatTurnOut(StrictModel):
     messages: list[ChatMessageOut]
     proposal: ChatProposalOut | None = None
     quick_replies: list[str]
+
+
+# Web voice receptionist (ADR 0012). Base64 of at most VOICE_MAX_AUDIO_BYTES (1000000 bytes,
+# 1333336 characters) of 16 kHz mono 16-bit PCM WAV; the decoded size and the RIFF/WAVE
+# header are checked by voice.decode_wav.
+VOICE_AUDIO_MAX_CHARS = 1_400_000
+
+
+class ChatVoiceRequest(StrictModel):
+    audio: Annotated[str, StringConstraints(min_length=1, max_length=VOICE_AUDIO_MAX_CHARS)]
+
+
+class ChatVoiceTurnOut(ChatTurnOut):
+    transcript: str  # What the speech-to-text heard (stored as the user message).
+    audio: str | None  # Base64 MP3 of the reply; null when speech synthesis failed.
+    audio_mime: Literal["audio/mpeg"] = "audio/mpeg"
+
+
+class ChatVoiceGreetingOut(StrictModel):
+    text: str
+    audio: str | None
+    audio_mime: Literal["audio/mpeg"] = "audio/mpeg"
 
 
 class ChatConfirmRequest(StrictModel):

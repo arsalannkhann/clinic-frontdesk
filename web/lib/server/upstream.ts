@@ -45,7 +45,13 @@ export class UpstreamUnavailable extends Error {
 export const UNAVAILABLE_MESSAGE =
   "We can't reach the clinic system right now. Please try again in a moment.";
 
-const MAX_BODY_BYTES = 32 * 1024;
+/** The default request body cap for every proxied route. */
+export const MAX_BODY_BYTES = 32 * 1024;
+/**
+ * The voice turn carries one utterance as base64 WAV: 15 s of 16 kHz mono 16-bit PCM is about
+ * 480 KB raw, 640 KB in base64. Only that route opts into this larger cap.
+ */
+export const VOICE_MAX_BODY_BYTES = 1536 * 1024;
 const IDEMPOTENCY = /^[A-Za-z0-9._:-]{8,128}$/;
 
 export interface UpstreamDeps {
@@ -162,6 +168,8 @@ export interface ForwardTarget {
   staff?: boolean;
   /** Use the longer chat timeout. */
   chat?: boolean;
+  /** Request body cap in bytes; MAX_BODY_BYTES unless the route opts into more. */
+  maxBodyBytes?: number;
 }
 
 /**
@@ -198,12 +206,12 @@ export async function readLimitedText(body: ReadableStream<Uint8Array> | null, l
 }
 
 /** Read a JSON body with a size cap enforced while streaming. Returns a Response on rejection. */
-export async function readJsonBody(request: Request): Promise<string | null | Response> {
+export async function readJsonBody(request: Request, limit: number = MAX_BODY_BYTES): Promise<string | null | Response> {
   const method = request.method.toUpperCase();
   if (method === "GET" || method === "HEAD" || method === "DELETE") return null;
   const declared = Number(request.headers.get("content-length") ?? "0");
-  if (declared > MAX_BODY_BYTES) return errorJson(413, "too_large", "The request is too large.");
-  const text = await readLimitedText(request.body, MAX_BODY_BYTES);
+  if (declared > limit) return errorJson(413, "too_large", "The request is too large.");
+  const text = await readLimitedText(request.body, limit);
   if (text === null) return errorJson(413, "too_large", "The request is too large.");
   if (!text.trim()) return null;
   const type = request.headers.get("content-type") ?? "";
@@ -240,7 +248,7 @@ export async function forward(request: Request, target: ForwardTarget, deps: Ups
     if (error instanceof ConfigError) return configErrorResponse(error);
     throw error;
   }
-  const body = await readJsonBody(request);
+  const body = await readJsonBody(request, target.maxBodyBytes ?? MAX_BODY_BYTES);
   if (body instanceof Response) return body;
 
   let token: string | null = null;

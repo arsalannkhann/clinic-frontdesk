@@ -10,16 +10,19 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Request, Response
 
-from clinic_voice import chat, public
+from clinic_voice import chat, public, voice
 from clinic_voice.config import get_settings
 from clinic_voice.deps import database
 from clinic_voice.edge import client_ip, require_proxy
-from clinic_voice.providers import chat_llm
+from clinic_voice.providers import chat_llm, speech
 from clinic_voice.schemas import (
     ChatConfirmRequest,
     ChatMessageRequest,
     ChatSessionOut,
     ChatTurnOut,
+    ChatVoiceGreetingOut,
+    ChatVoiceRequest,
+    ChatVoiceTurnOut,
     PublicBookingOut,
     PublicErrorEnvelope,
 )
@@ -40,6 +43,18 @@ def llm_for(settings):
         _llm_cache.clear()
         _llm_cache[key] = chat_llm.build(settings)
     return _llm_cache[key]
+
+
+_speech_cache: dict[int, object] = {}
+
+
+def speech_for(settings):
+    """The configured speech adapter (cached per Settings object), or None."""
+    key = id(settings)
+    if key not in _speech_cache:
+        _speech_cache.clear()
+        _speech_cache[key] = speech.build(settings)
+    return _speech_cache[key]
 
 
 def _url():
@@ -69,6 +84,33 @@ def send_message(session_id: str, body: ChatMessageRequest, request: Request, re
     response.headers["Cache-Control"] = "no-store"
     settings = get_settings()
     return chat.send(_url(), settings, session_id, body.text, client_ip(request), llm_for(settings))
+
+
+@router.post("/sessions/{session_id}/voice", response_model=ChatVoiceTurnOut)
+def send_voice(session_id: str, body: ChatVoiceRequest, request: Request, response: Response):
+    """One spoken turn (ADR 0012): base64 16 kHz mono WAV in; the transcript, the same turn
+    result as a typed message, and the reply as base64 MP3 (null if synthesis failed) out.
+    422 no_speech (nothing heard, no turn used); 503 voice_unavailable (no speech key, or
+    speech-to-text failed)."""
+    response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    return voice.turn(
+        _url(),
+        settings,
+        session_id,
+        body.audio,
+        client_ip(request),
+        llm_for(settings),
+        speech_for(settings),
+    )
+
+
+@router.post("/sessions/{session_id}/voice/greeting", response_model=ChatVoiceGreetingOut)
+def voice_greeting(session_id: str, request: Request, response: Response):
+    """The session's greeting text and its audio (base64 MP3, null if synthesis failed)."""
+    response.headers["Cache-Control"] = "no-store"
+    settings = get_settings()
+    return voice.greeting(_url(), settings, session_id, client_ip(request), speech_for(settings))
 
 
 @router.post(

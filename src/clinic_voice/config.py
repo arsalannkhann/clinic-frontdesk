@@ -2,7 +2,7 @@ import ipaddress
 from functools import lru_cache
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "[::1]", "::1"})
@@ -142,6 +142,22 @@ class Settings(BaseSettings):
     # Model calls (each tool round is one) per clinic per UTC day, all sessions together.
     # Over it the chat answers with the fallback text and quick replies, never an error.
     chat_llm_calls_per_clinic_per_day: int = Field(default=3000, ge=1, le=1000000)
+    # Web voice (ADR 0012, voice.py): speech-to-text and text-to-speech around the chat turn.
+    # Sarvam REST (POST {SPEECH_BASE_URL}/speech-to-text and /text-to-speech). SARVAM_API_KEY
+    # is accepted as a fallback name. Unset: the voice routes answer 503 voice_unavailable
+    # and the public profile reports voice_enabled false.
+    speech_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("speech_api_key", "sarvam_api_key"),
+    )
+    speech_base_url: str = "https://api.sarvam.ai"
+    speech_stt_model: str = "saarika:v2.5"
+    speech_tts_model: str = "bulbul:v3"
+    speech_tts_speaker: str = "priya"
+    speech_timeout_seconds: float = Field(default=15.0, ge=1.0, le=60.0)
+    # Largest decoded recording a voice turn accepts (16 kHz mono 16-bit WAV: 1000000 bytes
+    # is about 31 seconds).
+    voice_max_audio_bytes: int = Field(default=1_000_000, ge=16_000, le=1_000_000)
 
     @field_validator("worker_tick_secret", "public_proxy_secret")
     @classmethod
@@ -158,6 +174,14 @@ class Settings(BaseSettings):
         checked = _https_or_loopback(value, "chat_llm_base_url")
         if checked is None:
             raise ValueError("chat_llm_base_url is required")
+        return checked.rstrip("/")
+
+    @field_validator("speech_base_url")
+    @classmethod
+    def _speech_base(cls, value):
+        checked = _https_or_loopback(value, "speech_base_url")
+        if checked is None:
+            raise ValueError("speech_base_url is required")
         return checked.rstrip("/")
 
     @field_validator("chat_llm_auth_header")
@@ -179,6 +203,13 @@ class Settings(BaseSettings):
 
     def chat_configured(self) -> bool:
         return bool(self.chat_llm_api_key and self.chat_llm_api_key.get_secret_value())
+
+    def speech_configured(self) -> bool:
+        return bool(self.speech_api_key and self.speech_api_key.get_secret_value())
+
+    def voice_configured(self) -> bool:
+        """Web voice needs both the speech key and the chat model key."""
+        return self.speech_configured() and self.chat_configured()
 
     @field_validator("dashboard_origins")
     @classmethod

@@ -3,7 +3,7 @@ import "server-only";
 import { NextResponse } from "next/server";
 
 import { ConfigError, readConfig } from "./config";
-import { configErrorResponse, forward, pickQuery, safeSegments } from "./upstream";
+import { configErrorResponse, forward, pickQuery, safeSegments, VOICE_MAX_BODY_BYTES, type ForwardTarget } from "./upstream";
 import { errorJson } from "./errors";
 import { sessionCookieName, sessionCookieOptions } from "./request";
 
@@ -66,7 +66,8 @@ export const publicHandler: Handler = async (request, context) => {
 
 /**
  * /api/chat/* -> /v1/chat/*. Session creation is scoped to the configured clinic; the other
- * routes carry the session id, a 128-bit bearer secret for that conversation only.
+ * routes carry the session id, a 128-bit bearer secret for that conversation only. The voice
+ * turn (one recorded utterance as base64 WAV) is the only route with a larger body cap.
  */
 export const chatHandler: Handler = async (request, context) => {
   const { path } = await context.params;
@@ -75,7 +76,7 @@ export const chatHandler: Handler = async (request, context) => {
   const method = request.method.toUpperCase();
   const [first, id, kind, pid, action] = segments;
   if (first !== "sessions") return notFound();
-  let target: { path: string; chat?: boolean } | null = null;
+  let target: ForwardTarget | null = null;
   if (method === "POST" && segments.length === 1) {
     const clinic = slug();
     if (clinic instanceof Response) return clinic;
@@ -84,6 +85,10 @@ export const chatHandler: Handler = async (request, context) => {
     target = { path: `/v1/chat/sessions/${id}` };
   } else if (method === "POST" && segments.length === 3 && kind === "messages") {
     target = { path: `/v1/chat/sessions/${id}/messages`, chat: true };
+  } else if (method === "POST" && segments.length === 3 && kind === "voice") {
+    target = { path: `/v1/chat/sessions/${id}/voice`, chat: true, maxBodyBytes: VOICE_MAX_BODY_BYTES };
+  } else if (method === "POST" && segments.length === 4 && kind === "voice" && pid === "greeting") {
+    target = { path: `/v1/chat/sessions/${id}/voice/greeting`, chat: true };
   } else if (method === "POST" && segments.length === 5 && kind === "proposals" && action === "confirm") {
     target = { path: `/v1/chat/sessions/${id}/proposals/${pid}/confirm`, chat: true };
   }

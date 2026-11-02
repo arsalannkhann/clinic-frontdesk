@@ -7,7 +7,8 @@ const dev = process.env.NODE_ENV !== "production";
  * /_next/static, the BFF is /api/*, and there are no third-party scripts, frames or images.
  * Next's App Router streams its payload in inline <script> tags and next/font and React set
  * inline styles, so script-src and style-src allow 'unsafe-inline' (a nonce would force every
- * page to render dynamically). Development adds 'unsafe-eval' for React Refresh and ws: for
+ * page to render dynamically). The voice call's capture worklet is a same-origin static file
+ * (/voice-capture-worklet.js), covered by script-src 'self'. Development adds 'unsafe-eval' for React Refresh and ws: for
  * hot reload.
  */
 const csp = [
@@ -16,6 +17,8 @@ const csp = [
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self'",
   "img-src 'self' data: blob:",
+  // The web voice call plays the assistant's spoken reply from a blob: URL.
+  "media-src 'self' blob: data:",
   `connect-src 'self'${dev ? " ws: wss:" : ""}`,
   "frame-src 'none'",
   "frame-ancestors 'none'",
@@ -33,7 +36,8 @@ const securityHeaders = [
   { key: "X-Frame-Options", value: "DENY" },
   {
     key: "Permissions-Policy",
-    value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+    // The microphone is for the web voice call on this origin only; embedded frames get none.
+    value: "camera=(), microphone=(self), geolocation=(), payment=(), usb=()",
   },
 ];
 

@@ -73,7 +73,9 @@ function isProfile(value: unknown): value is ClinicProfile {
 
 export const getClinic = cache(async (): Promise<ClinicProfile | null> => {
   const value = await load("");
-  return isProfile(value) ? value : null;
+  if (!isProfile(value)) return null;
+  // An API without the voice call omits the flag: anything but true means no voice call.
+  return { ...value, voice_enabled: value.voice_enabled === true };
 });
 
 export const getServices = cache(async (): Promise<PublicService[] | null> => {
