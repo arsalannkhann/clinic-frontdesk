@@ -158,6 +158,22 @@ class Call:
         self.ctx.add_shutdown_callback(self.ctx.delete_room)
         self.session.shutdown()
 
+    def record(self, text: str):
+        async def store():
+            try:
+                outcome = await self.run(self.state.user_said, text)
+            except Exception as error:
+                log.warning(
+                    "call turn not stored session=%s error=%s",
+                    self.state.session_id,
+                    type(error).__name__,
+                )
+                return
+            if outcome == "limit":
+                await self.hang_up(GOODBYE_LIMIT)
+
+        asyncio.create_task(store())
+
     def on_user_state(self, event):
         if event.new_state == "speaking":
             self._silences = 0
@@ -206,7 +222,8 @@ class Receptionist(Agent):
         tools.append(
             EndCallTool(
                 extra_description="Use it once the caller is done or says goodbye.",
-                end_instructions="Say one short, warm goodbye in the caller's language.",
+                # The model says goodbye before calling it (CALL_RULES); no second goodbye.
+                end_instructions=None,
                 delete_room=True,
                 ignore_on_enter=True,
             )
@@ -232,7 +249,10 @@ class Receptionist(Agent):
         text = (new_message.text_content or "").strip()
         if not text:
             raise StopResponse()
-        outcome = await self._call.run(self._call.state.user_said, text)
+        # The reply starts at once; storing the turn and checking its limits (database round
+        # trips to another region) runs alongside it, and a limit it finds ends the call.
+        outcome = self._call.state.precheck(text)
+        self._call.record(text)
         if outcome == "ok":
             return
         if outcome == "emergency":
@@ -267,7 +287,7 @@ async def entrypoint(ctx: JobContext):
     call = Call(ctx, state)
 
     async def cleanup():
-        await asyncio.to_thread(state.close)
+        await call.run(state.close)  # After any turn or reply still being stored.
 
     ctx.add_shutdown_callback(cleanup)
     if settings.call_llm == "claude":

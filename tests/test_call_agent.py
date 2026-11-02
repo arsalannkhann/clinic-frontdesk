@@ -59,11 +59,15 @@ def test_turns_are_stored_and_counted(env, monkeypatch):  # noqa: F811
     token = start(env)
     call = state(env, token)
     try:
+        assert call.precheck("hello there") == "ok"
         assert call.user_said("hello there") == "ok"
         call.agent_said("Hi, how can I help?")
         assert call.user_said("my gums are bleeding heavily and it will not stop") == "emergency"
         assert call.emergency_text() == chat.emergency_script(call.clinic)
+        assert call.precheck("my gums are bleeding heavily") == "emergency"
         assert call.user_said("one more") == "limit"
+        # The turn that found the limit was answered; the next one is stopped without the DB.
+        assert call.precheck("and another") == "limit"
     finally:
         call.close()
     assert user_texts(env["url"])[:2] == [
@@ -79,10 +83,14 @@ def test_daily_model_cap(env, monkeypatch):  # noqa: F811
     call = state(env, start(env))
     try:
         assert call.user_said("first") == "ok"
+        assert call.precheck("second") == "ok"
         assert call.user_said("second") == "capped"
+        assert call.precheck("third") == "capped"
         assert call.capped_text() == chat.fallback_text(call.clinic)
     finally:
         call.close()
+    # A reply that arrives after the call closed is dropped, not written on a closed connection.
+    call.agent_said("Goodbye!")
 
 
 def test_a_call_books_after_name_number_and_consent(env):  # noqa: F811
