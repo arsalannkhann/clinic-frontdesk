@@ -75,7 +75,12 @@ PROPOSAL_QUICK_REPLIES = ["Show other times"]
 # MAX_CHOICES of at most MAX_CHOICE_LENGTH characters each become the quick replies.
 MAX_CHOICES = 4
 MAX_CHOICE_LENGTH = 40
-CHOICES_LINE = re.compile(r"\n[ \t]*(?:choices|options)[ \t]*:[ \t]*([^\n]*)\s*$", re.IGNORECASE)
+# On its own last line, or (models sometimes do this) at the end of the last sentence; at least
+# two options, so a sentence that merely ends "Options: ..." is left alone.
+CHOICES_LINE = re.compile(
+    r"(?:\n|(?<=[.?!।])[ \t]+)[ \t]*(?:choices|options)[ \t]*:[ \t]*([^\n]*\|[^\n]*)\s*$",
+    re.IGNORECASE,
+)
 
 DEFAULT_EMERGENCY = (
     "If this is a medical emergency, such as heavy bleeding that will not stop, swelling that"
@@ -403,8 +408,8 @@ def _hours_text(conn, clinic_id, zone) -> str:
 
 CHOICES_RULE = """
 - When the patient has to choose (a service, a day, a time, a doctor, yes or no), end the reply \
-with one last line "Choices: first | second | third" holding two to four short options they can \
-tap, in their language: the exact service names, or the times you just offered such as \
+with a new last line "Choices: first | second | third" holding two to four (never more) short \
+options they can tap, in their language: the exact service names, or the times you just offered such as \
 "Tue 10:00". The screen shows this line as buttons, not text. Leave it out when no choice is \
 needed."""
 
@@ -1060,8 +1065,9 @@ def _choices(options) -> list[str]:
 
 
 def split_choices(text: str) -> tuple[str, list[str]]:
-    """A model reply without its trailing "Choices: a | b" line (CHOICES_RULE), and those
-    choices. A reply that is only that line keeps no text."""
+    """A model reply without its trailing "Choices: a | b" (CHOICES_RULE; its own line, or
+    after the last sentence), and those choices. A reply that is only that line keeps no
+    text."""
     match = CHOICES_LINE.search("\n" + text)
     if match is None:
         return text.strip(), []

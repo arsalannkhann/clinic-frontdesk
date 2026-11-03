@@ -1433,3 +1433,12 @@ def test_split_choices_bounds_and_cleans_the_options():
     assert choices == ["a", "b", "c", "d"]
     assert chat.split_choices("No choices here: really") == ("No choices here: really", [])
     assert chat.split_choices("Choices: a | b") == ("", ["a", "b"])
+    # Inline after the last sentence, as models sometimes write it.
+    assert chat.split_choices("Which service? Choices: Cleaning | Whitening") == (
+        "Which service?",
+        ["Cleaning", "Whitening"],
+    )
+    assert chat.split_choices("We have two. Options: see the list") == (
+        "We have two. Options: see the list",
+        [],
+    )
