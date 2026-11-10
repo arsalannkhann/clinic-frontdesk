@@ -64,6 +64,12 @@ export default defineConfig(({ mode }) => {
     test: {
       environment: "jsdom",
       include: ["tests/**/*.test.ts"],
+      // Node 25+ has a built-in localStorage global that hides jsdom's, so
+      // window.localStorage is undefined in tests. Turn it off where the flag exists
+      // (Node 22.4+); older Node rejects the flag and has no such global.
+      execArgv: process.allowedNodeEnvironmentFlags.has("--no-experimental-webstorage")
+        ? ["--no-experimental-webstorage"]
+        : [],
     },
   };
 });
